@@ -6,7 +6,6 @@ with variable-length IQ inputs.
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -358,54 +357,34 @@ def build_controlled_tone_pulse_from_variable_inputs(
         seed=seed,
     )
 
-    build_tone_pulse = txflex.build_tone_pulse_iq_object
-    maybe_kwargs = {
-        "sample_rate_hz": cfg.sample_rate_hz,
-        "rf_center_hz": cfg.rf_center_hz,
-        "carrier_hz": cfg.carrier_hz,
-        "target_num_samples": desired_output_iq_len,
-        "num_tones": cfg.num_tones,
-        "tone_frequencies_hz": cfg.tone_frequencies_hz,
-        "tone_amplitudes": cfg.tone_amplitudes,
-        "pulse_on_samples": cfg.pulse_on_samples,
-        "pulse_off_samples": cfg.pulse_off_samples,
-        "pulse_count": cfg.pulse_count,
-        "start_offset_samples": cfg.start_offset_samples,
-        "snr_db": cfg.snr_db,
-        "noise_color": cfg.noise_color,
-        "freq_offset": cfg.freq_offset,
-        "timing_offset": cfg.timing_offset,
-        "fading_mode": cfg.fading_mode,
-        "fading_block_len": cfg.fading_block_len,
-        "rician_k_db": cfg.rician_k_db,
-        "multipath_taps": None,
-        "burst_probability": cfg.burst_probability,
-        "burst_len_min": cfg.burst_len_min,
-        "burst_len_max": cfg.burst_len_max,
-        "burst_power_ratio_db": cfg.burst_power_ratio_db,
-        "burst_color": cfg.burst_color,
-        "peak_power": cfg.peak_power,
-        "seed": cfg.seed,
-    }
-    accepted = set(inspect.signature(build_tone_pulse).parameters.keys())
-    filtered_kwargs = {k: v for k, v in maybe_kwargs.items() if k in accepted}
-
-    # Extra fallback: if runtime signature/source mismatch still throws
-    # unexpected-keyword TypeError, strip that key and retry.
-    retry_kwargs = dict(filtered_kwargs)
-    while True:
-        try:
-            tx_result = build_tone_pulse(**retry_kwargs)
-            break
-        except TypeError as exc:
-            msg = str(exc)
-            needle = "unexpected keyword argument '"
-            if needle not in msg:
-                raise
-            bad_key = msg.split(needle, 1)[1].split("'", 1)[0]
-            if bad_key not in retry_kwargs:
-                raise
-            retry_kwargs.pop(bad_key, None)
+    tx_result = txflex.build_tone_pulse_iq_object(
+        sample_rate_hz=cfg.sample_rate_hz,
+        rf_center_hz=cfg.rf_center_hz,
+        carrier_hz=cfg.carrier_hz,
+        target_num_samples=desired_output_iq_len,
+        num_tones=cfg.num_tones,
+        tone_frequencies_hz=cfg.tone_frequencies_hz,
+        tone_amplitudes=cfg.tone_amplitudes,
+        pulse_on_samples=cfg.pulse_on_samples,
+        pulse_off_samples=cfg.pulse_off_samples,
+        pulse_count=cfg.pulse_count,
+        start_offset_samples=cfg.start_offset_samples,
+        snr_db=cfg.snr_db,
+        noise_color=cfg.noise_color,
+        freq_offset=cfg.freq_offset,
+        timing_offset=cfg.timing_offset,
+        fading_mode=cfg.fading_mode,
+        fading_block_len=cfg.fading_block_len,
+        rician_k_db=cfg.rician_k_db,
+        multipath_taps=None,
+        burst_probability=cfg.burst_probability,
+        burst_len_min=cfg.burst_len_min,
+        burst_len_max=cfg.burst_len_max,
+        burst_power_ratio_db=cfg.burst_power_ratio_db,
+        burst_color=cfg.burst_color,
+        peak_power=cfg.peak_power,
+        seed=cfg.seed,
+    )
 
     tx_metadata = dict(tx_result.metadata)
     tx_metadata["controller_input_lengths"] = [int(v) for v in lengths.tolist()]
