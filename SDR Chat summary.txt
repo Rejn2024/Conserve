@@ -1,0 +1,441 @@
+Here is a **clean, self-contained technical summary** you can paste into a new chat to restore full working context.
+
+---
+
+# ADVANCED LINK PROJECT – TECHNICAL CONTEXT SUMMARY (V4)
+
+## 1. System Overview
+
+This project implements a **synthetic digital radio link** with:
+
+* Transmitter (TX)
+* Channel impairments (noise, fading, offsets, impulsive bursts)
+* Receiver (RX) with synchronization and decoding
+* Dataset generation for ML / testing
+* Scoring and evaluation tools
+* PyTorch-based control models (optional)
+
+The system is designed to simulate **real-world RF impairments** while remaining decodable under controlled conditions.
+
+---
+
+## 2. Core Script: `advanced_link_skdsp_v4_robust.py`
+
+### TX functionality
+
+Main function:
+
+```python
+build_tx_iq_object(...)
+```
+
+### Key capabilities:
+
+* Payload:
+
+  * Text message OR random bitstream
+* Encoding:
+
+  * `none`
+  * `rep3`
+  * `conv` (convolutional coding)
+* Optional interleaving
+* RRC pulse shaping
+* Configurable:
+
+  * sample rate
+  * RF center frequency
+  * digital carrier offset
+* Channel impairments:
+
+  * Noise (white, pink, brown, etc.)
+  * SNR control
+  * Frequency offset
+  * Timing offset
+  * Rayleigh / Rician fading
+  * Static multipath
+  * Impulsive burst noise
+
+### Output:
+
+Returns:
+
+```python
+TXBuildResult:
+    iq: np.ndarray (complex64)
+    metadata: dict
+```
+
+Metadata includes:
+
+* sample_rate_hz
+* rf_center_hz
+* carrier_hz
+* absolute_rf_hz
+* actual_num_samples
+* payload details
+
+---
+
+### RX functionality
+
+Invoked via:
+
+```python
+link.main(["rx", ...])
+```
+
+### RX features:
+
+* Coarse frequency acquisition (grid search)
+* Timing recovery (phase search)
+* Matched filtering (RRC)
+* Pilot / training-based channel estimation
+* Equalization (FIR)
+* Carrier recovery
+* Symbol slicing
+* FEC decoding
+* CRC validation
+
+### Output:
+
+```python
+{
+    "message": str or None,
+    "payload_bytes": bytes,
+    "payload_len": int
+}
+```
+
+Failure → raises or returns invalid decode
+
+---
+
+## 3. Important RX/TX Constraints (CRITICAL)
+
+### Carrier handling
+
+* For **reliable decode**, dataset generator uses:
+
+```python
+carrier_hz = 0.0
+```
+
+* RX tunes to:
+
+```python
+rf_center_hz (NOT rf_center + carrier)
+```
+
+---
+
+### Packet length constraint (VERY IMPORTANT)
+
+The TX produces **full packets**, whose length depends on:
+
+* payload size (500–1000 chars typical)
+* FEC
+* oversampling (sps)
+* pulse shaping
+
+Therefore:
+
+❗ `target_num_samples` is a **minimum**, NOT exact.
+
+Correct behaviour:
+
+```python
+actual_num_samples >= target_num_samples
+```
+
+---
+
+## 4. Dataset Generator: `generate_tx_iq_dataset.py`
+
+### Purpose
+
+Generate IQ datasets where:
+
+* each sample is **guaranteed decodable**
+* includes metadata and subsections
+
+---
+
+### Key function
+
+```python
+generate_dataset(...)
+```
+
+### Workflow
+
+1. Randomly generate:
+
+   * payload (message or random bits)
+   * channel parameters
+
+2. Build TX IQ:
+
+```python
+_build_candidate_iq_with_full_packet(...)
+```
+
+Ensures:
+
+```python
+len(iq) >= required_packet_length
+```
+
+3. Attempt decode:
+
+```python
+_decode_candidate_with_v4(...)
+```
+
+4. Accept ONLY if:
+
+```python
+_candidate_matches_payload(...) == True
+```
+
+5. Otherwise retry until:
+
+```python
+max_attempts_per_sample
+```
+
+---
+
+### Output structure
+
+```
+dataset/
+  sample_000000/
+    whole_iq.npy
+    whole_meta.json
+    sections.npy
+    sections_meta.json
+```
+
+---
+
+### Metadata additions
+
+Each sample includes:
+
+```python
+{
+  "decode_verified": True,
+  "requested_target_num_samples": int,
+  "actual_num_samples": int,
+  "payload_desc": {...}
+}
+```
+
+---
+
+### Subsections
+
+Each IQ sample also produces:
+
+* 3 random segments of length 1024
+
+---
+
+## 5. Key Internal Helpers
+
+### Payload generation
+
+```python
+_build_payload_description(...)
+```
+
+Modes:
+
+* `"message"`
+* `"random_bits"`
+
+---
+
+### Decoding validation
+
+```python
+_decode_candidate_with_v4(...)
+```
+
+* Writes temp IQ + metadata
+* Calls RX CLI internally
+
+---
+
+### Payload verification
+
+```python
+_candidate_matches_payload(...)
+```
+
+* Exact string match OR
+* Exact bit match
+
+---
+
+## 6. Scoring Script: `score_iq_decode.py`
+
+### Behaviour
+
+Returns:
+
+| Case          | Score                          |
+| ------------- | ------------------------------ |
+| Decode fails  | 0.0                            |
+| Exact match   | 1.0                            |
+| Partial match | 1 / (1 + Levenshtein distance) |
+
+### Key fix
+
+Avoids ambiguity:
+
+```python
+1 / distance   ❌ (bad when distance=1)
+1 / (1 + distance) ✅
+```
+
+---
+
+## 7. Test Design Principles
+
+### IMPORTANT CHANGE
+
+Tests must NOT assume:
+
+```python
+len(iq) == target_num_samples
+```
+
+Instead:
+
+```python
+len(iq) >= target_num_samples
+```
+
+---
+
+### Tests verify:
+
+* Decode correctness
+* Metadata consistency
+* Dataset structure
+* Subsection correctness
+* Parameter ranges
+
+---
+
+## 8. Common Failure Modes & Fixes
+
+### ❌ “No valid packet found”
+
+Cause:
+
+* IQ too short (truncated packet)
+* excessive channel impairment
+* carrier mismatch
+
+Fix:
+
+* ensure full packet length
+* use conservative parameters
+* keep `carrier_hz = 0`
+
+---
+
+### ❌ Decode returns None
+
+Cause:
+
+* RX tuning mismatch
+* metadata inconsistency
+
+Fix:
+
+```python
+--rf-center-hz = rf_center_hz
+```
+
+---
+
+### ❌ Infinite retries / generation failure
+
+Cause:
+
+* parameter space too harsh
+
+Fix:
+
+* fallback to:
+
+  * high SNR
+  * no fading
+  * no bursts
+
+---
+
+## 9. Design Philosophy
+
+The system balances:
+
+### Realism
+
+* colored noise
+* fading
+* impulsive interference
+* RF offsets
+
+### Decodability
+
+* constrained carrier usage
+* bounded impairments
+* validation loop
+
+---
+
+## 10. Current Limitations
+
+* RX not fully robust to:
+
+  * large carrier offsets
+  * strong multipath
+  * heavy impulsive noise
+* Dataset generator compensates by restricting parameters
+* Not yet ML-optimized for adversarial channels
+
+---
+
+## 11. Extensions Already Explored
+
+* PyTorch CNN (ResNet-style) TX controller
+* STFT preprocessing + MAD scaling
+* Multi-input IQ inference (3×1024 samples)
+* Adaptive TX parameter selection
+
+---
+
+## 12. Key Takeaways for Future Work
+
+If modifying or troubleshooting:
+
+1. Always ensure **full packet length**
+2. Keep RX/TX RF alignment consistent
+3. Validate with decode loop
+4. Use conservative fallback if needed
+5. Never assume fixed IQ length
+6. Treat dataset as **verified-decoding-only**
+
+---
+
+This summary contains enough detail to:
+
+* modify TX/RX behaviour
+* debug decoding failures
+* extend dataset generation
+* adjust channel models
+* integrate ML components
