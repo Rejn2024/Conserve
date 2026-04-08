@@ -226,6 +226,54 @@ def test_save_tx_iq_object(tmp_path: Path):
     assert meta["actual_num_samples"] == 9000
 
 
+def test_build_tone_pulse_iq_object_multi_tone():
+    result = link.build_tone_pulse_iq_object(
+        sample_rate_hz=1_000_000.0,
+        rf_center_hz=915_000_000.0,
+        carrier_hz=0.0,
+        target_num_samples=16000,
+        num_tones=3,
+        tone_frequencies_hz=[-120_000.0, 15_000.0, 220_000.0],
+        tone_amplitudes=[1.0, 0.5, 0.25],
+        pulse_on_samples=2000,
+        pulse_off_samples=500,
+        pulse_count=5,
+        snr_db=30.0,
+        noise_color="pink",
+        peak_power=0.8,
+        seed=42,
+    )
+
+    assert len(result.iq) == 16000
+    assert result.metadata["payload_source"] == "tone_pulse"
+    assert result.metadata["num_tones"] == 3
+    assert result.metadata["tone_frequencies_hz"] == [-120000.0, 15000.0, 220000.0]
+    assert result.metadata["pulse_on_samples"] == 2000
+    assert result.metadata["pulse_off_samples"] == 500
+    assert result.metadata["pulse_count"] == 5
+    assert result.metadata["noise_color"] == "pink"
+    assert result.metadata["measured_peak_power"] <= 0.8 * 1.5
+
+
+def test_build_tone_pulse_iq_object_peak_power_no_noise():
+    result = link.build_tone_pulse_iq_object(
+        sample_rate_hz=1_000_000.0,
+        target_num_samples=4096,
+        num_tones=2,
+        tone_frequencies_hz=[20_000.0, -35_000.0],
+        tone_amplitudes=[1.0, 0.8],
+        pulse_on_samples=1024,
+        pulse_off_samples=1024,
+        pulse_count=2,
+        snr_db=None,
+        peak_power=0.25,
+        seed=7,
+    )
+
+    peak_power = float(np.max(np.abs(result.iq) ** 2))
+    assert np.isclose(peak_power, 0.25, atol=1e-3)
+
+
 def test_noiseless_message_uncoded():
     _, rx, _, _ = run_case(
         message=TEST_MESSAGE,
