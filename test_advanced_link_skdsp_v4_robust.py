@@ -157,6 +157,48 @@ def test_build_tx_iq_object_random_bits():
     assert result.metadata["random_seed"] == 17
 
 
+def test_build_tone_pulse_iq_object_basic_offsets():
+    fs = 1_000_000.0
+    pulse_len = 4096
+    offsets = [-125_000.0, 75_000.0]
+    result = link.build_tone_pulse_iq_object(
+        tone_offsets_hz=offsets,
+        pulse_num_samples=pulse_len,
+        gap_num_samples=0,
+        target_num_samples=pulse_len * len(offsets),
+        sample_rate_hz=fs,
+        snr_db=None,
+    )
+    assert len(result.iq) == pulse_len * len(offsets)
+    assert result.metadata["waveform_type"] == "tone_pulse"
+    assert result.metadata["tone_offsets_hz"] == offsets
+
+    first = result.iq[:pulse_len]
+    second = result.iq[pulse_len:2 * pulse_len]
+
+    def estimate_peak_hz(x: np.ndarray, fs_hz: float) -> float:
+        spec = np.fft.fftshift(np.fft.fft(x))
+        freqs = np.fft.fftshift(np.fft.fftfreq(len(x), d=1.0 / fs_hz))
+        return float(freqs[int(np.argmax(np.abs(spec)))])
+
+    peak1 = estimate_peak_hz(first, fs)
+    peak2 = estimate_peak_hz(second, fs)
+    assert abs(peak1 - offsets[0]) < 500.0
+    assert abs(peak2 - offsets[1]) < 500.0
+
+
+def test_build_tone_pulse_iq_object_peak_limit():
+    result = link.build_tone_pulse_iq_object(
+        tone_offsets_hz=[10_000.0],
+        pulse_num_samples=4000,
+        tone_amplitude=2.0,
+        max_peak_power=0.5,
+        snr_db=None,
+    )
+    assert result.metadata["peak_limit_applied"] is True
+    assert result.metadata["peak_power"] <= 0.5 + 1e-6
+
+
 def test_save_tx_iq_object(tmp_path: Path):
     result = link.build_tx_iq_object(
         message="abc123" * 100,
