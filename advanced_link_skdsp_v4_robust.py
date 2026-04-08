@@ -171,6 +171,10 @@ def measure_power(x: np.ndarray) -> float:
     return float(np.mean(np.abs(x) ** 2)) if len(x) else 0.0
 
 
+def measure_peak_power(x: np.ndarray) -> float:
+    return float(np.max(np.abs(x) ** 2)) if len(x) else 0.0
+
+
 def bpsk_map(bits: List[int]) -> np.ndarray:
     return np.where(np.asarray(bits, dtype=np.int8) > 0, 1.0, -1.0).astype(np.complex64)
 
@@ -397,6 +401,19 @@ def impair_iq(
         seed=seed,
     )
     return y.astype(np.complex64)
+
+
+def limit_peak_power(iq: np.ndarray, max_peak_power: Optional[float]) -> Tuple[np.ndarray, bool, float]:
+    x = np.asarray(iq, dtype=np.complex64)
+    pre_peak_power = measure_peak_power(x)
+    if max_peak_power is None:
+        return x, False, pre_peak_power
+    if max_peak_power <= 0:
+        raise ValueError("max_peak_power must be > 0 when provided")
+    if pre_peak_power <= 0 or pre_peak_power <= max_peak_power:
+        return x, False, pre_peak_power
+    scale = math.sqrt(max_peak_power / pre_peak_power)
+    return (x * scale).astype(np.complex64), True, pre_peak_power
 
 
 def robust_agc_and_blanking(x: np.ndarray, blanker_k: float = 6.0) -> np.ndarray:
@@ -845,6 +862,122 @@ def build_tx_iq_object(
         "burst_color": burst_color,
         "seed": seed,
         "avg_power": measure_power(iq),
+    }
+
+    return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
+
+
+def build_tone_pulse_iq_object(
+    *,
+    tone_offsets_hz: List[float],
+    pulse_num_samples: int,
+    gap_num_samples: int = 0,
+    tone_amplitude: float = 1.0,
+    target_num_samples: Optional[int] = None,
+    sample_rate_hz: float = 1_000_000.0,
+    rf_center_hz: float = 0.0,
+    snr_db: Optional[float] = None,
+    noise_color: str = "white",
+    freq_offset: float = 0.0,
+    timing_offset: float = 1.0,
+    fading_mode: str = "none",
+    fading_block_len: int = 256,
+    rician_k_db: float = 6.0,
+    multipath_taps: Optional[List[complex]] = None,
+    burst_probability: float = 0.0,
+    burst_len_min: int = 16,
+    burst_len_max: int = 64,
+    burst_power_ratio_db: float = 12.0,
+    burst_color: str = "white",
+    max_peak_power: Optional[float] = None,
+    seed: int = 1,
+) -> TXBuildResult:
+    if not tone_offsets_hz:
+        raise ValueError("tone_offsets_hz must contain at least one offset")
+    if sample_rate_hz <= 0:
+        raise ValueError("sample_rate_hz must be positive")
+    if pulse_num_samples <= 0:
+        raise ValueError("pulse_num_samples must be > 0")
+    if gap_num_samples < 0:
+        raise ValueError("gap_num_samples must be >= 0")
+    if tone_amplitude <= 0:
+        raise ValueError("tone_amplitude must be > 0")
+
+    pulse_segments: List[np.ndarray] = []
+    n = np.arange(pulse_num_samples, dtype=np.float64)
+    for offset_hz in tone_offsets_hz:
+        if abs(offset_hz) >= sample_rate_hz / 2:
+            raise ValueError("Each tone offset must satisfy |offset_hz| < sample_rate_hz/2")
+        phase = 2.0 * np.pi * offset_hz * n / sample_rate_hz
+        tone = tone_amplitude * np.exp(1j * phase)
+        pulse_segments.append(tone.astype(np.complex64))
+        if gap_num_samples > 0:
+            pulse_segments.append(np.zeros(gap_num_samples, dtype=np.complex64))
+
+    if gap_num_samples > 0:
+        pulse_segments = pulse_segments[:-1]
+
+    one_burst_iq = np.concatenate(pulse_segments).astype(np.complex64)
+
+    if target_num_samples is None:
+        iq = one_burst_iq
+        n_repeats = 1
+    else:
+        if target_num_samples <= 0:
+            raise ValueError("target_num_samples must be > 0")
+        n_repeats = int(math.ceil(target_num_samples / len(one_burst_iq)))
+        iq = np.tile(one_burst_iq, n_repeats)[:target_num_samples].astype(np.complex64)
+
+    iq = impair_iq(
+        iq=iq,
+        snr_db=snr_db,
+        noise_color=noise_color,
+        freq_offset=freq_offset,
+        timing_offset=timing_offset,
+        fading_mode=fading_mode,
+        fading_block_len=fading_block_len,
+        rician_k_db=rician_k_db,
+        multipath_taps=multipath_taps,
+        burst_probability=burst_probability,
+        burst_len_min=burst_len_min,
+        burst_len_max=burst_len_max,
+        burst_power_ratio_db=burst_power_ratio_db,
+        burst_color=burst_color,
+        seed=seed,
+    )
+
+    iq, peak_limited, pre_limit_peak_power = limit_peak_power(iq, max_peak_power=max_peak_power)
+
+    metadata = {
+        "waveform_type": "tone_pulse",
+        "tone_offsets_hz": [float(x) for x in tone_offsets_hz],
+        "pulse_num_samples": pulse_num_samples,
+        "gap_num_samples": gap_num_samples,
+        "tone_amplitude": tone_amplitude,
+        "target_num_samples": target_num_samples,
+        "actual_num_samples": int(len(iq)),
+        "n_repeats": n_repeats,
+        "sample_rate_hz": sample_rate_hz,
+        "rf_center_hz": rf_center_hz,
+        "snr_db": snr_db,
+        "noise_color": noise_color,
+        "freq_offset": freq_offset,
+        "timing_offset": timing_offset,
+        "fading_mode": fading_mode,
+        "fading_block_len": fading_block_len,
+        "rician_k_db": rician_k_db,
+        "multipath_taps": None if multipath_taps is None else [str(t) for t in multipath_taps],
+        "burst_probability": burst_probability,
+        "burst_len_min": burst_len_min,
+        "burst_len_max": burst_len_max,
+        "burst_power_ratio_db": burst_power_ratio_db,
+        "burst_color": burst_color,
+        "max_peak_power": max_peak_power,
+        "peak_limit_applied": peak_limited,
+        "pre_limit_peak_power": pre_limit_peak_power,
+        "peak_power": measure_peak_power(iq),
+        "avg_power": measure_power(iq),
+        "seed": seed,
     }
 
     return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
