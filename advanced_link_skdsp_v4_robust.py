@@ -1212,24 +1212,27 @@ def extract_symbols_from_start(
 
 
 def design_symbol_equalizer_ls(
-    rx_train: np.ndarray,
-    tx_train: np.ndarray,
+    rx_train: Union[np.ndarray, torch.Tensor],
+    tx_train: Union[np.ndarray, torch.Tensor],
     ntaps: int = 7,
     ridge: float = 1e-3,
 ) -> np.ndarray:
+    rx_train_np = _as_numpy_complex64(rx_train)
+    tx_train_np = _as_numpy_complex64(tx_train)
+
     if ntaps % 2 == 0:
         raise ValueError("ntaps must be odd")
-    if len(rx_train) != len(tx_train):
+    if len(rx_train_np) != len(tx_train_np):
         raise ValueError("Training sequences must have same length")
-    if len(rx_train) < ntaps:
+    if len(rx_train_np) < ntaps:
         return np.array([1.0 + 0.0j], dtype=np.complex64)
 
     half = ntaps // 2
-    rpad = np.pad(rx_train, (half, half), mode="constant")
-    X = np.stack([rpad[i:i + ntaps] for i in range(len(rx_train))], axis=0)
+    rpad = np.pad(rx_train_np, (half, half), mode="constant")
+    X = np.stack([rpad[i:i + ntaps] for i in range(len(rx_train_np))], axis=0)
 
     A = X.conj().T @ X + ridge * np.eye(ntaps, dtype=np.complex128)
-    b = X.conj().T @ tx_train
+    b = X.conj().T @ tx_train_np
     w = np.linalg.solve(A, b)
     return w.astype(np.complex64)
 
