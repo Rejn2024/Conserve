@@ -342,8 +342,8 @@ def _complex_colored_noise(
     alpha = exponents[color]
 
     if n <= 0:
-        return torch.zeros(0, dtype=torch.complex64, device=device or DEFAULT_TORCH_DEVICE)
-    dev = device or DEFAULT_TORCH_DEVICE
+        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device("cpu"))
+    dev = device or torch.device("cpu")
 
     def make_real() -> torch.Tensor:
         freqs = torch.fft.rfftfreq(n, d=1.0, device=dev)
@@ -381,9 +381,9 @@ def apply_fading(
     multipath_taps: Optional[List[complex]] = None,
     seed: int = 1,
 ) -> torch.Tensor:
-    x = _as_complex_tensor(iq)
-    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen = torch.Generator(device=DEFAULT_TORCH_DEVICE)
     gen.manual_seed(seed)
+    x = _as_complex_tensor(iq)
 
     if mode == "none":
         return x
@@ -422,17 +422,7 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=torch.complex64)
-        xr = x.real.to(dtype=torch.float32).reshape(1, 1, -1)
-        xi = x.imag.to(dtype=torch.float32).reshape(1, 1, -1)
-        kr = torch.flip(taps_t.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        ki = torch.flip(taps_t.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        pad = taps_t.numel() - 1
-        xr_pad = F.pad(xr, (pad, 0))
-        xi_pad = F.pad(xi, (pad, 0))
-        yr = F.conv1d(xr_pad, kr).reshape(-1) - F.conv1d(xi_pad, ki).reshape(-1)
-        yi = F.conv1d(xr_pad, ki).reshape(-1) + F.conv1d(xi_pad, kr).reshape(-1)
-        y = torch.complex(yr, yi).to(dtype=torch.complex64)
+        y = _complex_lfilter_fir(x, taps)
         return y[: x.numel()].to(dtype=torch.complex64)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
@@ -452,7 +442,7 @@ def add_impulsive_bursts(
     if burst_probability <= 0.0 or x.numel() == 0:
         return x
 
-    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen = torch.Generator(device=DEFAULT_TORCH_DEVICE)
     gen.manual_seed(seed + 1000)
     out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
@@ -1251,17 +1241,14 @@ def coarse_frequency_acquire(
 
     n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
-    kr = torch.flip(torch.conj(ref).real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-    ki = torch.flip(torch.conj(ref).imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+    k = torch.flip(torch.conj(ref), dims=[0]).reshape(1, 1, -1)
 
     for f_hz in bins:
         phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
         rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
         y = x * rot
-        yr_in = y.real.to(dtype=torch.float32).reshape(1, 1, -1)
-        yi_in = y.imag.to(dtype=torch.float32).reshape(1, 1, -1)
-        yr = F.conv1d(yr_in, kr).reshape(-1) - F.conv1d(yi_in, ki).reshape(-1)
-        yi = F.conv1d(yr_in, ki).reshape(-1) + F.conv1d(yi_in, kr).reshape(-1)
+        yr = F.conv1d(y.real.reshape(1, 1, -1), k.real).reshape(-1) - F.conv1d(y.imag.reshape(1, 1, -1), k.imag).reshape(-1)
+        yi = F.conv1d(y.real.reshape(1, 1, -1), k.imag).reshape(-1) + F.conv1d(y.imag.reshape(1, 1, -1), k.real).reshape(-1)
         mag = torch.abs(torch.complex(yr, yi))
         idx = int(torch.argmax(mag).item())
         metric = float(mag[idx].item())
