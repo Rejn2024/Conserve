@@ -176,7 +176,7 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
 
 def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
-        return x.to(dtype=torch.complex64)
+        return x.to(dtype=torch.complex64).to(DEFAULT_TORCH_DEVICE)
     return torch.as_tensor(np.asarray(x), dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
 
 
@@ -342,7 +342,7 @@ def _complex_colored_noise(
     alpha = exponents[color]
 
     if n <= 0:
-        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device("cpu"))
+        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device(DEFAULT_TORCH_DEVICE ))
     dev = device or torch.device("cpu")
 
     def make_real() -> torch.Tensor:
@@ -477,7 +477,7 @@ def impair_iq(
     seed: int,
 ) -> torch.Tensor:
     x = _as_complex_tensor(iq)
-    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen = torch.Generator(device=x.device if x.is_cuda else DEFAULT_TORCH_DEVICE DEFAULT_TORCH_DEVICE )
     gen.manual_seed(seed)
 
     x = apply_fading(
