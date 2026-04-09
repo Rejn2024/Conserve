@@ -7,7 +7,7 @@ with variable-length IQ inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -22,34 +22,42 @@ NOISE_COLORS = ["white", "pink", "brown", "blue", "violet"]
 FADING_MODES = ["none", "rician_block", "rayleigh_block", "multipath_static"]
 
 
-def measure_iq_power(iq: np.ndarray) -> float:
-    x = np.asarray(iq)
-    if x.size == 0:
+def _as_complex_tensor(iq: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    if isinstance(iq, torch.Tensor):
+        return iq.to(dtype=torch.complex64)
+    return torch.as_tensor(np.asarray(iq), dtype=torch.complex64)
+
+
+def measure_iq_power(iq: Union[np.ndarray, torch.Tensor]) -> float:
+    x = _as_complex_tensor(iq)
+    if x.numel() == 0:
         return 0.0
-    return float(np.mean(np.abs(x) ** 2))
+    return float(torch.mean(torch.abs(x) ** 2).item())
 
 
-def robust_mad_scale(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    xr = np.concatenate([x.real, x.imag])
-    med = np.median(xr)
-    mad = np.median(np.abs(xr - med))
+def robust_mad_scale(x: Union[np.ndarray, torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+    xt = _as_complex_tensor(x)
+    xr = torch.cat([xt.real, xt.imag], dim=0)
+    med = torch.median(xr)
+    mad = torch.median(torch.abs(xr - med))
     sigma = 1.4826 * mad + eps
-    return (x / sigma).astype(np.complex64)
+    return (xt / sigma).to(dtype=torch.complex64)
 
 
 def preprocess_iq_to_stft_feature(
-    iq: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
     sample_rate_hz: float,
     nperseg: int = 128,
     noverlap: int = 96,
     nfft: int = 128,
-) -> Dict[str, np.ndarray]:
-    x = np.asarray(iq, dtype=np.complex64)
-    if len(x) < 8:
-        x = np.pad(x, (0, 8 - len(x)))
+) -> Dict[str, Union[np.ndarray, np.float32]]:
+    x_t = _as_complex_tensor(iq)
+    if x_t.numel() < 8:
+        x_t = F.pad(x_t, (0, 8 - int(x_t.numel())))
 
-    x = (x - np.mean(x)).astype(np.complex64)
-    x = robust_mad_scale(x)
+    x_t = (x_t - torch.mean(x_t)).to(dtype=torch.complex64)
+    x_t = robust_mad_scale(x_t)
+    x = x_t.detach().cpu().numpy()
 
     f, _, Z = signal.stft(
         x,
@@ -265,11 +273,20 @@ def decode_tone_pulse_config(
 
     base_f = float(model_out["base_tone_norm"].item()) * sample_rate_hz
     spacing = float(model_out["tone_spacing_norm"].item()) * sample_rate_hz
-    offsets = (np.arange(num_tones, dtype=np.float64) - 0.5 * (num_tones - 1)) * spacing
-    tone_frequencies_hz = [float(np.clip(base_f + df, -0.49 * sample_rate_hz, 0.49 * sample_rate_hz)) for df in offsets]
+    offsets = (torch.arange(num_tones, dtype=torch.float64) - 0.5 * (num_tones - 1)) * spacing
+    tone_frequencies_hz = [
+        float(
+            torch.clamp(
+                base_f + df,
+                min=-0.49 * sample_rate_hz,
+                max=0.49 * sample_rate_hz,
+            ).item()
+        )
+        for df in offsets
+    ]
 
-    amp_raw = model_out["tone_amp_raw"].detach().cpu().numpy().reshape(-1)[:num_tones]
-    tone_amplitudes = (0.05 + 0.95 * (1.0 / (1.0 + np.exp(-amp_raw)))).astype(np.float64).tolist()
+    amp_raw = model_out["tone_amp_raw"].detach().reshape(-1)[:num_tones]
+    tone_amplitudes = (0.05 + 0.95 * torch.sigmoid(amp_raw)).to(dtype=torch.float64).tolist()
 
     peak_power = None if user_peak_power_fraction is None else float(user_peak_power_fraction) * float(rx_input_power)
 
@@ -312,7 +329,7 @@ def decode_tone_pulse_config(
 
 def build_controlled_tone_pulse_from_variable_inputs(
     model: TonePulseTXControlNetVarLen,
-    rx_iq_windows: List[np.ndarray],
+    rx_iq_windows: List[Union[np.ndarray, torch.Tensor]],
     intake_sample_rate_hz: float,
     desired_output_iq_len: Optional[int] = None,
     user_peak_power_fraction: Optional[float] = None,
@@ -323,20 +340,23 @@ def build_controlled_tone_pulse_from_variable_inputs(
         raise ValueError("rx_iq_windows must contain at least one IQ array")
 
     proc = [preprocess_iq_to_stft_feature(x, intake_sample_rate_hz) for x in rx_iq_windows]
-    stft_tensors = [torch.from_numpy(p["feature"]).unsqueeze(0).to(device) for p in proc]
+    stft_tensors = [torch.from_numpy(p["feature"]).unsqueeze(0).to(device) for p in proc]  # type: ignore[arg-type]
 
-    rx_input_power = float(np.mean([float(p["rx_power"]) for p in proc]))
-    rf_center_est_hz = float(np.mean([float(p["peak_hz"]) for p in proc]))
+    rx_power_t = torch.tensor([float(p["rx_power"]) for p in proc], dtype=torch.float32)
+    peak_t = torch.tensor([float(p["peak_hz"]) for p in proc], dtype=torch.float32)
+    rx_input_power = float(rx_power_t.mean().item())
+    rf_center_est_hz = float(peak_t.mean().item())
 
-    lengths = np.asarray([len(np.asarray(x)) for x in rx_iq_windows], dtype=np.float64)
+    lengths = torch.tensor([int(_as_complex_tensor(x).numel()) for x in rx_iq_windows], dtype=torch.float32)
+    max_len = torch.clamp(torch.max(lengths), min=1.0)
     scalar_side = torch.tensor(
         [[
-            np.log10(max(intake_sample_rate_hz, 1.0)) / 10.0,
-            np.mean(lengths) / max(np.max(lengths), 1.0),
-            np.std(lengths) / max(np.max(lengths), 1.0),
+            torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32)).item() / 10.0,
+            float((torch.mean(lengths) / max_len).item()),
+            float((torch.std(lengths, unbiased=False) / max_len).item()),
             rx_input_power,
-            np.mean([float(p["peak_hz"]) for p in proc]) / max(intake_sample_rate_hz, 1.0),
-            np.std([float(p["peak_hz"]) for p in proc]) / max(intake_sample_rate_hz, 1.0),
+            float((peak_t.mean() / max(intake_sample_rate_hz, 1.0)).item()),
+            float((peak_t.std(unbiased=False) / max(intake_sample_rate_hz, 1.0)).item()),
         ]],
         dtype=torch.float32,
     ).to(device)

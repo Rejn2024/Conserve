@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
 from scipy import signal
 
 
@@ -167,22 +168,38 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
     return h.astype(np.float64)
 
 
-def measure_power(x: np.ndarray) -> float:
-    return float(np.mean(np.abs(x) ** 2)) if len(x) else 0.0
+def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x.to(dtype=torch.complex64)
+    return torch.as_tensor(np.asarray(x), dtype=torch.complex64)
 
 
-def measure_peak_power(x: np.ndarray) -> float:
-    return float(np.max(np.abs(x) ** 2)) if len(x) else 0.0
+def _as_numpy_complex64(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().astype(np.complex64, copy=False)
+    return np.asarray(x, dtype=np.complex64)
 
 
-def bpsk_map(bits: List[int]) -> np.ndarray:
-    return np.where(np.asarray(bits, dtype=np.int8) > 0, 1.0, -1.0).astype(np.complex64)
+def measure_power(x: Union[np.ndarray, torch.Tensor]) -> float:
+    xt = _as_complex_tensor(x)
+    return float(torch.mean(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
 
 
-def upsample_and_shape(symbols: np.ndarray, sps: int, taps: np.ndarray) -> np.ndarray:
-    up = np.zeros(len(symbols) * sps, dtype=np.complex64)
-    up[::sps] = symbols
-    y = signal.lfilter(taps, [1.0], up)
+def measure_peak_power(x: Union[np.ndarray, torch.Tensor]) -> float:
+    xt = _as_complex_tensor(x)
+    return float(torch.max(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
+
+
+def bpsk_map(bits: List[int]) -> torch.Tensor:
+    b = torch.tensor(bits, dtype=torch.int8)
+    return torch.where(b > 0, torch.tensor(1.0), torch.tensor(-1.0)).to(dtype=torch.complex64)
+
+
+def upsample_and_shape(symbols: Union[np.ndarray, torch.Tensor], sps: int, taps: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    syms = _as_complex_tensor(symbols)
+    up = torch.zeros(syms.numel() * sps, dtype=torch.complex64)
+    up[::sps] = syms
+    y = signal.lfilter(_as_numpy_complex64(taps), [1.0], _as_numpy_complex64(up))
     return y.astype(np.complex64)
 
 
@@ -192,35 +209,40 @@ def tx_waveform(bits: List[int], sps: int, beta: float, span: int) -> np.ndarray
     return upsample_and_shape(syms, sps=sps, taps=taps)
 
 
-def apply_carrier_frequency(iq: np.ndarray, carrier_hz: float, sample_rate_hz: float) -> np.ndarray:
+def apply_carrier_frequency(iq: Union[np.ndarray, torch.Tensor], carrier_hz: float, sample_rate_hz: float) -> np.ndarray:
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz must be positive")
     if abs(carrier_hz) >= sample_rate_hz / 2:
         raise ValueError("carrier_hz must satisfy |carrier_hz| < sample_rate_hz/2")
+    x = _as_complex_tensor(iq)
     if carrier_hz == 0.0:
-        return iq.astype(np.complex64)
-    n = np.arange(len(iq), dtype=np.float64)
-    rot = np.exp(1j * 2.0 * np.pi * carrier_hz * n / sample_rate_hz)
-    return (iq * rot).astype(np.complex64)
+        return _as_numpy_complex64(x)
+    n = torch.arange(x.numel(), dtype=torch.float64)
+    phase = 2.0 * torch.pi * carrier_hz * n / sample_rate_hz
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    return _as_numpy_complex64(x * rot)
 
 
-def apply_frequency_offset(iq: np.ndarray, freq_offset: float) -> np.ndarray:
+def apply_frequency_offset(iq: Union[np.ndarray, torch.Tensor], freq_offset: float) -> np.ndarray:
+    x = _as_complex_tensor(iq)
     if freq_offset == 0.0:
-        return iq.astype(np.complex64)
-    n = np.arange(len(iq), dtype=np.float64)
-    rot = np.exp(1j * 2.0 * np.pi * freq_offset * n)
-    return (iq * rot).astype(np.complex64)
+        return _as_numpy_complex64(x)
+    n = torch.arange(x.numel(), dtype=torch.float64)
+    phase = 2.0 * torch.pi * freq_offset * n
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    return _as_numpy_complex64(x * rot)
 
 
-def apply_timing_offset_resample(iq: np.ndarray, timing_offset: float) -> np.ndarray:
-    if timing_offset == 1.0 or len(iq) == 0:
-        return iq.astype(np.complex64)
-    new_len = max(1, int(round(len(iq) / timing_offset)))
-    y = signal.resample(iq, new_len)
-    if new_len > len(iq):
-        y = y[:len(iq)]
-    elif new_len < len(iq):
-        y = np.concatenate([y, np.zeros(len(iq) - new_len, dtype=y.dtype)])
+def apply_timing_offset_resample(iq: Union[np.ndarray, torch.Tensor], timing_offset: float) -> np.ndarray:
+    x = _as_numpy_complex64(iq)
+    if timing_offset == 1.0 or len(x) == 0:
+        return x.astype(np.complex64)
+    new_len = max(1, int(round(len(x) / timing_offset)))
+    y = signal.resample(x, new_len)
+    if new_len > len(x):
+        y = y[:len(x)]
+    elif new_len < len(x):
+        y = np.concatenate([y, np.zeros(len(x) - new_len, dtype=y.dtype)])
     return y.astype(np.complex64)
 
 
