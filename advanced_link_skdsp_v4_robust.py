@@ -23,6 +23,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     AF = None
 
+DEFAULT_TORCH_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 FEC_NONE = "none"
 FEC_REP3 = "rep3"
@@ -176,7 +177,7 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
 def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         return x.to(dtype=torch.complex64)
-    return torch.as_tensor(np.asarray(x), dtype=torch.complex64)
+    return torch.as_tensor(np.asarray(x), dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
 
 
 def _as_numpy_complex64(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> np.ndarray:
@@ -253,8 +254,12 @@ def measure_peak_power(x: Union[np.ndarray, torch.Tensor]) -> float:
 
 
 def bpsk_map(bits: List[int]) -> torch.Tensor:
-    b = torch.tensor(bits, dtype=torch.int8)
-    return torch.where(b > 0, torch.tensor(1.0), torch.tensor(-1.0)).to(dtype=torch.complex64)
+    b = torch.tensor(bits, dtype=torch.int8, device=DEFAULT_TORCH_DEVICE)
+    return torch.where(
+        b > 0,
+        torch.tensor(1.0, device=b.device),
+        torch.tensor(-1.0, device=b.device),
+    ).to(dtype=torch.complex64)
 
 
 def upsample_and_shape(symbols: Union[np.ndarray, torch.Tensor], sps: int, taps: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
@@ -376,7 +381,7 @@ def apply_fading(
     multipath_taps: Optional[List[complex]] = None,
     seed: int = 1,
 ) -> torch.Tensor:
-    gen = torch.Generator(device="cpu")
+    gen = torch.Generator(device=DEFAULT_TORCH_DEVICE)
     gen.manual_seed(seed)
     x = _as_complex_tensor(iq)
 
@@ -437,7 +442,7 @@ def add_impulsive_bursts(
     if burst_probability <= 0.0 or x.numel() == 0:
         return x
 
-    gen = torch.Generator(device="cpu")
+    gen = torch.Generator(device=DEFAULT_TORCH_DEVICE)
     gen.manual_seed(seed + 1000)
     out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
@@ -471,9 +476,9 @@ def impair_iq(
     burst_color: str,
     seed: int,
 ) -> torch.Tensor:
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(seed)
     x = _as_complex_tensor(iq)
+    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen.manual_seed(seed)
 
     x = apply_fading(
         x,
@@ -1059,7 +1064,7 @@ def build_tone_pulse_iq_object(
     if total_samples <= 0:
         raise ValueError("target_num_samples must be > 0 when provided")
 
-    gate = torch.zeros(total_samples, dtype=torch.float32)
+    gate = torch.zeros(total_samples, dtype=torch.float32, device=DEFAULT_TORCH_DEVICE)
     for k in range(pulse_count):
         start = start_offset_samples + k * cycle_samples
         end = min(start + pulse_on_samples, total_samples)
@@ -1067,8 +1072,8 @@ def build_tone_pulse_iq_object(
             break
         gate[start:end] = 1.0
 
-    n = torch.arange(total_samples, dtype=torch.float64)
-    iq = torch.zeros(total_samples, dtype=torch.complex64)
+    n = torch.arange(total_samples, dtype=torch.float64, device=DEFAULT_TORCH_DEVICE)
+    iq = torch.zeros(total_samples, dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
     for a, f_hz, ph in zip(tone_amplitudes, tone_frequencies_hz, tone_initial_phases_rad):
         if a == 0.0:
             continue
