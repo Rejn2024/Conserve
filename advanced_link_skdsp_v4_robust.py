@@ -889,15 +889,35 @@ def build_tx_iq_object(
     return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
 
 
+def _scale_iq_to_peak_power(iq: np.ndarray, peak_power: Optional[float]) -> np.ndarray:
+    x = np.asarray(iq, dtype=np.complex64)
+    if peak_power is None:
+        return x
+    if peak_power <= 0.0:
+        raise ValueError("peak_power must be > 0 when provided")
+    if len(x) == 0:
+        return x
+    current_peak_power = float(np.max(np.abs(x) ** 2))
+    if current_peak_power <= 0.0:
+        return x
+    gain = np.sqrt(peak_power / current_peak_power)
+    return (x * gain).astype(np.complex64)
+
+
 def build_tone_pulse_iq_object(
     *,
-    tone_offsets_hz: List[float],
-    pulse_num_samples: int,
-    gap_num_samples: int = 0,
-    tone_amplitude: float = 1.0,
-    target_num_samples: Optional[int] = None,
     sample_rate_hz: float = 1_000_000.0,
     rf_center_hz: float = 0.0,
+    carrier_hz: float = 0.0,
+    target_num_samples: Optional[int] = None,
+    num_tones: int = 1,
+    tone_frequencies_hz: Optional[List[float]] = None,
+    tone_amplitudes: Optional[List[float]] = None,
+    tone_initial_phases_rad: Optional[List[float]] = None,
+    pulse_on_samples: int = 4096,
+    pulse_off_samples: int = 0,
+    pulse_count: int = 1,
+    start_offset_samples: int = 0,
     snr_db: Optional[float] = None,
     noise_color: str = "white",
     freq_offset: float = 0.0,
@@ -911,45 +931,66 @@ def build_tone_pulse_iq_object(
     burst_len_max: int = 64,
     burst_power_ratio_db: float = 12.0,
     burst_color: str = "white",
-    max_peak_power: Optional[float] = None,
+    peak_power: Optional[float] = None,
     seed: int = 1,
 ) -> TXBuildResult:
-    if not tone_offsets_hz:
-        raise ValueError("tone_offsets_hz must contain at least one offset")
     if sample_rate_hz <= 0:
-        raise ValueError("sample_rate_hz must be positive")
-    if pulse_num_samples <= 0:
-        raise ValueError("pulse_num_samples must be > 0")
-    if gap_num_samples < 0:
-        raise ValueError("gap_num_samples must be >= 0")
-    if tone_amplitude <= 0:
-        raise ValueError("tone_amplitude must be > 0")
+        raise ValueError("sample_rate_hz must be > 0")
+    if num_tones <= 0:
+        raise ValueError("num_tones must be > 0")
+    if pulse_on_samples <= 0:
+        raise ValueError("pulse_on_samples must be > 0")
+    if pulse_off_samples < 0:
+        raise ValueError("pulse_off_samples must be >= 0")
+    if pulse_count <= 0:
+        raise ValueError("pulse_count must be > 0")
+    if start_offset_samples < 0:
+        raise ValueError("start_offset_samples must be >= 0")
 
-    pulse_segments: List[np.ndarray] = []
-    n = np.arange(pulse_num_samples, dtype=np.float64)
-    for offset_hz in tone_offsets_hz:
-        if abs(offset_hz) >= sample_rate_hz / 2:
-            raise ValueError("Each tone offset must satisfy |offset_hz| < sample_rate_hz/2")
-        phase = 2.0 * np.pi * offset_hz * n / sample_rate_hz
-        tone = tone_amplitude * np.exp(1j * phase)
-        pulse_segments.append(tone.astype(np.complex64))
-        if gap_num_samples > 0:
-            pulse_segments.append(np.zeros(gap_num_samples, dtype=np.complex64))
+    if tone_frequencies_hz is None:
+        tone_frequencies_hz = [0.0] * num_tones
+    if len(tone_frequencies_hz) != num_tones:
+        raise ValueError("len(tone_frequencies_hz) must equal num_tones")
+    if any(abs(f_hz) >= sample_rate_hz / 2.0 for f_hz in tone_frequencies_hz):
+        raise ValueError("Each tone frequency must satisfy |f_hz| < sample_rate_hz/2")
 
-    if gap_num_samples > 0:
-        pulse_segments = pulse_segments[:-1]
+    if tone_amplitudes is None:
+        tone_amplitudes = [1.0] * num_tones
+    if len(tone_amplitudes) != num_tones:
+        raise ValueError("len(tone_amplitudes) must equal num_tones")
+    if any(a < 0.0 for a in tone_amplitudes):
+        raise ValueError("tone_amplitudes must be non-negative")
 
-    one_burst_iq = np.concatenate(pulse_segments).astype(np.complex64)
+    rng = np.random.default_rng(seed)
+    if tone_initial_phases_rad is None:
+        tone_initial_phases_rad = rng.uniform(0.0, 2.0 * np.pi, size=num_tones).tolist()
+    if len(tone_initial_phases_rad) != num_tones:
+        raise ValueError("len(tone_initial_phases_rad) must equal num_tones")
 
-    if target_num_samples is None:
-        iq = one_burst_iq
-        n_repeats = 1
-    else:
-        if target_num_samples <= 0:
-            raise ValueError("target_num_samples must be > 0")
-        n_repeats = int(math.ceil(target_num_samples / len(one_burst_iq)))
-        iq = np.tile(one_burst_iq, n_repeats)[:target_num_samples].astype(np.complex64)
+    cycle_samples = pulse_on_samples + pulse_off_samples
+    natural_len = start_offset_samples + (pulse_count * cycle_samples) - pulse_off_samples
+    total_samples = natural_len if target_num_samples is None else int(target_num_samples)
+    if total_samples <= 0:
+        raise ValueError("target_num_samples must be > 0 when provided")
 
+    gate = np.zeros(total_samples, dtype=np.float32)
+    for k in range(pulse_count):
+        start = start_offset_samples + k * cycle_samples
+        end = min(start + pulse_on_samples, total_samples)
+        if start >= total_samples:
+            break
+        gate[start:end] = 1.0
+
+    n = np.arange(total_samples, dtype=np.float64)
+    iq = np.zeros(total_samples, dtype=np.complex128)
+    for a, f_hz, ph in zip(tone_amplitudes, tone_frequencies_hz, tone_initial_phases_rad):
+        if a == 0.0:
+            continue
+        iq += a * np.exp(1j * (2.0 * np.pi * f_hz * n / sample_rate_hz + ph))
+    iq = (iq * gate).astype(np.complex64)
+
+    iq = _scale_iq_to_peak_power(iq, peak_power)
+    iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
     iq = impair_iq(
         iq=iq,
         snr_db=snr_db,
@@ -968,19 +1009,22 @@ def build_tone_pulse_iq_object(
         seed=seed,
     )
 
-    iq, peak_limited, pre_limit_peak_power = limit_peak_power(iq, max_peak_power=max_peak_power)
-
     metadata = {
-        "waveform_type": "tone_pulse",
-        "tone_offsets_hz": [float(x) for x in tone_offsets_hz],
-        "pulse_num_samples": pulse_num_samples,
-        "gap_num_samples": gap_num_samples,
-        "tone_amplitude": tone_amplitude,
-        "target_num_samples": target_num_samples,
-        "actual_num_samples": int(len(iq)),
-        "n_repeats": n_repeats,
+        "payload_source": "tone_pulse",
         "sample_rate_hz": sample_rate_hz,
         "rf_center_hz": rf_center_hz,
+        "carrier_hz": carrier_hz,
+        "absolute_rf_hz": rf_center_hz + carrier_hz,
+        "target_num_samples": target_num_samples,
+        "actual_num_samples": int(len(iq)),
+        "num_tones": num_tones,
+        "tone_frequencies_hz": [float(x) for x in tone_frequencies_hz],
+        "tone_amplitudes": [float(x) for x in tone_amplitudes],
+        "tone_initial_phases_rad": [float(x) for x in tone_initial_phases_rad],
+        "pulse_on_samples": pulse_on_samples,
+        "pulse_off_samples": pulse_off_samples,
+        "pulse_count": pulse_count,
+        "start_offset_samples": start_offset_samples,
         "snr_db": snr_db,
         "noise_color": noise_color,
         "freq_offset": freq_offset,
@@ -994,14 +1038,11 @@ def build_tone_pulse_iq_object(
         "burst_len_max": burst_len_max,
         "burst_power_ratio_db": burst_power_ratio_db,
         "burst_color": burst_color,
-        "max_peak_power": max_peak_power,
-        "peak_limit_applied": peak_limited,
-        "pre_limit_peak_power": pre_limit_peak_power,
-        "peak_power": measure_peak_power(iq),
-        "avg_power": measure_power(iq),
+        "peak_power": peak_power,
         "seed": seed,
+        "avg_power": measure_power(iq),
+        "measured_peak_power": float(np.max(np.abs(iq) ** 2)) if len(iq) else 0.0,
     }
-
     return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
 
 
@@ -1364,8 +1405,12 @@ def rx_command(args):
     rx_rf_center_hz = float(args.rf_center_hz)
     sps = int(args.sps)
     symbol_rate_hz = tx_sample_rate_hz / sps
-
+    
+    # print(args)
+    
     baseband_offset_hz = tx_absolute_rf_hz - rx_rf_center_hz
+    # print(f'baseband_offset_hz : {baseband_offset_hz}')
+    
     if abs(baseband_offset_hz) >= tx_sample_rate_hz / 2:
         raise ValueError("RX RF center causes out-of-band baseband offset")
 
@@ -1454,21 +1499,28 @@ def rx_command_iq(iq, meta):
 
     rx_sample_rate_hz = tx_sample_rate_hz
     rx_rf_center_hz = tx_rf_center_hz
-    sps = 8 # default
-    beta = 0.35 # default
-    span = 6 # default
-    coarse_freq_search_hz = 25_000.0
-    coarse_freq_bins = 101
-    sample_phase_search = 3
-    eq_taps = 7
 
-    fec = FEC_NONE
-    interleave = True
-    interleave_rows = 8
+    sps = int(meta["sps"])
+    beta = float(meta["beta"])
+    span = int(meta["span"])
+    sample_rate_hz = float(meta["sample_rate_hz"])
+    rf_center_hz = float(meta["rf_center_hz"])
+
+    fec = meta['fec']
+    # print(f'fec : {fec}')
+    interleave = bool(meta['interleave'])
+    interleave_rows = int(meta['interleave_rows'])
     
+    coarse_freq_search_hz = 25_000.0 # float(meta["coarse_freq_search_hz"])
+    coarse_freq_bins = 101 # int(meta["coarse_freq_bins"])
+    sample_phase_search = 3 # float(meta["sample_phase_search"])
+    eq_taps = 7 # int(meta["eq_taps"])
+
     symbol_rate_hz = tx_sample_rate_hz / sps
 
     baseband_offset_hz = tx_absolute_rf_hz - rx_rf_center_hz
+    # print(f'baseband_offset_hz : {baseband_offset_hz}')
+    
     if abs(baseband_offset_hz) >= tx_sample_rate_hz / 2:
         raise ValueError("RX RF center causes out-of-band baseband offset")
 
@@ -1499,7 +1551,7 @@ def rx_command_iq(iq, meta):
     payload = None
     sample_offset_used = None
 
-    for sample_delta in range(sample_phase_search, sample_phase_search + 1):
+    for sample_delta in range(-sample_phase_search, sample_phase_search + 1):
         symbols = extract_symbols_from_start(
             mf=mf,
             start_index_samples=coarse_start,

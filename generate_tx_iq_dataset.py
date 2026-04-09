@@ -97,6 +97,7 @@ def conservative_fallback_params(rng: random.Random) -> Dict:
     """
     Easier channel used after repeated failures.
     """
+    print("resorted to fallback")
     sample_rate_hz = rng.choice([1_000_000_000.0, 2_000_000_000.0, 4_000_000_000.0])
     rf_center_hz = rng.choice([433_920_000.0, 915_000_000.0, 2_400_000_000.0])
 
@@ -331,6 +332,8 @@ def build_decodable_sample(
                 "payload_len": int(rx_result.get("payload_len", 0)),
                 "message_is_text": rx_result.get("message") is not None,
             }
+
+            print("sucessfully generated data")
             return tx_result.iq.astype(np.complex64), whole_meta
 
     raise RuntimeError(
