@@ -417,17 +417,7 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=torch.complex64)
-        xr = x.real.to(dtype=torch.float32).reshape(1, 1, -1)
-        xi = x.imag.to(dtype=torch.float32).reshape(1, 1, -1)
-        kr = torch.flip(taps_t.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        ki = torch.flip(taps_t.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        pad = taps_t.numel() - 1
-        xr_pad = F.pad(xr, (pad, 0))
-        xi_pad = F.pad(xi, (pad, 0))
-        yr = F.conv1d(xr_pad, kr).reshape(-1) - F.conv1d(xi_pad, ki).reshape(-1)
-        yi = F.conv1d(xr_pad, ki).reshape(-1) + F.conv1d(xi_pad, kr).reshape(-1)
-        y = torch.complex(yr, yi).to(dtype=torch.complex64)
+        y = _complex_lfilter_fir(x, taps)
         return y[: x.numel()].to(dtype=torch.complex64)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
