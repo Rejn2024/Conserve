@@ -413,7 +413,7 @@ def build_controlled_tone_pulse_from_variable_inputs(
     return {
         "tx_config": cfg,
         "model_outputs": y,
-        "tx_iq": _as_complex_tensor(tx_result.iq),
+        "tx_iq": tx_result.iq,
         "tx_metadata": tx_metadata,
         "rx_input_power": rx_input_power,
         "rf_center_est_hz": rf_center_est_hz,
