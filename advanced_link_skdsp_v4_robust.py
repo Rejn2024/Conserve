@@ -184,6 +184,9 @@ def measure_power(x: Union[np.ndarray, torch.Tensor]) -> float:
     xt = _as_complex_tensor(x)
     return float(torch.mean(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
 
+def measure_peak_power(x: Union[np.ndarray, torch.Tensor]) -> float:
+    xt = _as_complex_tensor(x)
+    return float(torch.max(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
 
 def measure_peak_power(x: Union[np.ndarray, torch.Tensor]) -> float:
     xt = _as_complex_tensor(x)
@@ -1259,6 +1262,7 @@ def apply_pilot_phase_tracking(
     data_only_len: int,
     access_and_headers_len: int,
 ) -> np.ndarray:
+    symbols = _as_numpy_complex64(symbols)
     if len(symbols) < access_and_headers_len + data_with_pilots_len:
         return symbols.astype(np.complex64)
 
@@ -1266,7 +1270,7 @@ def apply_pilot_phase_tracking(
     payload_stream = y[access_and_headers_len:access_and_headers_len + data_with_pilots_len]
 
     pos = pilot_positions(data_only_len, interval=PILOT_INTERVAL_BITS, p_len=PILOT_BLOCK_BITS)
-    pilot_syms = bpsk_map(PILOT_BITS)
+    pilot_syms = _as_numpy_complex64(bpsk_map(PILOT_BITS))
 
     phase_est = 0.0
     for data_start, data_end, pilot_start, pilot_end in pos:
@@ -1304,14 +1308,15 @@ def choose_valid_header_from_copies(header_soft_all: np.ndarray) -> Optional[int
 
 
 def try_decode_from_symbols(
-    symbols: np.ndarray,
+    symbols: Union[np.ndarray, torch.Tensor],
     fec_mode: str,
     interleave: bool,
     interleave_rows: int,
     symbol_rate_hz: float,
     eq_taps: int,
 ) -> Optional[bytes]:
-    access_syms = bpsk_map(ACCESS_BITS)
+    symbols = _as_numpy_complex64(symbols)
+    access_syms = _as_numpy_complex64(bpsk_map(ACCESS_BITS))
 
     if len(symbols) < len(access_syms) + HEADER_COPIES * HEADER_PROT_BITS_LEN:
         return None
@@ -1325,13 +1330,13 @@ def try_decode_from_symbols(
         return None
 
     rx_train = symbols[train_start:train_end]
-    tx_train = access_syms[train_start:train_end]
+    tx_train = _as_numpy_complex64(access_syms[train_start:train_end])
 
     w = design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3)
     eq_symbols = apply_symbol_equalizer(symbols, w)
 
     rx_train_eq = eq_symbols[train_start:train_end]
-    ph = np.angle(np.sum(rx_train_eq * np.conj(tx_train)))
+    ph = np.angle(np.sum(_as_numpy_complex64(rx_train_eq) * np.conj(tx_train)))
     eq_symbols *= np.exp(-1j * ph)
 
     soft_bits = np.real(eq_symbols).astype(np.float64)
@@ -1494,6 +1499,8 @@ def rx_command(args):
 def rx_command_iq(iq, meta):
     # iq = load_iq(args.input)
     # meta = load_iq_metadata(args.input, metadata_path=args.metadata_path)
+
+    iq = _as_numpy_complex64(iq)
 
     tx_sample_rate_hz = float(meta["sample_rate_hz"])
     tx_rf_center_hz = float(meta["rf_center_hz"])
