@@ -362,7 +362,7 @@ def build_controlled_tone_pulse_from_variable_inputs(
     ).to(device)
 
     model = model.to(device)
-    model.eval()
+    # model.eval()
     with torch.no_grad():
         y = model(stft_tensors, scalar_side)
 
