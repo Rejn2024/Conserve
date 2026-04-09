@@ -342,8 +342,8 @@ def _complex_colored_noise(
     alpha = exponents[color]
 
     if n <= 0:
-        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device(DEFAULT_TORCH_DEVICE ))
-    dev = device or torch.device("cpu")
+        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device(DEFAULT_TORCH_DEVICE))
+    dev = device or torch.device(DEFAULT_TORCH_DEVICE)
 
     def make_real() -> torch.Tensor:
         freqs = torch.fft.rfftfreq(n, d=1.0, device=dev)
@@ -477,7 +477,7 @@ def impair_iq(
     seed: int,
 ) -> torch.Tensor:
     x = _as_complex_tensor(iq)
-    gen = torch.Generator(device=x.device if x.is_cuda else DEFAULT_TORCH_DEVICE DEFAULT_TORCH_DEVICE )
+    gen = torch.Generator(device=x.device if x.is_cuda else DEFAULT_TORCH_DEVICE)
     gen.manual_seed(seed)
 
     x = apply_fading(
@@ -1235,27 +1235,26 @@ def coarse_frequency_acquire(
     if x.numel() < ref.numel():
         raise RuntimeError("IQ shorter than reference waveform")
 
-    best_metric = -1.0
-    best_start = 0
-    best_cfo = 0.0
-
     n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
-    k = torch.flip(torch.conj(ref), dims=[0]).reshape(1, 1, -1)
+    kr = torch.flip(torch.conj(ref).real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+    ki = torch.flip(torch.conj(ref).imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
 
-    for f_hz in bins:
-        phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
-        rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-        y = x * rot
-        yr = F.conv1d(y.real.reshape(1, 1, -1), k.real).reshape(-1) - F.conv1d(y.imag.reshape(1, 1, -1), k.imag).reshape(-1)
-        yi = F.conv1d(y.real.reshape(1, 1, -1), k.imag).reshape(-1) + F.conv1d(y.imag.reshape(1, 1, -1), k.real).reshape(-1)
-        mag = torch.abs(torch.complex(yr, yi))
-        idx = int(torch.argmax(mag).item())
-        metric = float(mag[idx].item())
-        if metric > best_metric:
-            best_metric = metric
-            best_start = idx
-            best_cfo = float(f_hz.item())
+    phase = -2.0 * torch.pi * bins[:, None] * n[None, :] / sample_rate_hz
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    y = x[None, :] * rot  # [n_bins, n_samples]
+
+    yr_in = y.real.to(dtype=torch.float32).unsqueeze(1)  # [B,1,N]
+    yi_in = y.imag.to(dtype=torch.float32).unsqueeze(1)  # [B,1,N]
+    yr = F.conv1d(yr_in, kr).squeeze(1) - F.conv1d(yi_in, ki).squeeze(1)
+    yi = F.conv1d(yr_in, ki).squeeze(1) + F.conv1d(yi_in, kr).squeeze(1)
+    mag = torch.abs(torch.complex(yr, yi))  # [B, valid_len]
+
+    per_bin_metric, per_bin_idx = torch.max(mag, dim=1)
+    best_bin = int(torch.argmax(per_bin_metric).item())
+    best_metric = float(per_bin_metric[best_bin].item())
+    best_start = int(per_bin_idx[best_bin].item())
+    best_cfo = float(bins[best_bin].item())
 
     return best_start, best_cfo, best_metric
 
