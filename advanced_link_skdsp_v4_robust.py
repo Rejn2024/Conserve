@@ -194,25 +194,32 @@ def _complex_lfilter_fir(
     if xt.numel() == 0:
         return xt
 
-    if AF is not None:
-        y_r = AF.lfilter(
-            waveform=xt.real.unsqueeze(0),
-            a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
-            b_coeffs=ht.real.to(dtype=torch.float32),
-        ).squeeze(0)
-        y_i = AF.lfilter(
-            waveform=xt.imag.unsqueeze(0),
-            a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
-            b_coeffs=ht.real.to(dtype=torch.float32),
-        ).squeeze(0)
-        return torch.complex(y_r, y_i).to(dtype=torch.complex64)
+    # if AF is not None:
+    #     y_r = AF.lfilter(
+    #         waveform=xt.real.unsqueeze(0),
+    #         a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
+    #         b_coeffs=ht.real.to(dtype=torch.float32),
+    #     ).squeeze(0)
+    #     y_i = AF.lfilter(
+    #         waveform=xt.imag.unsqueeze(0),
+    #         a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
+    #         b_coeffs=ht.real.to(dtype=torch.float32),
+    #     ).squeeze(0)
+    #     return torch.complex(y_r, y_i).to(dtype=torch.complex64)
 
     k = torch.flip(ht, dims=[0]).reshape(1, 1, -1)
+    kr = k.real.reshape(1, 1, -1)
+    ki = k.imag.reshape(1, 1, -1)
     xr = xt.real.reshape(1, 1, -1)
     xi = xt.imag.reshape(1, 1, -1)
     pad = ht.numel() - 1
-    yr = F.conv1d(F.pad(xr, (pad, 0)), k).reshape(-1)
-    yi = F.conv1d(F.pad(xi, (pad, 0)), k).reshape(-1)
+    
+    print(f'xr.dtype : {xr.dtype}')
+    print(f'k.dtype : {k.dtype}')
+    print(f'type(pad) : {type(pad)}')
+    
+    yr = F.conv1d(F.pad(xr, (pad, 0)), kr).reshape(-1)
+    yi = F.conv1d(F.pad(xi, (pad, 0)), ki).reshape(-1)
     return torch.complex(yr, yi).to(dtype=torch.complex64)
 
 
