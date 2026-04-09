@@ -530,25 +530,28 @@ def limit_peak_power(iq: Union[np.ndarray, torch.Tensor], max_peak_power: Option
     return (x * scale).to(dtype=torch.complex64), True, pre_peak_power
 
 
-def robust_agc_and_blanking(x: np.ndarray, blanker_k: float = 6.0) -> np.ndarray:
-    x = np.asarray(x, dtype=np.complex64)
-    x = x - np.mean(x)
+def robust_agc_and_blanking(x: Union[np.ndarray, torch.Tensor], blanker_k: float = 6.0) -> torch.Tensor:
+    xt = _as_complex_tensor(x)
+    if xt.numel() == 0:
+        return xt
 
-    mag = np.abs(x)
-    med = np.median(mag)
-    mad = np.median(np.abs(mag - med)) + 1e-12
+    xt = xt - torch.mean(xt)
+    mag = torch.abs(xt)
+    med = torch.median(mag)
+    mad = torch.median(torch.abs(mag - med)) + 1e-12
     thresh = med + blanker_k * 1.4826 * mad
 
-    if thresh > 0:
+    if float(thresh.item()) > 0.0:
         over = mag > thresh
-        if np.any(over):
-            x = np.array(x, copy=True)
-            x[over] = thresh * np.exp(1j * np.angle(x[over]))
+        if bool(torch.any(over).item()):
+            clamped = thresh * torch.exp(1j * torch.angle(xt[over]))
+            xt = xt.clone()
+            xt[over] = clamped
 
-    p = measure_power(x)
-    if p > 0:
-        x = x / np.sqrt(p)
-    return x.astype(np.complex64)
+    p = torch.mean(torch.abs(xt) ** 2)
+    if float(p.item()) > 0:
+        xt = xt / torch.sqrt(p)
+    return xt.to(dtype=torch.complex64)
 
 
 def lfsr_sequence(n: int, seed: int = 0x5D) -> List[int]:
@@ -1225,22 +1228,24 @@ def tx_command(args):
 
 
 def coarse_frequency_acquire(
-    iq: np.ndarray,
-    ref_waveform: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
+    ref_waveform: Union[np.ndarray, torch.Tensor],
     sample_rate_hz: float,
     search_hz: float,
     n_bins: int,
 ) -> Tuple[int, float, float]:
-    if len(iq) < len(ref_waveform):
+    x = _as_complex_tensor(iq)
+    ref = _as_complex_tensor(ref_waveform)
+    if x.numel() < ref.numel():
         raise RuntimeError("IQ shorter than reference waveform")
 
     best_metric = -1.0
     best_start = 0
     best_cfo = 0.0
 
-    n = np.arange(len(iq), dtype=np.float64)
-    bins = np.linspace(-search_hz, search_hz, n_bins)
-    ref = np.asarray(ref_waveform, dtype=np.complex64)
+    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
+    bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
+    k = torch.flip(torch.conj(ref), dims=[0]).reshape(1, 1, -1)
 
     for f_hz in bins:
         rot = np.exp(-1j * 2.0 * np.pi * f_hz * n / sample_rate_hz)
@@ -1252,56 +1257,60 @@ def coarse_frequency_acquire(
         if metric > best_metric:
             best_metric = metric
             best_start = idx
-            best_cfo = float(f_hz)
+            best_cfo = float(f_hz.item())
 
     return best_start, best_cfo, best_metric
 
 
 def estimate_residual_cfo_from_preamble(
-    symbols: np.ndarray,
+    symbols: Union[np.ndarray, torch.Tensor],
     symbol_rate_hz: float,
 ) -> float:
+    syms = _as_complex_tensor(symbols)
     half = PREAMBLE_HALF_LEN_BITS
     reps = PREAMBLE_REPS
-    if len(symbols) < PREAMBLE_BITS_LEN:
+    if syms.numel() < PREAMBLE_BITS_LEN:
         return 0.0
 
     phases = []
     for r in range(reps - 1):
-        s1 = symbols[r * half:(r + 1) * half]
-        s2 = symbols[(r + 1) * half:(r + 2) * half]
-        if len(s1) == half and len(s2) == half:
-            ph = np.angle(np.sum(s2 * np.conj(s1)))
+        s1 = syms[r * half:(r + 1) * half]
+        s2 = syms[(r + 1) * half:(r + 2) * half]
+        if s1.numel() == half and s2.numel() == half:
+            ph = torch.angle(torch.sum(s2 * torch.conj(s1)))
             phases.append(ph / (2.0 * np.pi * half))
     if not phases:
         return 0.0
-    return float(np.mean(phases) * symbol_rate_hz)
+    return float(torch.mean(torch.stack(phases)).item() * symbol_rate_hz)
 
 
-def apply_symbol_rate_cfo(symbols: np.ndarray, cfo_hz: float, symbol_rate_hz: float) -> np.ndarray:
+def apply_symbol_rate_cfo(symbols: Union[np.ndarray, torch.Tensor], cfo_hz: float, symbol_rate_hz: float) -> torch.Tensor:
+    syms = _as_complex_tensor(symbols)
     if cfo_hz == 0.0:
-        return symbols.astype(np.complex64)
-    n = np.arange(len(symbols), dtype=np.float64)
-    rot = np.exp(-1j * 2.0 * np.pi * cfo_hz * n / symbol_rate_hz)
-    return (symbols * rot).astype(np.complex64)
+        return syms
+    n = torch.arange(syms.numel(), dtype=torch.float64, device=syms.device)
+    phase = -2.0 * torch.pi * cfo_hz * n / symbol_rate_hz
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    return (syms * rot).to(dtype=torch.complex64)
 
 
-def matched_filter(iq: np.ndarray, sps: int, beta: float, span: int) -> np.ndarray:
+def matched_filter(iq: Union[np.ndarray, torch.Tensor], sps: int, beta: float, span: int) -> torch.Tensor:
     taps = rrc_taps(beta=beta, sps=sps, span=span)
     return _as_numpy_complex64(_complex_lfilter_fir(iq, taps))
 
 
 def extract_symbols_from_start(
-    mf: np.ndarray,
+    mf: Union[np.ndarray, torch.Tensor],
     start_index_samples: int,
     sps: int,
     span: int,
     sample_delta: int = 0,
-) -> np.ndarray:
+) -> torch.Tensor:
+    mft = _as_complex_tensor(mf)
     first = start_index_samples + 2 * span * sps + sample_delta
-    if first < 0 or first >= len(mf):
-        return np.array([], dtype=np.complex64)
-    return np.asarray(mf[first::sps], dtype=np.complex64)
+    if first < 0 or first >= mft.numel():
+        return torch.zeros(0, dtype=torch.complex64, device=mft.device)
+    return mft[first::sps].to(dtype=torch.complex64)
 
 
 def design_symbol_equalizer_ls(
@@ -1309,74 +1318,78 @@ def design_symbol_equalizer_ls(
     tx_train: Union[np.ndarray, torch.Tensor],
     ntaps: int = 7,
     ridge: float = 1e-3,
-) -> np.ndarray:
-    rx_train_np = _as_numpy_complex64(rx_train)
-    tx_train_np = _as_numpy_complex64(tx_train)
+) -> torch.Tensor:
+    rx_train_t = _as_complex_tensor(rx_train)
+    tx_train_t = _as_complex_tensor(tx_train)
 
     if ntaps % 2 == 0:
         raise ValueError("ntaps must be odd")
-    if len(rx_train_np) != len(tx_train_np):
+    if rx_train_t.numel() != tx_train_t.numel():
         raise ValueError("Training sequences must have same length")
-    if len(rx_train_np) < ntaps:
-        return np.array([1.0 + 0.0j], dtype=np.complex64)
+    if rx_train_t.numel() < ntaps:
+        return torch.tensor([1.0 + 0.0j], dtype=torch.complex64, device=rx_train_t.device)
 
     half = ntaps // 2
-    rpad = np.pad(rx_train_np, (half, half), mode="constant")
-    X = np.stack([rpad[i:i + ntaps] for i in range(len(rx_train_np))], axis=0)
+    rpad = F.pad(rx_train_t.reshape(1, 1, -1), (half, half)).reshape(-1)
+    X = torch.stack([rpad[i:i + ntaps] for i in range(rx_train_t.numel())], dim=0)
 
-    A = X.conj().T @ X + ridge * np.eye(ntaps, dtype=np.complex128)
-    b = X.conj().T @ tx_train_np
-    w = np.linalg.solve(A, b)
-    return w.astype(np.complex64)
+    A = X.conj().T @ X + ridge * torch.eye(ntaps, dtype=torch.complex64, device=rx_train_t.device)
+    b = X.conj().T @ tx_train_t
+    w = torch.linalg.solve(A, b)
+    return w.to(dtype=torch.complex64)
 
 
-def apply_symbol_equalizer(symbols: np.ndarray, w: np.ndarray) -> np.ndarray:
-    ntaps = len(w)
+def apply_symbol_equalizer(symbols: Union[np.ndarray, torch.Tensor], w: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    sym_t = _as_complex_tensor(symbols)
+    w_t = _as_complex_tensor(w)
+    ntaps = int(w_t.numel())
     if ntaps == 1:
-        return (symbols * w[0]).astype(np.complex64)
+        return (sym_t * w_t[0]).to(dtype=torch.complex64)
 
     half = ntaps // 2
-    spad = np.pad(symbols, (half, half), mode="constant")
-    out = np.empty(len(symbols), dtype=np.complex64)
-
-    for i in range(len(symbols)):
-        x = spad[i:i + ntaps]
-        out[i] = np.dot(x, w)
-
-    return out
+    spad = F.pad(sym_t.reshape(1, 1, -1), (half, half)).reshape(-1)
+    X = torch.stack([spad[i:i + ntaps] for i in range(sym_t.numel())], dim=0)
+    out = X @ w_t
+    return out.to(dtype=torch.complex64)
 
 
 def apply_pilot_phase_tracking(
-    symbols: np.ndarray,
+    symbols: Union[np.ndarray, torch.Tensor],
     data_with_pilots_len: int,
     data_only_len: int,
     access_and_headers_len: int,
-) -> np.ndarray:
-    symbols = _as_numpy_complex64(symbols)
-    if len(symbols) < access_and_headers_len + data_with_pilots_len:
-        return symbols.astype(np.complex64)
+) -> torch.Tensor:
+    symbols_t = _as_complex_tensor(symbols)
+    if symbols_t.numel() < access_and_headers_len + data_with_pilots_len:
+        return symbols_t.to(dtype=torch.complex64)
 
-    y = np.array(symbols, copy=True)
+    y = symbols_t.clone()
     payload_stream = y[access_and_headers_len:access_and_headers_len + data_with_pilots_len]
 
     pos = pilot_positions(data_only_len, interval=PILOT_INTERVAL_BITS, p_len=PILOT_BLOCK_BITS)
-    pilot_syms = _as_numpy_complex64(bpsk_map(PILOT_BITS))
+    pilot_syms = bpsk_map(PILOT_BITS).to(device=symbols_t.device)
 
     phase_est = 0.0
     for data_start, data_end, pilot_start, pilot_end in pos:
-        if pilot_start >= 0 and pilot_end <= len(payload_stream):
+        if pilot_start >= 0 and pilot_end <= payload_stream.numel():
             rx_pilot = payload_stream[pilot_start:pilot_end]
-            if len(rx_pilot) == len(pilot_syms):
-                ph = np.angle(np.sum(rx_pilot * np.conj(pilot_syms)))
-                phase_est = ph
-                payload_stream[data_start:pilot_start] *= np.exp(-1j * phase_est)
+            if rx_pilot.numel() == pilot_syms.numel():
+                ph = torch.angle(torch.sum(rx_pilot * torch.conj(pilot_syms)))
+                phase_est = float(ph.item())
+                payload_stream[data_start:pilot_start] *= torch.exp(
+                    torch.tensor(-1j * phase_est, dtype=torch.complex64, device=symbols_t.device)
+                )
             else:
-                payload_stream[data_start:data_end] *= np.exp(-1j * phase_est)
+                payload_stream[data_start:data_end] *= torch.exp(
+                    torch.tensor(-1j * phase_est, dtype=torch.complex64, device=symbols_t.device)
+                )
         else:
-            payload_stream[data_start:data_end] *= np.exp(-1j * phase_est)
+            payload_stream[data_start:data_end] *= torch.exp(
+                torch.tensor(-1j * phase_est, dtype=torch.complex64, device=symbols_t.device)
+            )
 
     y[access_and_headers_len:access_and_headers_len + data_with_pilots_len] = payload_stream
-    return y.astype(np.complex64)
+    return y.to(dtype=torch.complex64)
 
 
 def choose_valid_header_from_copies(header_soft_all: np.ndarray) -> Optional[int]:
@@ -1405,38 +1418,40 @@ def try_decode_from_symbols(
     symbol_rate_hz: float,
     eq_taps: int,
 ) -> Optional[bytes]:
-    symbols = _as_numpy_complex64(symbols)
-    access_syms = _as_numpy_complex64(bpsk_map(ACCESS_BITS))
+    symbols_t = _as_complex_tensor(symbols)
+    access_syms = bpsk_map(ACCESS_BITS).to(device=symbols_t.device)
 
-    if len(symbols) < len(access_syms) + HEADER_COPIES * HEADER_PROT_BITS_LEN:
+    if symbols_t.numel() < access_syms.numel() + HEADER_COPIES * HEADER_PROT_BITS_LEN:
         return None
 
-    residual_cfo_hz = estimate_residual_cfo_from_preamble(symbols[:PREAMBLE_BITS_LEN], symbol_rate_hz)
-    symbols = apply_symbol_rate_cfo(symbols, residual_cfo_hz, symbol_rate_hz)
+    residual_cfo_hz = estimate_residual_cfo_from_preamble(symbols_t[:PREAMBLE_BITS_LEN], symbol_rate_hz)
+    symbols_t = apply_symbol_rate_cfo(symbols_t, residual_cfo_hz, symbol_rate_hz)
 
     train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
     train_end = train_start + TRAINING_LEN_BITS
-    if len(symbols) < train_end:
+    if symbols_t.numel() < train_end:
         return None
 
-    rx_train = symbols[train_start:train_end]
-    tx_train = _as_numpy_complex64(access_syms[train_start:train_end])
+    rx_train = symbols_t[train_start:train_end]
+    tx_train = access_syms[train_start:train_end]
 
     w = design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3)
-    eq_symbols = apply_symbol_equalizer(symbols, w)
+    eq_symbols = apply_symbol_equalizer(symbols_t, w)
 
     rx_train_eq = eq_symbols[train_start:train_end]
-    ph = np.angle(np.sum(_as_numpy_complex64(rx_train_eq) * np.conj(tx_train)))
-    eq_symbols *= np.exp(-1j * ph)
+    ph = torch.angle(torch.sum(rx_train_eq * torch.conj(tx_train)))
+    eq_symbols = eq_symbols * torch.exp(torch.tensor(-1j * float(ph.item()), dtype=torch.complex64, device=eq_symbols.device))
 
-    soft_bits = np.real(eq_symbols).astype(np.float64)
+    soft_bits = eq_symbols.real.to(dtype=torch.float64)
 
     hdr_start = ACCESS_BITS_LEN
     hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
-    if hdr_end > len(soft_bits):
+    if hdr_end > soft_bits.numel():
         return None
 
-    payload_len = choose_valid_header_from_copies(soft_bits[hdr_start:hdr_end])
+    payload_len = choose_valid_header_from_copies(
+        soft_bits[hdr_start:hdr_end].detach().cpu().numpy().astype(np.float64, copy=False)
+    )
     if payload_len is None:
         return None
 
@@ -1449,7 +1464,7 @@ def try_decode_from_symbols(
 
     data_start = hdr_end
     data_end = data_start + payload_with_pilots_bits
-    if data_end > len(soft_bits):
+    if data_end > soft_bits.numel():
         return None
 
     eq_symbols = apply_pilot_phase_tracking(
@@ -1458,9 +1473,9 @@ def try_decode_from_symbols(
         data_only_len=payload_coded_bits,
         access_and_headers_len=data_start,
     )
-    soft_bits = np.real(eq_symbols).astype(np.float64)
+    soft_bits = eq_symbols.real.to(dtype=torch.float64)
 
-    payload_soft_with_pilots = soft_bits[data_start:data_end]
+    payload_soft_with_pilots = soft_bits[data_start:data_end].detach().cpu().numpy().astype(np.float64, copy=False)
     payload_soft = remove_pilots_soft(
         payload_soft_with_pilots,
         original_data_len=payload_coded_bits,
@@ -1483,7 +1498,7 @@ def try_decode_from_symbols(
 
 
 def rx_command(args):
-    iq = load_iq(args.input)
+    iq = _as_complex_tensor(load_iq(args.input))
     meta = load_iq_metadata(args.input, metadata_path=args.metadata_path)
 
     if meta is not None:
@@ -1590,7 +1605,7 @@ def rx_command_iq(iq, meta):
     # iq = load_iq(args.input)
     # meta = load_iq_metadata(args.input, metadata_path=args.metadata_path)
 
-    iq = _as_numpy_complex64(iq)
+    iq = _as_complex_tensor(iq)
 
     tx_sample_rate_hz = float(meta["sample_rate_hz"])
     tx_rf_center_hz = float(meta["rf_center_hz"])
