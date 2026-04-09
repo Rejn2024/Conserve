@@ -16,7 +16,12 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from scipy import signal
+import torch.nn.functional as F
+
+try:
+    import torchaudio.functional as AF
+except Exception:  # pragma: no cover - optional dependency
+    AF = None
 
 
 FEC_NONE = "none"
@@ -45,8 +50,8 @@ POSTAMBLE_BITS = 256
 # Raw IQ / metadata helpers
 # -----------------------------------------------------------------------------
 
-def save_iq(path: Union[str, Path], iq: np.ndarray) -> None:
-    np.asarray(iq, dtype=np.complex64).tofile(str(path))
+def save_iq(path: Union[str, Path], iq: Union[np.ndarray, torch.Tensor]) -> None:
+    np.asarray(_as_numpy_complex64(iq), dtype=np.complex64).tofile(str(path))
 
 
 def load_iq(path: Union[str, Path]) -> np.ndarray:
@@ -180,6 +185,69 @@ def _as_numpy_complex64(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> np
     return np.asarray(x, dtype=np.complex64)
 
 
+def _complex_lfilter_fir(
+    x: Union[np.ndarray, torch.Tensor, List[complex]],
+    taps: Union[np.ndarray, torch.Tensor, List[complex]],
+) -> torch.Tensor:
+    xt = _as_complex_tensor(x)
+    ht = _as_complex_tensor(taps)
+    if xt.numel() == 0:
+        return xt
+
+    if AF is not None:
+        y_r = AF.lfilter(
+            waveform=xt.real.unsqueeze(0),
+            a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
+            b_coeffs=ht.real.to(dtype=torch.float32),
+        ).squeeze(0)
+        y_i = AF.lfilter(
+            waveform=xt.imag.unsqueeze(0),
+            a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
+            b_coeffs=ht.real.to(dtype=torch.float32),
+        ).squeeze(0)
+        return torch.complex(y_r, y_i).to(dtype=torch.complex64)
+
+    k = torch.flip(ht, dims=[0]).reshape(1, 1, -1)
+    xr = xt.real.reshape(1, 1, -1)
+    xi = xt.imag.reshape(1, 1, -1)
+    pad = ht.numel() - 1
+    yr = F.conv1d(F.pad(xr, (pad, 0)), k).reshape(-1)
+    yi = F.conv1d(F.pad(xi, (pad, 0)), k).reshape(-1)
+    return torch.complex(yr, yi).to(dtype=torch.complex64)
+
+
+def _resample_complex_to_len(
+    x: Union[np.ndarray, torch.Tensor, List[complex]],
+    new_len: int,
+) -> torch.Tensor:
+    xt = _as_complex_tensor(x)
+    if new_len <= 0:
+        raise ValueError("new_len must be positive")
+    if xt.numel() == 0:
+        return xt
+    if int(new_len) == int(xt.numel()):
+        return xt
+
+    old_len = int(xt.numel())
+    if AF is not None:
+        y_r = AF.resample(xt.real.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
+        y_i = AF.resample(xt.imag.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
+    else:
+        y_r = F.interpolate(
+            xt.real.reshape(1, 1, -1),
+            size=int(new_len),
+            mode="linear",
+            align_corners=False,
+        ).reshape(-1)
+        y_i = F.interpolate(
+            xt.imag.reshape(1, 1, -1),
+            size=int(new_len),
+            mode="linear",
+            align_corners=False,
+        ).reshape(-1)
+    return torch.complex(y_r, y_i).to(dtype=torch.complex64)
+
+
 def measure_power(x: Union[np.ndarray, torch.Tensor]) -> float:
     xt = _as_complex_tensor(x)
     return float(torch.mean(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
@@ -198,72 +266,74 @@ def bpsk_map(bits: List[int]) -> torch.Tensor:
     return torch.where(b > 0, torch.tensor(1.0), torch.tensor(-1.0)).to(dtype=torch.complex64)
 
 
-def upsample_and_shape(symbols: Union[np.ndarray, torch.Tensor], sps: int, taps: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+def upsample_and_shape(symbols: Union[np.ndarray, torch.Tensor], sps: int, taps: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     syms = _as_complex_tensor(symbols)
-    up = torch.zeros(syms.numel() * sps, dtype=torch.complex64)
+    up = torch.zeros(syms.numel() * sps, dtype=torch.complex64, device=syms.device)
     up[::sps] = syms
-    y = signal.lfilter(_as_numpy_complex64(taps), [1.0], _as_numpy_complex64(up))
-    return y.astype(np.complex64)
+    return _complex_lfilter_fir(up, taps)
 
 
-def tx_waveform(bits: List[int], sps: int, beta: float, span: int) -> np.ndarray:
+def tx_waveform(bits: List[int], sps: int, beta: float, span: int) -> torch.Tensor:
     syms = bpsk_map(bits)
     taps = rrc_taps(beta=beta, sps=sps, span=span)
     return upsample_and_shape(syms, sps=sps, taps=taps)
 
 
-def apply_carrier_frequency(iq: Union[np.ndarray, torch.Tensor], carrier_hz: float, sample_rate_hz: float) -> np.ndarray:
+def apply_carrier_frequency(iq: Union[np.ndarray, torch.Tensor], carrier_hz: float, sample_rate_hz: float) -> torch.Tensor:
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz must be positive")
     if abs(carrier_hz) >= sample_rate_hz / 2:
         raise ValueError("carrier_hz must satisfy |carrier_hz| < sample_rate_hz/2")
     x = _as_complex_tensor(iq)
     if carrier_hz == 0.0:
-        return _as_numpy_complex64(x)
-    n = torch.arange(x.numel(), dtype=torch.float64)
+        return x
+    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     phase = 2.0 * torch.pi * carrier_hz * n / sample_rate_hz
     rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-    return _as_numpy_complex64(x * rot)
+    return x * rot
 
 
-def apply_frequency_offset(iq: Union[np.ndarray, torch.Tensor], freq_offset: float) -> np.ndarray:
+def apply_frequency_offset(iq: Union[np.ndarray, torch.Tensor], freq_offset: float) -> torch.Tensor:
     x = _as_complex_tensor(iq)
     if freq_offset == 0.0:
-        return _as_numpy_complex64(x)
-    n = torch.arange(x.numel(), dtype=torch.float64)
+        return x
+    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     phase = 2.0 * torch.pi * freq_offset * n
     rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-    return _as_numpy_complex64(x * rot)
+    return x * rot
 
 
-def apply_timing_offset_resample(iq: Union[np.ndarray, torch.Tensor], timing_offset: float) -> np.ndarray:
-    x = _as_numpy_complex64(iq)
-    if timing_offset == 1.0 or len(x) == 0:
-        return x.astype(np.complex64)
-    new_len = max(1, int(round(len(x) / timing_offset)))
-    y = signal.resample(x, new_len)
-    if new_len > len(x):
-        y = y[:len(x)]
-    elif new_len < len(x):
-        y = np.concatenate([y, np.zeros(len(x) - new_len, dtype=y.dtype)])
-    return y.astype(np.complex64)
+def apply_timing_offset_resample(iq: Union[np.ndarray, torch.Tensor], timing_offset: float) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
+    if timing_offset == 1.0 or x.numel() == 0:
+        return x
+    target_len = int(x.numel())
+    new_len = max(1, int(round(target_len / timing_offset)))
+    y = _resample_complex_to_len(x, new_len)
+    if new_len > target_len:
+        y = y[:target_len]
+    elif new_len < target_len:
+        y = torch.cat([y, torch.zeros(target_len - new_len, dtype=y.dtype, device=y.device)])
+    return y
 
 
-def resample_iq(iq: np.ndarray, fs_in_hz: float, fs_out_hz: float) -> np.ndarray:
+def resample_iq(iq: Union[np.ndarray, torch.Tensor], fs_in_hz: float, fs_out_hz: float) -> torch.Tensor:
     if fs_in_hz <= 0 or fs_out_hz <= 0:
         raise ValueError("Sample rates must be positive")
     if np.isclose(fs_in_hz, fs_out_hz):
-        return iq.astype(np.complex64)
-    new_len = max(1, int(round(len(iq) * fs_out_hz / fs_in_hz)))
-    return signal.resample(iq, new_len).astype(np.complex64)
+        return _as_complex_tensor(iq)
+    x = _as_complex_tensor(iq)
+    new_len = max(1, int(round(x.numel() * fs_out_hz / fs_in_hz)))
+    return _resample_complex_to_len(x, new_len)
 
 
 def _complex_colored_noise(
     n: int,
     color: str,
     power: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
+    generator: Optional[torch.Generator] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     exponents = {
         "white": 0.0,
         "pink": 1.0,
@@ -275,64 +345,80 @@ def _complex_colored_noise(
         raise ValueError(f"Unsupported noise color: {color}")
     alpha = exponents[color]
 
-    def make_real():
-        freqs = np.fft.rfftfreq(n, d=1.0)
-        spec = rng.normal(size=len(freqs)) + 1j * rng.normal(size=len(freqs))
-        shaping = np.ones_like(freqs, dtype=np.float64)
+    if n <= 0:
+        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device("cpu"))
+    dev = device or torch.device("cpu")
+
+    def make_real() -> torch.Tensor:
+        freqs = torch.fft.rfftfreq(n, d=1.0, device=dev)
+        spec = torch.complex(
+            torch.randn(len(freqs), generator=generator, device=dev),
+            torch.randn(len(freqs), generator=generator, device=dev),
+        )
+        shaping = torch.ones_like(freqs, dtype=torch.float32)
         nz = freqs > 0
         if alpha > 0:
             shaping[nz] = 1.0 / (freqs[nz] ** (alpha / 2.0))
         elif alpha < 0:
             shaping[nz] = freqs[nz] ** ((-alpha) / 2.0)
         shaping[~nz] = 0.0 if color in ("pink", "brown") else 1.0
-        y = np.fft.irfft(spec * shaping, n=n)
-        p = np.mean(y ** 2)
-        if p > 0:
-            y *= np.sqrt((power / 2.0) / p)
+        y = torch.fft.irfft(spec * shaping.to(spec.dtype), n=n)
+        p = torch.mean(y ** 2)
+        if float(p.item()) > 0:
+            y = y * torch.sqrt(torch.tensor((power / 2.0), device=dev, dtype=torch.float32) / p)
         return y
 
     i = make_real()
     q = make_real()
-    z = i + 1j * q
-    p = np.mean(np.abs(z) ** 2)
-    if p > 0:
-        z *= np.sqrt(power / p)
-    return z.astype(np.complex64)
+    z = torch.complex(i, q).to(dtype=torch.complex64)
+    p = torch.mean(torch.abs(z) ** 2)
+    if float(p.item()) > 0:
+        z = z * torch.sqrt(torch.tensor(power, device=dev, dtype=torch.float32) / p)
+    return z
 
 
 def apply_fading(
-    iq: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
     mode: str = "none",
     block_len: int = 256,
     rician_k_db: float = 6.0,
     multipath_taps: Optional[List[complex]] = None,
     seed: int = 1,
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    x = np.asarray(iq, dtype=np.complex64)
+) -> torch.Tensor:
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    x = _as_complex_tensor(iq)
 
     if mode == "none":
         return x
 
     if mode == "rayleigh_block":
-        out = np.empty_like(x)
-        for start in range(0, len(x), block_len):
-            end = min(start + block_len, len(x))
-            h = (rng.normal() + 1j * rng.normal()) / np.sqrt(2.0)
+        out = torch.empty_like(x)
+        for start in range(0, x.numel(), block_len):
+            end = min(start + block_len, x.numel())
+            h = torch.complex(
+                torch.randn((), generator=gen, device=x.device),
+                torch.randn((), generator=gen, device=x.device),
+            ) / math.sqrt(2.0)
             out[start:end] = x[start:end] * h
-        return out.astype(np.complex64)
+        return out.to(dtype=torch.complex64)
 
     if mode == "rician_block":
-        out = np.empty_like(x)
+        out = torch.empty_like(x)
         k_lin = 10.0 ** (rician_k_db / 10.0)
         los = np.sqrt(k_lin / (k_lin + 1.0))
         scat_scale = np.sqrt(1.0 / (k_lin + 1.0))
-        for start in range(0, len(x), block_len):
-            end = min(start + block_len, len(x))
-            scat = ((rng.normal() + 1j * rng.normal()) / np.sqrt(2.0)) * scat_scale
+        for start in range(0, x.numel(), block_len):
+            end = min(start + block_len, x.numel())
+            scat = (
+                torch.complex(
+                    torch.randn((), generator=gen, device=x.device),
+                    torch.randn((), generator=gen, device=x.device),
+                ) / math.sqrt(2.0)
+            ) * scat_scale
             h = los + scat
             out[start:end] = x[start:end] * h
-        return out.astype(np.complex64)
+        return out.to(dtype=torch.complex64)
 
     if mode == "multipath_static":
         taps = multipath_taps if multipath_taps is not None else [
@@ -340,14 +426,14 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        y = np.convolve(x, np.asarray(taps, dtype=np.complex64), mode="full")[:len(x)]
-        return y.astype(np.complex64)
+        y = _complex_lfilter_fir(x, taps)
+        return y[: x.numel()].to(dtype=torch.complex64)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
 
 
 def add_impulsive_bursts(
-    iq: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
     base_noise_power: float,
     burst_probability: float = 0.0,
     burst_len_min: int = 16,
@@ -355,28 +441,30 @@ def add_impulsive_bursts(
     burst_power_ratio_db: float = 12.0,
     burst_color: str = "white",
     seed: int = 1,
-) -> np.ndarray:
-    if burst_probability <= 0.0 or len(iq) == 0:
-        return iq.astype(np.complex64)
+) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
+    if burst_probability <= 0.0 or x.numel() == 0:
+        return x
 
-    rng = np.random.default_rng(seed + 1000)
-    out = np.array(iq, copy=True, dtype=np.complex64)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed + 1000)
+    out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
 
     idx = 0
-    while idx < len(out):
-        if rng.random() < burst_probability:
-            burst_len = int(rng.integers(burst_len_min, burst_len_max + 1))
-            end = min(idx + burst_len, len(out))
-            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, rng)
+    while idx < out.numel():
+        if float(torch.rand((), generator=gen).item()) < burst_probability:
+            burst_len = int(torch.randint(burst_len_min, burst_len_max + 1, (1,), generator=gen).item())
+            end = min(idx + burst_len, out.numel())
+            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=gen, device=out.device)
             idx = end
         else:
             idx += 1
-    return out.astype(np.complex64)
+    return out.to(dtype=torch.complex64)
 
 
 def impair_iq(
-    iq: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
     snr_db: Optional[float],
     noise_color: str,
     freq_offset: float,
@@ -391,9 +479,10 @@ def impair_iq(
     burst_power_ratio_db: float,
     burst_color: str,
     seed: int,
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    x = np.asarray(iq, dtype=np.complex64)
+) -> torch.Tensor:
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    x = _as_complex_tensor(iq)
 
     x = apply_fading(
         x,
@@ -413,7 +502,7 @@ def impair_iq(
         y = x
     else:
         noise_power = sig_power / (10.0 ** (snr_db / 10.0))
-        y = x + _complex_colored_noise(len(x), noise_color, noise_power, rng)
+        y = x + _complex_colored_noise(x.numel(), noise_color, noise_power, generator=gen, device=x.device)
 
     y = add_impulsive_bursts(
         y,
@@ -425,11 +514,11 @@ def impair_iq(
         burst_color=burst_color,
         seed=seed,
     )
-    return y.astype(np.complex64)
+    return y.to(dtype=torch.complex64)
 
 
-def limit_peak_power(iq: np.ndarray, max_peak_power: Optional[float]) -> Tuple[np.ndarray, bool, float]:
-    x = np.asarray(iq, dtype=np.complex64)
+def limit_peak_power(iq: Union[np.ndarray, torch.Tensor], max_peak_power: Optional[float]) -> Tuple[torch.Tensor, bool, float]:
+    x = _as_complex_tensor(iq)
     pre_peak_power = measure_peak_power(x)
     if max_peak_power is None:
         return x, False, pre_peak_power
@@ -438,7 +527,7 @@ def limit_peak_power(iq: np.ndarray, max_peak_power: Optional[float]) -> Tuple[n
     if pre_peak_power <= 0 or pre_peak_power <= max_peak_power:
         return x, False, pre_peak_power
     scale = math.sqrt(max_peak_power / pre_peak_power)
-    return (x * scale).astype(np.complex64), True, pre_peak_power
+    return (x * scale).to(dtype=torch.complex64), True, pre_peak_power
 
 
 def robust_agc_and_blanking(x: np.ndarray, blanker_k: float = 6.0) -> np.ndarray:
@@ -740,7 +829,7 @@ def pilot_positions(total_data_len: int, interval: int = PILOT_INTERVAL_BITS, p_
 
 @dataclass
 class TXBuildResult:
-    iq: np.ndarray
+    iq: torch.Tensor
     metadata: dict
 
 
@@ -820,13 +909,13 @@ def build_tx_iq_object(
     one_burst_iq = tx_waveform(frame_bits, sps=sps, beta=beta, span=span)
 
     if target_num_samples is None:
-        iq = one_burst_iq.astype(np.complex64)
+        iq = one_burst_iq.to(dtype=torch.complex64)
         n_repeats = 1
     else:
         if target_num_samples <= 0:
             raise ValueError("target_num_samples must be > 0")
         n_repeats = int(math.ceil(target_num_samples / len(one_burst_iq)))
-        iq = np.tile(one_burst_iq, n_repeats)[:target_num_samples].astype(np.complex64)
+        iq = torch.tile(one_burst_iq, (n_repeats,))[:target_num_samples].to(dtype=torch.complex64)
 
     iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
 
@@ -857,7 +946,7 @@ def build_tx_iq_object(
         "payload_len": payload_len,
         "payload_len_bytes": payload_len,
         "target_num_samples": target_num_samples,
-        "actual_num_samples": int(len(iq)),
+        "actual_num_samples": int(iq.numel()),
         "payload_plain_bits": payload_plain_bits,
         "payload_coded_bits": payload_coded_bits,
         "payload_with_pilots_bits": payload_with_pilots_bits,
@@ -889,22 +978,22 @@ def build_tx_iq_object(
         "avg_power": measure_power(iq),
     }
 
-    return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
+    return TXBuildResult(iq=iq.to(dtype=torch.complex64), metadata=metadata)
 
 
-def _scale_iq_to_peak_power(iq: np.ndarray, peak_power: Optional[float]) -> np.ndarray:
-    x = np.asarray(iq, dtype=np.complex64)
+def _scale_iq_to_peak_power(iq: Union[np.ndarray, torch.Tensor], peak_power: Optional[float]) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
     if peak_power is None:
         return x
     if peak_power <= 0.0:
         raise ValueError("peak_power must be > 0 when provided")
     if len(x) == 0:
         return x
-    current_peak_power = float(np.max(np.abs(x) ** 2))
+    current_peak_power = float(torch.max(torch.abs(x) ** 2).item())
     if current_peak_power <= 0.0:
         return x
     gain = np.sqrt(peak_power / current_peak_power)
-    return (x * gain).astype(np.complex64)
+    return (x * gain).to(dtype=torch.complex64)
 
 
 def build_tone_pulse_iq_object(
@@ -976,7 +1065,7 @@ def build_tone_pulse_iq_object(
     if total_samples <= 0:
         raise ValueError("target_num_samples must be > 0 when provided")
 
-    gate = np.zeros(total_samples, dtype=np.float32)
+    gate = torch.zeros(total_samples, dtype=torch.float32)
     for k in range(pulse_count):
         start = start_offset_samples + k * cycle_samples
         end = min(start + pulse_on_samples, total_samples)
@@ -984,13 +1073,14 @@ def build_tone_pulse_iq_object(
             break
         gate[start:end] = 1.0
 
-    n = np.arange(total_samples, dtype=np.float64)
-    iq = np.zeros(total_samples, dtype=np.complex128)
+    n = torch.arange(total_samples, dtype=torch.float64)
+    iq = torch.zeros(total_samples, dtype=torch.complex64)
     for a, f_hz, ph in zip(tone_amplitudes, tone_frequencies_hz, tone_initial_phases_rad):
         if a == 0.0:
             continue
-        iq += a * np.exp(1j * (2.0 * np.pi * f_hz * n / sample_rate_hz + ph))
-    iq = (iq * gate).astype(np.complex64)
+        phase = 2.0 * torch.pi * f_hz * n / sample_rate_hz + ph
+        iq = iq + a * torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    iq = (iq * gate).to(dtype=torch.complex64)
 
     iq = _scale_iq_to_peak_power(iq, peak_power)
     iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
@@ -1019,7 +1109,7 @@ def build_tone_pulse_iq_object(
         "carrier_hz": carrier_hz,
         "absolute_rf_hz": rf_center_hz + carrier_hz,
         "target_num_samples": target_num_samples,
-        "actual_num_samples": int(len(iq)),
+        "actual_num_samples": int(iq.numel()),
         "num_tones": num_tones,
         "tone_frequencies_hz": [float(x) for x in tone_frequencies_hz],
         "tone_amplitudes": [float(x) for x in tone_amplitudes],
@@ -1044,9 +1134,9 @@ def build_tone_pulse_iq_object(
         "peak_power": peak_power,
         "seed": seed,
         "avg_power": measure_power(iq),
-        "measured_peak_power": float(np.max(np.abs(iq) ** 2)) if len(iq) else 0.0,
+        "measured_peak_power": float(torch.max(torch.abs(iq) ** 2).item()) if iq.numel() else 0.0,
     }
-    return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
+    return TXBuildResult(iq=iq.to(dtype=torch.complex64), metadata=metadata)
 
 
 def save_tx_iq_object(
@@ -1155,7 +1245,7 @@ def coarse_frequency_acquire(
     for f_hz in bins:
         rot = np.exp(-1j * 2.0 * np.pi * f_hz * n / sample_rate_hz)
         y = iq * rot
-        corr = signal.correlate(y, ref, mode="valid", method="fft")
+        corr = np.correlate(y, np.conjugate(ref[::-1]), mode="valid")
         mag = np.abs(corr)
         idx = int(np.argmax(mag))
         metric = float(mag[idx])
@@ -1198,7 +1288,7 @@ def apply_symbol_rate_cfo(symbols: np.ndarray, cfo_hz: float, symbol_rate_hz: fl
 
 def matched_filter(iq: np.ndarray, sps: int, beta: float, span: int) -> np.ndarray:
     taps = rrc_taps(beta=beta, sps=sps, span=span)
-    return signal.lfilter(taps, [1.0], iq).astype(np.complex64)
+    return _as_numpy_complex64(_complex_lfilter_fir(iq, taps))
 
 
 def extract_symbols_from_start(
