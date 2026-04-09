@@ -194,32 +194,16 @@ def _complex_lfilter_fir(
     if xt.numel() == 0:
         return xt
 
-    # if AF is not None:
-    #     y_r = AF.lfilter(
-    #         waveform=xt.real.unsqueeze(0),
-    #         a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
-    #         b_coeffs=ht.real.to(dtype=torch.float32),
-    #     ).squeeze(0)
-    #     y_i = AF.lfilter(
-    #         waveform=xt.imag.unsqueeze(0),
-    #         a_coeffs=torch.tensor([1.0], device=xt.device, dtype=torch.float32),
-    #         b_coeffs=ht.real.to(dtype=torch.float32),
-    #     ).squeeze(0)
-    #     return torch.complex(y_r, y_i).to(dtype=torch.complex64)
-
-    k = torch.flip(ht, dims=[0]).reshape(1, 1, -1)
-    kr = k.real.reshape(1, 1, -1)
-    ki = k.imag.reshape(1, 1, -1)
-    xr = xt.real.reshape(1, 1, -1)
-    xi = xt.imag.reshape(1, 1, -1)
+    xr = xt.real.to(dtype=torch.float32).reshape(1, 1, -1)
+    xi = xt.imag.to(dtype=torch.float32).reshape(1, 1, -1)
+    k_r = torch.flip(ht.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1).to(device=xr.device, dtype=xr.dtype)
+    k_i = torch.flip(ht.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1).to(device=xr.device, dtype=xr.dtype)
     pad = ht.numel() - 1
-    
-    print(f'xr.dtype : {xr.dtype}')
-    print(f'k.dtype : {k.dtype}')
-    print(f'type(pad) : {type(pad)}')
-    
-    yr = F.conv1d(F.pad(xr, (pad, 0)), kr).reshape(-1)
-    yi = F.conv1d(F.pad(xi, (pad, 0)), ki).reshape(-1)
+
+    xr_pad = F.pad(xr, (pad, 0))
+    xi_pad = F.pad(xi, (pad, 0))
+    yr = F.conv1d(xr_pad, k_r).reshape(-1) - F.conv1d(xi_pad, k_i).reshape(-1)
+    yi = F.conv1d(xr_pad, k_i).reshape(-1) + F.conv1d(xi_pad, k_r).reshape(-1)
     return torch.complex(yr, yi).to(dtype=torch.complex64)
 
 
@@ -1255,12 +1239,14 @@ def coarse_frequency_acquire(
     k = torch.flip(torch.conj(ref), dims=[0]).reshape(1, 1, -1)
 
     for f_hz in bins:
-        rot = np.exp(-1j * 2.0 * np.pi * f_hz * n / sample_rate_hz)
-        y = iq * rot
-        corr = np.correlate(y, np.conjugate(ref[::-1]), mode="valid")
-        mag = np.abs(corr)
-        idx = int(np.argmax(mag))
-        metric = float(mag[idx])
+        phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
+        rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+        y = x * rot
+        yr = F.conv1d(y.real.reshape(1, 1, -1), k.real).reshape(-1) - F.conv1d(y.imag.reshape(1, 1, -1), k.imag).reshape(-1)
+        yi = F.conv1d(y.real.reshape(1, 1, -1), k.imag).reshape(-1) + F.conv1d(y.imag.reshape(1, 1, -1), k.real).reshape(-1)
+        mag = torch.abs(torch.complex(yr, yi))
+        idx = int(torch.argmax(mag).item())
+        metric = float(mag[idx].item())
         if metric > best_metric:
             best_metric = metric
             best_start = idx
@@ -1303,7 +1289,7 @@ def apply_symbol_rate_cfo(symbols: Union[np.ndarray, torch.Tensor], cfo_hz: floa
 
 def matched_filter(iq: Union[np.ndarray, torch.Tensor], sps: int, beta: float, span: int) -> torch.Tensor:
     taps = rrc_taps(beta=beta, sps=sps, span=span)
-    return _as_numpy_complex64(_complex_lfilter_fir(iq, taps))
+    return _complex_lfilter_fir(iq, taps)
 
 
 def extract_symbols_from_start(
