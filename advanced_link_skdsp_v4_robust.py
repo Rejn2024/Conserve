@@ -1524,9 +1524,10 @@ def try_decode_from_symbols_numpy_legacy(
     eq_taps: int,
 ) -> Optional[bytes]:
     symbols = _as_numpy_complex64(symbols)
+    symbols_t = symbols  # legacy compatibility alias
     access_syms = _as_numpy_complex64(bpsk_map(ACCESS_BITS))
 
-    if symbols_t.numel() < access_syms.numel() + HEADER_COPIES * HEADER_PROT_BITS_LEN:
+    if len(symbols_t) < len(access_syms) + HEADER_COPIES * HEADER_PROT_BITS_LEN:
         return None
 
     residual_cfo_hz = estimate_residual_cfo_from_preamble(symbols[:PREAMBLE_BITS_LEN], symbol_rate_hz)
@@ -1843,10 +1844,6 @@ def rx_command_iq(iq, meta):
         symbol_rate_hz=symbol_rate_hz,
         eq_taps=eq_taps,
     )
-
-    if payload is None:
-        raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
-
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
