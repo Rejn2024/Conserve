@@ -1259,6 +1259,61 @@ def coarse_frequency_acquire(
     best_start = int(per_bin_idx[best_bin].item())
     best_cfo = float(bins[best_bin].item())
 
+    print(f'from broadcast best_start : {best_start}, type : {type(best_start)}')
+    print(f'from broadcast best_cfo : {best_cfo}, type : {type(best_cfo)}')
+    print(f'from broadcast best_metric : {best_metric}, type : {type(best_metric)}')
+
+    
+    return best_start, best_cfo, best_metric
+
+
+def loop_coarse_frequency_acquire(
+    iq: Union[np.ndarray, torch.Tensor],
+    ref_waveform: Union[np.ndarray, torch.Tensor],
+    sample_rate_hz: float,
+    search_hz: float,
+    n_bins: int,
+) -> Tuple[int, float, float]:
+
+    x = _as_complex_tensor(iq)
+    ref = _as_complex_tensor(ref_waveform)
+    if x.numel() < ref.numel():
+        raise RuntimeError("IQ shorter than reference waveform")
+
+    best_metric = -1.0
+    best_start = 0
+    best_cfo = 0.0
+
+    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
+    bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
+    kr = torch.flip(torch.conj(ref).real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+    ki = torch.flip(torch.conj(ref).imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+
+    for f_hz in bins:
+        
+        phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
+        rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+        y = x * rot
+
+        yr_in = y.real.to(dtype=torch.float32).reshape(1, 1, -1)
+        yi_in = y.imag.to(dtype=torch.float32).reshape(1, 1, -1)
+        yr = F.conv1d(yr_in, kr).reshape(-1) - F.conv1d(yi_in, ki).reshape(-1)
+        yi = F.conv1d(yr_in, ki).reshape(-1) + F.conv1d(yi_in, kr).reshape(-1)
+        mag = torch.abs(torch.complex(yr, yi))
+
+        idx = int(torch.argmax(mag).item())
+        metric = float(mag[idx].item())
+        if metric > best_metric:
+            best_metric = metric
+            best_start = idx
+            best_cfo = float(f_hz)
+            best_cfo = float(f_hz.item())
+
+    print(f'from loop best_start : {best_start}, type : {type(best_start)}')
+    print(f'from loop best_cfo : {best_cfo}, type : {type(best_cfo)}')
+    print(f'from loop best_metric : {best_metric}, type : {type(best_metric)}')
+
+    
     return best_start, best_cfo, best_metric
 
 
@@ -1697,6 +1752,14 @@ def rx_command_iq(iq, meta):
 
     access_ref_waveform = tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span)
 
+    loop_coarse_start, loop_coarse_cfo_hz, loop_coarse_metric = loop_coarse_frequency_acquire(
+        iq=iq,
+        ref_waveform=access_ref_waveform,
+        sample_rate_hz=dsp_sample_rate_hz,
+        search_hz=coarse_freq_search_hz,
+        n_bins=coarse_freq_bins,
+    )
+    
     coarse_start, coarse_cfo_hz, coarse_metric = coarse_frequency_acquire(
         iq=iq,
         ref_waveform=access_ref_waveform,
@@ -1705,21 +1768,47 @@ def rx_command_iq(iq, meta):
         n_bins=coarse_freq_bins,
     )
 
+    
+
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
 
-    payload, sample_offset_used = try_decode_over_sample_deltas(
-        mf=mf,
-        start_index_samples=coarse_start,
-        sps=sps,
-        span=span,
-        sample_phase_search=sample_phase_search,
-        fec_mode=fec,
-        interleave=interleave,
-        interleave_rows=interleave_rows,
-        symbol_rate_hz=symbol_rate_hz,
-        eq_taps=eq_taps,
-    )
+    # payload, sample_offset_used = try_decode_over_sample_deltas(
+    #     mf=mf,
+    #     start_index_samples=coarse_start,
+    #     sps=sps,
+    #     span=span,
+    #     sample_phase_search=sample_phase_search,
+    #     fec_mode=fec,
+    #     interleave=interleave,
+    #     interleave_rows=interleave_rows,
+    #     symbol_rate_hz=symbol_rate_hz,
+    #     eq_taps=eq_taps,
+    # )
+    #deltas = list(range(-sample_phase_search, sample_phase_search + 1))
+    for sample_delta in range(-sample_phase_search, sample_phase_search + 1):
+        symbols = extract_symbols_from_start(
+            mf=mf,
+            start_index_samples=coarse_start,
+            sps=sps,
+            span=span,
+            sample_delta=sample_delta,
+        )
+        payload = try_decode_from_symbols(
+            symbols=symbols,
+            fec_mode=fec,
+            interleave=interleave,
+            interleave_rows=interleave_rows,
+            symbol_rate_hz=symbol_rate_hz,
+            eq_taps=eq_taps,
+        )
+        if payload is not None:
+            sample_offset_used = sample_delta
+            break
+
+    if payload is None:
+        raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
+
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
