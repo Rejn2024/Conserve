@@ -1238,48 +1238,6 @@ def coarse_frequency_acquire(
     if x.numel() < ref.numel():
         raise RuntimeError("IQ shorter than reference waveform")
 
-    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
-    bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
-    kr = torch.flip(torch.conj(ref).real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-    ki = torch.flip(torch.conj(ref).imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-
-    phase = -2.0 * torch.pi * bins[:, None] * n[None, :] / sample_rate_hz
-    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-    y = x[None, :] * rot  # [n_bins, n_samples]
-
-    yr_in = y.real.to(dtype=torch.float32).unsqueeze(1)  # [B,1,N]
-    yi_in = y.imag.to(dtype=torch.float32).unsqueeze(1)  # [B,1,N]
-    yr = F.conv1d(yr_in, kr).squeeze(1) - F.conv1d(yi_in, ki).squeeze(1)
-    yi = F.conv1d(yr_in, ki).squeeze(1) + F.conv1d(yi_in, kr).squeeze(1)
-    mag = torch.abs(torch.complex(yr, yi))  # [B, valid_len]
-
-    per_bin_metric, per_bin_idx = torch.max(mag, dim=1)
-    best_bin = int(torch.argmax(per_bin_metric).item())
-    best_metric = float(per_bin_metric[best_bin].item())
-    best_start = int(per_bin_idx[best_bin].item())
-    best_cfo = float(bins[best_bin].item())
-
-    print(f'from broadcast best_start : {best_start}, type : {type(best_start)}')
-    print(f'from broadcast best_cfo : {best_cfo}, type : {type(best_cfo)}')
-    print(f'from broadcast best_metric : {best_metric}, type : {type(best_metric)}')
-
-    
-    return best_start, best_cfo, best_metric
-
-
-def loop_coarse_frequency_acquire(
-    iq: Union[np.ndarray, torch.Tensor],
-    ref_waveform: Union[np.ndarray, torch.Tensor],
-    sample_rate_hz: float,
-    search_hz: float,
-    n_bins: int,
-) -> Tuple[int, float, float]:
-
-    x = _as_complex_tensor(iq)
-    ref = _as_complex_tensor(ref_waveform)
-    if x.numel() < ref.numel():
-        raise RuntimeError("IQ shorter than reference waveform")
-
     best_metric = -1.0
     best_start = 0
     best_cfo = 0.0
@@ -1290,7 +1248,6 @@ def loop_coarse_frequency_acquire(
     ki = torch.flip(torch.conj(ref).imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
 
     for f_hz in bins:
-        
         phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
         rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
         y = x * rot
@@ -1401,6 +1358,9 @@ def apply_symbol_equalizer(symbols: Union[np.ndarray, torch.Tensor], w: Union[np
         sym_t = sym_t.to(dtype=torch.complex64)
     if not torch.is_complex(w_t):
         w_t = w_t.to(dtype=torch.complex64)
+    common_dtype = torch.promote_types(sym_t.dtype, w_t.dtype)
+    sym_t = sym_t.to(dtype=common_dtype)
+    w_t = w_t.to(dtype=common_dtype)
     ntaps = int(w_t.numel())
     if ntaps == 1:
         return sym_t * w_t[0]
@@ -1773,6 +1733,18 @@ def rx_command_iq(iq, meta):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
 
+    payload, sample_offset_used = try_decode_over_sample_deltas(
+        mf=mf,
+        start_index_samples=coarse_start,
+        sps=sps,
+        span=span,
+        sample_phase_search=sample_phase_search,
+        fec_mode=fec,
+        interleave=interleave,
+        interleave_rows=interleave_rows,
+        symbol_rate_hz=symbol_rate_hz,
+        eq_taps=eq_taps,
+    )
     # payload, sample_offset_used = try_decode_over_sample_deltas(
     #     mf=mf,
     #     start_index_samples=coarse_start,
