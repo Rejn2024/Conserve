@@ -1563,7 +1563,7 @@ def try_decode_from_symbols_numpy_legacy(
         return None
 
     payload_len = choose_valid_header_from_copies(
-        soft_bits[hdr_start:hdr_end].detach().cpu().numpy().astype(np.float64, copy=False)
+        soft_bits[hdr_start:hdr_end].astype(np.float64, copy=False)
     )
     if payload_len is None:
         return None
