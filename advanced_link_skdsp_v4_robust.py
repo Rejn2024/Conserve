@@ -1263,7 +1263,6 @@ def coarse_frequency_acquire(
         if metric > best_metric:
             best_metric = metric
             best_start = idx
-            best_cfo = float(f_hz)
             best_cfo = float(f_hz.item())
 
     print(f'from loop best_start : {best_start}, type : {type(best_start)}')
@@ -1516,6 +1515,96 @@ def try_decode_from_symbols(
     return parse_payload_bytes(decoded_bytes, payload_len)
 
 
+def try_decode_from_symbols_numpy_legacy(
+    symbols: Union[np.ndarray, torch.Tensor],
+    fec_mode: str,
+    interleave: bool,
+    interleave_rows: int,
+    symbol_rate_hz: float,
+    eq_taps: int,
+) -> Optional[bytes]:
+    symbols = _as_numpy_complex64(symbols)
+    access_syms = _as_numpy_complex64(bpsk_map(ACCESS_BITS))
+
+    if symbols_t.numel() < access_syms.numel() + HEADER_COPIES * HEADER_PROT_BITS_LEN:
+        return None
+
+    residual_cfo_hz = estimate_residual_cfo_from_preamble(symbols[:PREAMBLE_BITS_LEN], symbol_rate_hz)
+    if residual_cfo_hz != 0.0:
+        n = np.arange(len(symbols), dtype=np.float64)
+        symbols = (symbols * np.exp(-1j * 2.0 * np.pi * residual_cfo_hz * n / symbol_rate_hz)).astype(np.complex64)
+
+    train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
+    train_end = train_start + TRAINING_LEN_BITS
+    if symbols_t.numel() < train_end:
+        return None
+
+    rx_train = symbols[train_start:train_end]
+    tx_train = access_syms[train_start:train_end]
+
+    w = _as_numpy_complex64(design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3))
+    eq_symbols = _as_numpy_complex64(apply_symbol_equalizer(symbols, w))
+
+    rx_train_eq = eq_symbols[train_start:train_end]
+    ph = np.angle(np.sum(rx_train_eq * np.conj(tx_train)))
+    eq_symbols = (eq_symbols * np.exp(-1j * ph)).astype(np.complex64)
+
+    soft_bits = eq_symbols.real.to(dtype=torch.float64)
+
+    hdr_start = ACCESS_BITS_LEN
+    hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
+    if hdr_end > soft_bits.numel():
+        return None
+
+    payload_len = choose_valid_header_from_copies(
+        soft_bits[hdr_start:hdr_end].detach().cpu().numpy().astype(np.float64, copy=False)
+    )
+    if payload_len is None:
+        return None
+
+    payload_plain_bits = (payload_len + 4) * 8
+    fec = FECCodec(fec_mode)
+    payload_coded_bits = fec.encoded_length(payload_plain_bits)
+
+    n_pilot_blocks = max(0, math.ceil(max(payload_coded_bits - PILOT_INTERVAL_BITS, 0) / PILOT_INTERVAL_BITS))
+    payload_with_pilots_bits = payload_coded_bits + n_pilot_blocks * PILOT_BLOCK_BITS
+
+    data_start = hdr_end
+    data_end = data_start + payload_with_pilots_bits
+    if data_end > soft_bits.numel():
+        return None
+
+    eq_symbols = _as_numpy_complex64(
+        apply_pilot_phase_tracking(
+            eq_symbols,
+            data_with_pilots_len=payload_with_pilots_bits,
+            data_only_len=payload_coded_bits,
+            access_and_headers_len=data_start,
+        )
+    )
+    soft_bits = eq_symbols.real.to(dtype=torch.float64)
+
+    payload_soft_with_pilots = soft_bits[data_start:data_end].detach().cpu().numpy().astype(np.float64, copy=False)
+    payload_soft = remove_pilots_soft(
+        payload_soft_with_pilots,
+        original_data_len=payload_coded_bits,
+        interval=PILOT_INTERVAL_BITS,
+        pilot_bits=PILOT_BITS,
+    )
+
+    if interleave:
+        payload_soft = block_deinterleave_soft(payload_soft, rows=interleave_rows)
+
+    decoded_bits = fec.decode_soft(payload_soft)
+    if len(decoded_bits) < payload_plain_bits:
+        return None
+
+    decoded_bits = decoded_bits[:payload_plain_bits]
+    decoded_bits = descramble_bits(decoded_bits, seed=0x5D)
+    decoded_bytes = bits_to_bytes_msb(decoded_bits)
+    return parse_payload_bytes(decoded_bytes, payload_len)
+
+
 def try_decode_over_sample_deltas(
     mf: Union[np.ndarray, torch.Tensor],
     start_index_samples: int,
@@ -1547,6 +1636,15 @@ def try_decode_over_sample_deltas(
             symbol_rate_hz=symbol_rate_hz,
             eq_taps=eq_taps,
         )
+        if payload is None:
+            payload = try_decode_from_symbols_numpy_legacy(
+                symbols=symbols,
+                fec_mode=fec_mode,
+                interleave=interleave,
+                interleave_rows=interleave_rows,
+                symbol_rate_hz=symbol_rate_hz,
+                eq_taps=eq_taps,
+            )
         return sample_delta, payload
 
     # GPU tensor decode attempts are kept sequential for determinism/stability.
@@ -1733,50 +1831,18 @@ def rx_command_iq(iq, meta):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
 
-    # payload, sample_offset_used = try_decode_over_sample_deltas(
-    #     mf=mf,
-    #     start_index_samples=coarse_start,
-    #     sps=sps,
-    #     span=span,
-    #     sample_phase_search=sample_phase_search,
-    #     fec_mode=fec,
-    #     interleave=interleave,
-    #     interleave_rows=interleave_rows,
-    #     symbol_rate_hz=symbol_rate_hz,
-    #     eq_taps=eq_taps,
-    # )
-    # payload, sample_offset_used = try_decode_over_sample_deltas(
-    #     mf=mf,
-    #     start_index_samples=coarse_start,
-    #     sps=sps,
-    #     span=span,
-    #     sample_phase_search=sample_phase_search,
-    #     fec_mode=fec,
-    #     interleave=interleave,
-    #     interleave_rows=interleave_rows,
-    #     symbol_rate_hz=symbol_rate_hz,
-    #     eq_taps=eq_taps,
-    # )
-    #deltas = list(range(-sample_phase_search, sample_phase_search + 1))
-    for sample_delta in range(-sample_phase_search, sample_phase_search + 1):
-        symbols = extract_symbols_from_start(
-            mf=mf,
-            start_index_samples=coarse_start,
-            sps=sps,
-            span=span,
-            sample_delta=sample_delta,
-        )
-        payload = try_decode_from_symbols(
-            symbols=symbols,
-            fec_mode=fec,
-            interleave=interleave,
-            interleave_rows=interleave_rows,
-            symbol_rate_hz=symbol_rate_hz,
-            eq_taps=eq_taps,
-        )
-        if payload is not None:
-            sample_offset_used = sample_delta
-            break
+    payload, sample_offset_used = try_decode_over_sample_deltas(
+        mf=mf,
+        start_index_samples=coarse_start,
+        sps=sps,
+        span=span,
+        sample_phase_search=sample_phase_search,
+        fec_mode=fec,
+        interleave=interleave,
+        interleave_rows=interleave_rows,
+        symbol_rate_hz=symbol_rate_hz,
+        eq_taps=eq_taps,
+    )
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
