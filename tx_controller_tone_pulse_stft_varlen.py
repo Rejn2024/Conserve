@@ -9,11 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy import signal
 
 import advanced_link_skdsp_v4_robust as txflex
 
@@ -22,20 +20,20 @@ NOISE_COLORS = ["white", "pink", "brown", "blue", "violet"]
 FADING_MODES = ["none", "rician_block", "rayleigh_block", "multipath_static"]
 
 
-def _as_complex_tensor(iq: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+def _as_complex_tensor(iq: Union[torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(iq, torch.Tensor):
         return iq.to(dtype=torch.complex64)
-    return torch.as_tensor(np.asarray(iq), dtype=torch.complex64)
+    return torch.as_tensor(iq, dtype=torch.complex64)
 
 
-def measure_iq_power(iq: Union[np.ndarray, torch.Tensor]) -> float:
+def measure_iq_power(iq: Union[torch.Tensor, List[complex]]) -> torch.Tensor:
     x = _as_complex_tensor(iq)
     if x.numel() == 0:
-        return 0.0
-    return float(torch.mean(torch.abs(x) ** 2).item())
+        return torch.tensor(0.0, dtype=torch.float32)
+    return torch.mean(torch.abs(x) ** 2).to(dtype=torch.float32)
 
 
-def robust_mad_scale(x: Union[np.ndarray, torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+def robust_mad_scale(x: Union[torch.Tensor, List[complex]], eps: float = 1e-12) -> torch.Tensor:
     xt = _as_complex_tensor(x)
     xr = torch.cat([xt.real, xt.imag], dim=0)
     med = torch.median(xr)
@@ -45,56 +43,57 @@ def robust_mad_scale(x: Union[np.ndarray, torch.Tensor], eps: float = 1e-12) -> 
 
 
 def preprocess_iq_to_stft_feature(
-    iq: Union[np.ndarray, torch.Tensor],
+    iq: Union[torch.Tensor, List[complex]],
     sample_rate_hz: float,
     nperseg: int = 128,
     noverlap: int = 96,
     nfft: int = 128,
-) -> Dict[str, Union[np.ndarray, np.float32]]:
+) -> Dict[str, torch.Tensor]:
     x_t = _as_complex_tensor(iq)
     if x_t.numel() < 8:
         x_t = F.pad(x_t, (0, 8 - int(x_t.numel())))
 
     x_t = (x_t - torch.mean(x_t)).to(dtype=torch.complex64)
     x_t = robust_mad_scale(x_t)
-    x = x_t.detach().cpu().numpy()
 
-    f, _, Z = signal.stft(
-        x,
-        fs=sample_rate_hz,
-        window="hann",
-        nperseg=min(nperseg, len(x)),
-        noverlap=min(noverlap, max(0, len(x) - 1)),
-        nfft=nfft,
-        return_onesided=False,
-        boundary=None,
-        padded=False,
+    nperseg_eff = int(min(nperseg, max(8, x_t.numel())))
+    noverlap_eff = int(min(noverlap, max(0, nperseg_eff - 1)))
+    hop_length = max(1, nperseg_eff - noverlap_eff)
+    window = torch.hann_window(nperseg_eff, dtype=torch.float32, device=x_t.device)
+    Z = torch.stft(
+        x_t,
+        n_fft=nfft,
+        hop_length=hop_length,
+        win_length=nperseg_eff,
+        window=window,
+        center=False,
+        return_complex=True,
     )
 
-    Z = np.fft.fftshift(Z, axes=0)
-    f = np.fft.fftshift(f)
+    Z = torch.fft.fftshift(Z, dim=0)
+    f = torch.fft.fftshift(torch.fft.fftfreq(nfft, d=1.0 / max(sample_rate_hz, 1.0)).to(x_t.device))
 
-    mag = np.log1p(np.abs(Z)).astype(np.float32)
-    phase = np.angle(Z).astype(np.float32)
-    power = np.abs(Z) ** 2
-    denom = np.sum(power, axis=0, keepdims=True) + 1e-12
-    centroid = (np.sum(f[:, None] * power, axis=0, keepdims=True) / denom).astype(np.float32)
-    centroid_plane = np.repeat(centroid, repeats=mag.shape[0], axis=0)
+    mag = torch.log1p(torch.abs(Z)).to(dtype=torch.float32)
+    phase = torch.angle(Z).to(dtype=torch.float32)
+    power = (torch.abs(Z) ** 2).to(dtype=torch.float32)
+    denom = torch.sum(power, dim=0, keepdim=True) + 1e-12
+    centroid = torch.sum(f[:, None] * power, dim=0, keepdim=True) / denom
+    centroid_plane = centroid.repeat(mag.shape[0], 1).to(dtype=torch.float32)
 
-    feat = np.stack(
+    feat = torch.stack(
         [
             mag,
             phase,
             centroid_plane / max(sample_rate_hz, 1.0),
-            np.full_like(mag, np.log10(max(sample_rate_hz, 1.0)) / 10.0, dtype=np.float32),
+            torch.full_like(mag, torch.log10(torch.tensor(max(sample_rate_hz, 1.0), device=mag.device)) / 10.0),
         ],
-        axis=0,
+        dim=0,
     )
 
     return {
-        "feature": feat.astype(np.float32),
-        "rx_power": np.float32(measure_iq_power(iq)),
-        "peak_hz": np.float32(f[np.argmax(np.mean(power, axis=1))]) if power.size else np.float32(0.0),
+        "feature": feat.to(dtype=torch.float32),
+        "rx_power": measure_iq_power(iq),
+        "peak_hz": f[torch.argmax(torch.mean(power, dim=1))].to(dtype=torch.float32) if power.numel() else torch.tensor(0.0, dtype=torch.float32, device=x_t.device),
     }
 
 
@@ -244,10 +243,10 @@ class TonePulseTXControlNetVarLen(nn.Module):
 
 
 def _nearest_block_len(x_norm: float) -> int:
-    choices = np.array([128, 256, 512, 1024, 2048, 4096], dtype=np.int64)
+    choices = torch.tensor([128, 256, 512, 1024, 2048, 4096], dtype=torch.int64)
     idx = int(round(x_norm * (len(choices) - 1)))
     idx = max(0, min(idx, len(choices) - 1))
-    return int(choices[idx])
+    return int(choices[idx].item())
 
 
 def decode_tone_pulse_config(
@@ -329,7 +328,7 @@ def decode_tone_pulse_config(
 
 def build_controlled_tone_pulse_from_variable_inputs(
     model: TonePulseTXControlNetVarLen,
-    rx_iq_windows: List[Union[np.ndarray, torch.Tensor]],
+    rx_iq_windows: List[Union[torch.Tensor, List[complex]]],
     intake_sample_rate_hz: float,
     desired_output_iq_len: Optional[int] = None,
     user_peak_power_fraction: Optional[float] = None,
@@ -340,26 +339,27 @@ def build_controlled_tone_pulse_from_variable_inputs(
         raise ValueError("rx_iq_windows must contain at least one IQ array")
 
     proc = [preprocess_iq_to_stft_feature(x, intake_sample_rate_hz) for x in rx_iq_windows]
-    stft_tensors = [torch.from_numpy(p["feature"]).unsqueeze(0).to(device) for p in proc]  # type: ignore[arg-type]
+    stft_tensors = [p["feature"].unsqueeze(0).to(device) for p in proc]
 
-    rx_power_t = torch.tensor([float(p["rx_power"]) for p in proc], dtype=torch.float32)
-    peak_t = torch.tensor([float(p["peak_hz"]) for p in proc], dtype=torch.float32)
+    rx_power_t = torch.stack([p["rx_power"].to(dtype=torch.float32) for p in proc]).to(device)
+    peak_t = torch.stack([p["peak_hz"].to(dtype=torch.float32) for p in proc]).to(device)
     rx_input_power = float(rx_power_t.mean().item())
     rf_center_est_hz = float(peak_t.mean().item())
 
-    lengths = torch.tensor([int(_as_complex_tensor(x).numel()) for x in rx_iq_windows], dtype=torch.float32)
+    lengths = torch.tensor([int(_as_complex_tensor(x).numel()) for x in rx_iq_windows], dtype=torch.float32, device=device)
     max_len = torch.clamp(torch.max(lengths), min=1.0)
     scalar_side = torch.tensor(
         [[
-            torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32)).item() / 10.0,
-            float((torch.mean(lengths) / max_len).item()),
-            float((torch.std(lengths, unbiased=False) / max_len).item()),
+            (torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32, device=device)) / 10.0).item(),
+            (torch.mean(lengths) / max_len).item(),
+            (torch.std(lengths, unbiased=False) / max_len).item(),
             rx_input_power,
-            float((peak_t.mean() / max(intake_sample_rate_hz, 1.0)).item()),
-            float((peak_t.std(unbiased=False) / max(intake_sample_rate_hz, 1.0)).item()),
+            (peak_t.mean() / max(intake_sample_rate_hz, 1.0)).item(),
+            (peak_t.std(unbiased=False) / max(intake_sample_rate_hz, 1.0)).item(),
         ]],
         dtype=torch.float32,
-    ).to(device)
+        device=device,
+    )
 
     model = model.to(device)
     # model.eval()
@@ -413,7 +413,7 @@ def build_controlled_tone_pulse_from_variable_inputs(
     return {
         "tx_config": cfg,
         "model_outputs": y,
-        "tx_iq": tx_result.iq.astype(np.complex64),
+        "tx_iq": _as_complex_tensor(tx_result.iq),
         "tx_metadata": tx_metadata,
         "rx_input_power": rx_input_power,
         "rf_center_est_hz": rf_center_est_hz,
@@ -421,9 +421,9 @@ def build_controlled_tone_pulse_from_variable_inputs(
 
 
 if __name__ == "__main__":
-    iq_a = (np.random.randn(900) + 1j * np.random.randn(900)).astype(np.complex64)
-    iq_b = (np.random.randn(1700) + 1j * np.random.randn(1700)).astype(np.complex64)
-    iq_c = (np.random.randn(3200) + 1j * np.random.randn(3200)).astype(np.complex64)
+    iq_a = torch.complex(torch.randn(900), torch.randn(900)).to(dtype=torch.complex64)
+    iq_b = torch.complex(torch.randn(1700), torch.randn(1700)).to(dtype=torch.complex64)
+    iq_c = torch.complex(torch.randn(3200), torch.randn(3200)).to(dtype=torch.complex64)
 
     model = TonePulseTXControlNetVarLen(in_ch=4, base_ch=16, n_scalar_features=6, max_tones=8)
     out = build_controlled_tone_pulse_from_variable_inputs(
