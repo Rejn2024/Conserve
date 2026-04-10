@@ -1712,13 +1712,13 @@ def rx_command_iq(iq, meta):
 
     access_ref_waveform = tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span)
 
-    loop_coarse_start, loop_coarse_cfo_hz, loop_coarse_metric = loop_coarse_frequency_acquire(
-        iq=iq,
-        ref_waveform=access_ref_waveform,
-        sample_rate_hz=dsp_sample_rate_hz,
-        search_hz=coarse_freq_search_hz,
-        n_bins=coarse_freq_bins,
-    )
+    # loop_coarse_start, loop_coarse_cfo_hz, loop_coarse_metric = loop_coarse_frequency_acquire(
+    #     iq=iq,
+    #     ref_waveform=access_ref_waveform,
+    #     sample_rate_hz=dsp_sample_rate_hz,
+    #     search_hz=coarse_freq_search_hz,
+    #     n_bins=coarse_freq_bins,
+    # )
     
     coarse_start, coarse_cfo_hz, coarse_metric = coarse_frequency_acquire(
         iq=iq,
@@ -1733,18 +1733,18 @@ def rx_command_iq(iq, meta):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
 
-    payload, sample_offset_used = try_decode_over_sample_deltas(
-        mf=mf,
-        start_index_samples=coarse_start,
-        sps=sps,
-        span=span,
-        sample_phase_search=sample_phase_search,
-        fec_mode=fec,
-        interleave=interleave,
-        interleave_rows=interleave_rows,
-        symbol_rate_hz=symbol_rate_hz,
-        eq_taps=eq_taps,
-    )
+    # payload, sample_offset_used = try_decode_over_sample_deltas(
+    #     mf=mf,
+    #     start_index_samples=coarse_start,
+    #     sps=sps,
+    #     span=span,
+    #     sample_phase_search=sample_phase_search,
+    #     fec_mode=fec,
+    #     interleave=interleave,
+    #     interleave_rows=interleave_rows,
+    #     symbol_rate_hz=symbol_rate_hz,
+    #     eq_taps=eq_taps,
+    # )
     # payload, sample_offset_used = try_decode_over_sample_deltas(
     #     mf=mf,
     #     start_index_samples=coarse_start,
