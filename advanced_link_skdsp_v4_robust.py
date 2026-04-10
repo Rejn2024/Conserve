@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import concurrent.futures
 import json
 import math
 import struct
@@ -381,9 +382,9 @@ def apply_fading(
     multipath_taps: Optional[List[complex]] = None,
     seed: int = 1,
 ) -> torch.Tensor:
-    gen = torch.Generator(device=DEFAULT_TORCH_DEVICE)
-    gen.manual_seed(seed)
     x = _as_complex_tensor(iq)
+    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen.manual_seed(seed)
 
     if mode == "none":
         return x
@@ -442,7 +443,7 @@ def add_impulsive_bursts(
     if burst_probability <= 0.0 or x.numel() == 0:
         return x
 
-    gen = torch.Generator(device=DEFAULT_TORCH_DEVICE)
+    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
     gen.manual_seed(seed + 1000)
     out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
@@ -477,7 +478,7 @@ def impair_iq(
     seed: int,
 ) -> torch.Tensor:
     x = _as_complex_tensor(iq)
-    gen = torch.Generator(device=x.device if x.is_cuda else DEFAULT_TORCH_DEVICE)
+    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
     gen.manual_seed(seed)
 
     x = apply_fading(
@@ -1494,6 +1495,48 @@ def try_decode_from_symbols(
     return parse_payload_bytes(decoded_bytes, payload_len)
 
 
+def try_decode_over_sample_deltas(
+    mf: Union[np.ndarray, torch.Tensor],
+    start_index_samples: int,
+    sps: int,
+    span: int,
+    sample_phase_search: int,
+    fec_mode: str,
+    interleave: bool,
+    interleave_rows: int,
+    symbol_rate_hz: float,
+    eq_taps: int,
+) -> Tuple[Optional[bytes], Optional[int]]:
+    deltas = list(range(-sample_phase_search, sample_phase_search + 1))
+
+    def _worker(sample_delta: int) -> Tuple[int, Optional[bytes]]:
+        symbols = extract_symbols_from_start(
+            mf=mf,
+            start_index_samples=start_index_samples,
+            sps=sps,
+            span=span,
+            sample_delta=sample_delta,
+        )
+        payload = try_decode_from_symbols(
+            symbols=symbols,
+            fec_mode=fec_mode,
+            interleave=interleave,
+            interleave_rows=interleave_rows,
+            symbol_rate_hz=symbol_rate_hz,
+            eq_taps=eq_taps,
+        )
+        return sample_delta, payload
+
+    max_workers = max(1, min(len(deltas), 8))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        results = list(ex.map(_worker, deltas))
+
+    for sample_delta, payload in results:
+        if payload is not None:
+            return payload, sample_delta
+    return None, None
+
+
 def rx_command(args):
     iq = _as_complex_tensor(load_iq(args.input))
     meta = load_iq_metadata(args.input, metadata_path=args.metadata_path)
@@ -1548,28 +1591,18 @@ def rx_command(args):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=args.beta, span=args.span)
 
-    payload = None
-    sample_offset_used = None
-
-    for sample_delta in range(-args.sample_phase_search, args.sample_phase_search + 1):
-        symbols = extract_symbols_from_start(
-            mf=mf,
-            start_index_samples=coarse_start,
-            sps=sps,
-            span=args.span,
-            sample_delta=sample_delta,
-        )
-        payload = try_decode_from_symbols(
-            symbols=symbols,
-            fec_mode=args.fec,
-            interleave=args.interleave,
-            interleave_rows=args.interleave_rows,
-            symbol_rate_hz=symbol_rate_hz,
-            eq_taps=args.eq_taps,
-        )
-        if payload is not None:
-            sample_offset_used = sample_delta
-            break
+    payload, sample_offset_used = try_decode_over_sample_deltas(
+        mf=mf,
+        start_index_samples=coarse_start,
+        sps=sps,
+        span=args.span,
+        sample_phase_search=args.sample_phase_search,
+        fec_mode=args.fec,
+        interleave=args.interleave,
+        interleave_rows=args.interleave_rows,
+        symbol_rate_hz=symbol_rate_hz,
+        eq_taps=args.eq_taps,
+    )
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
@@ -1660,28 +1693,18 @@ def rx_command_iq(iq, meta):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
 
-    payload = None
-    sample_offset_used = None
-
-    for sample_delta in range(-sample_phase_search, sample_phase_search + 1):
-        symbols = extract_symbols_from_start(
-            mf=mf,
-            start_index_samples=coarse_start,
-            sps=sps,
-            span=span,
-            sample_delta=sample_delta,
-        )
-        payload = try_decode_from_symbols(
-            symbols=symbols,
-            fec_mode=fec,
-            interleave=interleave,
-            interleave_rows=interleave_rows,
-            symbol_rate_hz=symbol_rate_hz,
-            eq_taps=eq_taps,
-        )
-        if payload is not None:
-            sample_offset_used = sample_delta
-            break
+    payload, sample_offset_used = try_decode_over_sample_deltas(
+        mf=mf,
+        start_index_samples=coarse_start,
+        sps=sps,
+        span=span,
+        sample_phase_search=sample_phase_search,
+        fec_mode=fec,
+        interleave=interleave,
+        interleave_rows=interleave_rows,
+        symbol_rate_hz=symbol_rate_hz,
+        eq_taps=eq_taps,
+    )
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
