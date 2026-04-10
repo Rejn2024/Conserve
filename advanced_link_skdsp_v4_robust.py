@@ -443,8 +443,10 @@ def add_impulsive_bursts(
     if burst_probability <= 0.0 or x.numel() == 0:
         return x
 
-    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen = torch.Generator(device="cpu")
+    genl = torch.Generator(device=x.device)
     gen.manual_seed(seed + 1000)
+    genl.manual_seed(seed + 2000)
     out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
 
@@ -453,7 +455,7 @@ def add_impulsive_bursts(
         if float(torch.rand((), generator=gen).item()) < burst_probability:
             burst_len = int(torch.randint(burst_len_min, burst_len_max + 1, (1,), generator=gen).item())
             end = min(idx + burst_len, out.numel())
-            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=gen, device=out.device)
+            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=genl, device=out.device)
             idx = end
         else:
             idx += 1
