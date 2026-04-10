@@ -177,7 +177,7 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
 
 def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
-        return x.to(dtype=torch.complex64)
+        return x.to(dtype=torch.complex64).to(DEFAULT_TORCH_DEVICE)
     return torch.as_tensor(np.asarray(x), dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
 
 
@@ -343,8 +343,8 @@ def _complex_colored_noise(
     alpha = exponents[color]
 
     if n <= 0:
-        return torch.zeros(0, dtype=torch.complex64, device=device or DEFAULT_TORCH_DEVICE)
-    dev = device or DEFAULT_TORCH_DEVICE
+        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device(DEFAULT_TORCH_DEVICE))
+    dev = device or torch.device(DEFAULT_TORCH_DEVICE)
 
     def make_real() -> torch.Tensor:
         freqs = torch.fft.rfftfreq(n, d=1.0, device=dev)
@@ -423,17 +423,7 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=torch.complex64)
-        xr = x.real.to(dtype=torch.float32).reshape(1, 1, -1)
-        xi = x.imag.to(dtype=torch.float32).reshape(1, 1, -1)
-        kr = torch.flip(taps_t.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        ki = torch.flip(taps_t.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        pad = taps_t.numel() - 1
-        xr_pad = F.pad(xr, (pad, 0))
-        xi_pad = F.pad(xi, (pad, 0))
-        yr = F.conv1d(xr_pad, kr).reshape(-1) - F.conv1d(xi_pad, ki).reshape(-1)
-        yi = F.conv1d(xr_pad, ki).reshape(-1) + F.conv1d(xi_pad, kr).reshape(-1)
-        y = torch.complex(yr, yi).to(dtype=torch.complex64)
+        y = _complex_lfilter_fir(x, taps)
         return y[: x.numel()].to(dtype=torch.complex64)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
@@ -453,8 +443,10 @@ def add_impulsive_bursts(
     if burst_probability <= 0.0 or x.numel() == 0:
         return x
 
-    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen = torch.Generator(device="cpu")
+    genl = torch.Generator(device=x.device)
     gen.manual_seed(seed + 1000)
+    genl.manual_seed(seed + 2000)
     out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
 
@@ -463,7 +455,7 @@ def add_impulsive_bursts(
         if float(torch.rand((), generator=gen).item()) < burst_probability:
             burst_len = int(torch.randint(burst_len_min, burst_len_max + 1, (1,), generator=gen).item())
             end = min(idx + burst_len, out.numel())
-            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=gen, device=out.device)
+            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=genl, device=out.device)
             idx = end
         else:
             idx += 1
@@ -1273,6 +1265,11 @@ def coarse_frequency_acquire(
             best_start = idx
             best_cfo = float(f_hz.item())
 
+    print(f'from loop best_start : {best_start}, type : {type(best_start)}')
+    print(f'from loop best_cfo : {best_cfo}, type : {type(best_cfo)}')
+    print(f'from loop best_metric : {best_metric}, type : {type(best_metric)}')
+
+    
     return best_start, best_cfo, best_metric
 
 
@@ -1545,7 +1542,7 @@ def try_decode_from_symbols_numpy_legacy(
 
     train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
     train_end = train_start + TRAINING_LEN_BITS
-    if len(symbols) < train_end:
+    if symbols_t.numel() < train_end:
         return None
 
     rx_train = symbols[train_start:train_end]
@@ -1562,10 +1559,12 @@ def try_decode_from_symbols_numpy_legacy(
 
     hdr_start = ACCESS_BITS_LEN
     hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
-    if hdr_end > len(soft_bits):
+    if hdr_end > soft_bits.numel():
         return None
 
-    payload_len = choose_valid_header_from_copies(soft_bits[hdr_start:hdr_end])
+    payload_len = choose_valid_header_from_copies(
+        soft_bits[hdr_start:hdr_end].detach().cpu().numpy().astype(np.float64, copy=False)
+    )
     if payload_len is None:
         return None
 
@@ -1578,7 +1577,7 @@ def try_decode_from_symbols_numpy_legacy(
 
     data_start = hdr_end
     data_end = data_start + payload_with_pilots_bits
-    if data_end > len(soft_bits):
+    if data_end > soft_bits.numel():
         return None
 
     eq_symbols = _as_numpy_complex64(
@@ -1591,7 +1590,7 @@ def try_decode_from_symbols_numpy_legacy(
     )
     soft_bits = _soft_bits_np(eq_symbols)
 
-    payload_soft_with_pilots = soft_bits[data_start:data_end]
+    payload_soft_with_pilots = soft_bits[data_start:data_end].detach().cpu().numpy().astype(np.float64, copy=False)
     payload_soft = remove_pilots_soft(
         payload_soft_with_pilots,
         original_data_len=payload_coded_bits,
@@ -1817,6 +1816,14 @@ def rx_command_iq(iq, meta):
 
     access_ref_waveform = tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span)
 
+    # loop_coarse_start, loop_coarse_cfo_hz, loop_coarse_metric = loop_coarse_frequency_acquire(
+    #     iq=iq,
+    #     ref_waveform=access_ref_waveform,
+    #     sample_rate_hz=dsp_sample_rate_hz,
+    #     search_hz=coarse_freq_search_hz,
+    #     n_bins=coarse_freq_bins,
+    # )
+    
     coarse_start, coarse_cfo_hz, coarse_metric = coarse_frequency_acquire(
         iq=iq,
         ref_waveform=access_ref_waveform,
@@ -1824,6 +1831,8 @@ def rx_command_iq(iq, meta):
         search_hz=coarse_freq_search_hz,
         n_bins=coarse_freq_bins,
     )
+
+    
 
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
