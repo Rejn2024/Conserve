@@ -1542,7 +1542,7 @@ def try_decode_from_symbols_numpy_legacy(
 
     train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
     train_end = train_start + TRAINING_LEN_BITS
-    if symbols_t.numel() < train_end:
+    if len(symbols_t) < train_end:
         return None
 
     rx_train = symbols[train_start:train_end]
