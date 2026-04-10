@@ -177,7 +177,7 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
 
 def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
-        return x.to(dtype=torch.complex64)
+        return x.to(dtype=torch.complex64).to(DEFAULT_TORCH_DEVICE)
     return torch.as_tensor(np.asarray(x), dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
 
 
@@ -343,8 +343,8 @@ def _complex_colored_noise(
     alpha = exponents[color]
 
     if n <= 0:
-        return torch.zeros(0, dtype=torch.complex64, device=device or DEFAULT_TORCH_DEVICE)
-    dev = device or DEFAULT_TORCH_DEVICE
+        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device(DEFAULT_TORCH_DEVICE))
+    dev = device or torch.device(DEFAULT_TORCH_DEVICE)
 
     def make_real() -> torch.Tensor:
         freqs = torch.fft.rfftfreq(n, d=1.0, device=dev)
@@ -423,17 +423,7 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=torch.complex64)
-        xr = x.real.to(dtype=torch.float32).reshape(1, 1, -1)
-        xi = x.imag.to(dtype=torch.float32).reshape(1, 1, -1)
-        kr = torch.flip(taps_t.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        ki = torch.flip(taps_t.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-        pad = taps_t.numel() - 1
-        xr_pad = F.pad(xr, (pad, 0))
-        xi_pad = F.pad(xi, (pad, 0))
-        yr = F.conv1d(xr_pad, kr).reshape(-1) - F.conv1d(xi_pad, ki).reshape(-1)
-        yi = F.conv1d(xr_pad, ki).reshape(-1) + F.conv1d(xi_pad, kr).reshape(-1)
-        y = torch.complex(yr, yi).to(dtype=torch.complex64)
+        y = _complex_lfilter_fir(x, taps)
         return y[: x.numel()].to(dtype=torch.complex64)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
@@ -453,8 +443,10 @@ def add_impulsive_bursts(
     if burst_probability <= 0.0 or x.numel() == 0:
         return x
 
-    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen = torch.Generator(device="cpu")
+    genl = torch.Generator(device=x.device)
     gen.manual_seed(seed + 1000)
+    genl.manual_seed(seed + 2000)
     out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
 
@@ -463,7 +455,7 @@ def add_impulsive_bursts(
         if float(torch.rand((), generator=gen).item()) < burst_probability:
             burst_len = int(torch.randint(burst_len_min, burst_len_max + 1, (1,), generator=gen).item())
             end = min(idx + burst_len, out.numel())
-            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=gen, device=out.device)
+            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=genl, device=out.device)
             idx = end
         else:
             idx += 1
@@ -1271,8 +1263,14 @@ def coarse_frequency_acquire(
         if metric > best_metric:
             best_metric = metric
             best_start = idx
+            best_cfo = float(f_hz)
             best_cfo = float(f_hz.item())
 
+    print(f'from loop best_start : {best_start}, type : {type(best_start)}')
+    print(f'from loop best_cfo : {best_cfo}, type : {type(best_cfo)}')
+    print(f'from loop best_metric : {best_metric}, type : {type(best_metric)}')
+
+    
     return best_start, best_cfo, best_metric
 
 
@@ -1714,6 +1712,14 @@ def rx_command_iq(iq, meta):
 
     access_ref_waveform = tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span)
 
+    loop_coarse_start, loop_coarse_cfo_hz, loop_coarse_metric = loop_coarse_frequency_acquire(
+        iq=iq,
+        ref_waveform=access_ref_waveform,
+        sample_rate_hz=dsp_sample_rate_hz,
+        search_hz=coarse_freq_search_hz,
+        n_bins=coarse_freq_bins,
+    )
+    
     coarse_start, coarse_cfo_hz, coarse_metric = coarse_frequency_acquire(
         iq=iq,
         ref_waveform=access_ref_waveform,
@@ -1721,6 +1727,8 @@ def rx_command_iq(iq, meta):
         search_hz=coarse_freq_search_hz,
         n_bins=coarse_freq_bins,
     )
+
+    
 
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
@@ -1737,6 +1745,42 @@ def rx_command_iq(iq, meta):
         symbol_rate_hz=symbol_rate_hz,
         eq_taps=eq_taps,
     )
+    # payload, sample_offset_used = try_decode_over_sample_deltas(
+    #     mf=mf,
+    #     start_index_samples=coarse_start,
+    #     sps=sps,
+    #     span=span,
+    #     sample_phase_search=sample_phase_search,
+    #     fec_mode=fec,
+    #     interleave=interleave,
+    #     interleave_rows=interleave_rows,
+    #     symbol_rate_hz=symbol_rate_hz,
+    #     eq_taps=eq_taps,
+    # )
+    #deltas = list(range(-sample_phase_search, sample_phase_search + 1))
+    for sample_delta in range(-sample_phase_search, sample_phase_search + 1):
+        symbols = extract_symbols_from_start(
+            mf=mf,
+            start_index_samples=coarse_start,
+            sps=sps,
+            span=span,
+            sample_delta=sample_delta,
+        )
+        payload = try_decode_from_symbols(
+            symbols=symbols,
+            fec_mode=fec,
+            interleave=interleave,
+            interleave_rows=interleave_rows,
+            symbol_rate_hz=symbol_rate_hz,
+            eq_taps=eq_taps,
+        )
+        if payload is not None:
+            sample_offset_used = sample_delta
+            break
+
+    if payload is None:
+        raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
+
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
