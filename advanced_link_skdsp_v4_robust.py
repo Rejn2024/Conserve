@@ -1319,38 +1319,42 @@ def design_symbol_equalizer_ls(
     ntaps: int = 7,
     ridge: float = 1e-3,
 ) -> torch.Tensor:
-    rx_train_t = _as_complex_tensor(rx_train)
-    tx_train_t = _as_complex_tensor(tx_train)
+    rx_train_t = _as_complex_tensor(rx_train).to(dtype=torch.complex128)
+    tx_train_t = _as_complex_tensor(tx_train).to(dtype=torch.complex128)
 
     if ntaps % 2 == 0:
         raise ValueError("ntaps must be odd")
     if rx_train_t.numel() != tx_train_t.numel():
         raise ValueError("Training sequences must have same length")
     if rx_train_t.numel() < ntaps:
-        return torch.tensor([1.0 + 0.0j], dtype=torch.complex64, device=rx_train_t.device)
+        return torch.tensor([1.0 + 0.0j], dtype=torch.complex128, device=rx_train_t.device)
 
     half = ntaps // 2
     rpad = F.pad(rx_train_t.reshape(1, 1, -1), (half, half)).reshape(-1)
     X = torch.stack([rpad[i:i + ntaps] for i in range(rx_train_t.numel())], dim=0)
 
-    A = X.conj().T @ X + ridge * torch.eye(ntaps, dtype=torch.complex64, device=rx_train_t.device)
+    A = X.conj().T @ X + ridge * torch.eye(ntaps, dtype=torch.complex128, device=rx_train_t.device)
     b = X.conj().T @ tx_train_t
     w = torch.linalg.solve(A, b)
-    return w.to(dtype=torch.complex64)
+    return w
 
 
 def apply_symbol_equalizer(symbols: Union[np.ndarray, torch.Tensor], w: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
-    sym_t = _as_complex_tensor(symbols)
-    w_t = _as_complex_tensor(w)
+    sym_t = symbols if isinstance(symbols, torch.Tensor) else _as_complex_tensor(symbols)
+    w_t = w if isinstance(w, torch.Tensor) else _as_complex_tensor(w)
+    if not torch.is_complex(sym_t):
+        sym_t = sym_t.to(dtype=torch.complex64)
+    if not torch.is_complex(w_t):
+        w_t = w_t.to(dtype=torch.complex64)
     ntaps = int(w_t.numel())
     if ntaps == 1:
-        return (sym_t * w_t[0]).to(dtype=torch.complex64)
+        return sym_t * w_t[0]
 
     half = ntaps // 2
     spad = F.pad(sym_t.reshape(1, 1, -1), (half, half)).reshape(-1)
     X = torch.stack([spad[i:i + ntaps] for i in range(sym_t.numel())], dim=0)
     out = X @ w_t
-    return out.to(dtype=torch.complex64)
+    return out
 
 
 def apply_pilot_phase_tracking(
@@ -1367,7 +1371,7 @@ def apply_pilot_phase_tracking(
     payload_stream = y[access_and_headers_len:access_and_headers_len + data_with_pilots_len]
 
     pos = pilot_positions(data_only_len, interval=PILOT_INTERVAL_BITS, p_len=PILOT_BLOCK_BITS)
-    pilot_syms = bpsk_map(PILOT_BITS).to(device=symbols_t.device)
+    pilot_syms = bpsk_map(PILOT_BITS).to(device=symbols_t.device, dtype=symbols_t.dtype)
 
     phase_est = 0.0
     for data_start, data_end, pilot_start, pilot_end in pos:
@@ -1377,19 +1381,19 @@ def apply_pilot_phase_tracking(
                 ph = torch.angle(torch.sum(rx_pilot * torch.conj(pilot_syms)))
                 phase_est = float(ph.item())
                 payload_stream[data_start:pilot_start] *= torch.exp(
-                    torch.tensor(-1j * phase_est, dtype=torch.complex64, device=symbols_t.device)
+                    torch.tensor(-1j * phase_est, dtype=symbols_t.dtype, device=symbols_t.device)
                 )
             else:
                 payload_stream[data_start:data_end] *= torch.exp(
-                    torch.tensor(-1j * phase_est, dtype=torch.complex64, device=symbols_t.device)
+                    torch.tensor(-1j * phase_est, dtype=symbols_t.dtype, device=symbols_t.device)
                 )
         else:
             payload_stream[data_start:data_end] *= torch.exp(
-                torch.tensor(-1j * phase_est, dtype=torch.complex64, device=symbols_t.device)
+                torch.tensor(-1j * phase_est, dtype=symbols_t.dtype, device=symbols_t.device)
             )
 
     y[access_and_headers_len:access_and_headers_len + data_with_pilots_len] = payload_stream
-    return y.to(dtype=torch.complex64)
+    return y
 
 
 def choose_valid_header_from_copies(header_soft_all: np.ndarray) -> Optional[int]:
@@ -1418,8 +1422,8 @@ def try_decode_from_symbols(
     symbol_rate_hz: float,
     eq_taps: int,
 ) -> Optional[bytes]:
-    symbols_t = _as_complex_tensor(symbols)
-    access_syms = bpsk_map(ACCESS_BITS).to(device=symbols_t.device)
+    symbols_t = _as_complex_tensor(symbols).to(dtype=torch.complex128)
+    access_syms = bpsk_map(ACCESS_BITS).to(device=symbols_t.device, dtype=torch.complex128)
 
     if symbols_t.numel() < access_syms.numel() + HEADER_COPIES * HEADER_PROT_BITS_LEN:
         return None
@@ -1440,7 +1444,7 @@ def try_decode_from_symbols(
 
     rx_train_eq = eq_symbols[train_start:train_end]
     ph = torch.angle(torch.sum(rx_train_eq * torch.conj(tx_train)))
-    eq_symbols = eq_symbols * torch.exp(torch.tensor(-1j * float(ph.item()), dtype=torch.complex64, device=eq_symbols.device))
+    eq_symbols = eq_symbols * torch.exp(torch.tensor(-1j * float(ph.item()), dtype=eq_symbols.dtype, device=eq_symbols.device))
 
     soft_bits = eq_symbols.real.to(dtype=torch.float64)
 
@@ -1510,10 +1514,11 @@ def try_decode_over_sample_deltas(
     eq_taps: int,
 ) -> Tuple[Optional[bytes], Optional[int]]:
     deltas = list(range(-sample_phase_search, sample_phase_search + 1))
+    mf_t = _as_complex_tensor(mf)
 
     def _worker(sample_delta: int) -> Tuple[int, Optional[bytes]]:
         symbols = extract_symbols_from_start(
-            mf=mf,
+            mf=mf_t,
             start_index_samples=start_index_samples,
             sps=sps,
             span=span,
@@ -1528,6 +1533,14 @@ def try_decode_over_sample_deltas(
             eq_taps=eq_taps,
         )
         return sample_delta, payload
+
+    # GPU tensor decode attempts are kept sequential for determinism/stability.
+    if mf_t.is_cuda:
+        for d in deltas:
+            sample_delta, payload = _worker(d)
+            if payload is not None:
+                return payload, sample_delta
+        return None, None
 
     max_workers = max(1, min(len(deltas), 8))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
