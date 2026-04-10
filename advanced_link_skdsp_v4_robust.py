@@ -1559,7 +1559,7 @@ def try_decode_from_symbols_numpy_legacy(
 
     hdr_start = ACCESS_BITS_LEN
     hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
-    if hdr_end > soft_bits.numel():
+    if hdr_end > len(soft_bits):
         return None
 
     payload_len = choose_valid_header_from_copies(
@@ -1577,7 +1577,7 @@ def try_decode_from_symbols_numpy_legacy(
 
     data_start = hdr_end
     data_end = data_start + payload_with_pilots_bits
-    if data_end > soft_bits.numel():
+    if data_end > len(soft_bits):
         return None
 
     eq_symbols = _as_numpy_complex64(
