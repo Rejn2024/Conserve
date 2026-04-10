@@ -343,8 +343,8 @@ def _complex_colored_noise(
     alpha = exponents[color]
 
     if n <= 0:
-        return torch.zeros(0, dtype=torch.complex64, device=device or torch.device(DEFAULT_TORCH_DEVICE))
-    dev = device or torch.device(DEFAULT_TORCH_DEVICE)
+        return torch.zeros(0, dtype=torch.complex64, device=device or DEFAULT_TORCH_DEVICE)
+    dev = device or DEFAULT_TORCH_DEVICE
 
     def make_real() -> torch.Tensor:
         freqs = torch.fft.rfftfreq(n, d=1.0, device=dev)
@@ -423,7 +423,17 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        y = _complex_lfilter_fir(x, taps)
+        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=torch.complex64)
+        xr = x.real.to(dtype=torch.float32).reshape(1, 1, -1)
+        xi = x.imag.to(dtype=torch.float32).reshape(1, 1, -1)
+        kr = torch.flip(taps_t.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+        ki = torch.flip(taps_t.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+        pad = taps_t.numel() - 1
+        xr_pad = F.pad(xr, (pad, 0))
+        xi_pad = F.pad(xi, (pad, 0))
+        yr = F.conv1d(xr_pad, kr).reshape(-1) - F.conv1d(xi_pad, ki).reshape(-1)
+        yi = F.conv1d(xr_pad, ki).reshape(-1) + F.conv1d(xi_pad, kr).reshape(-1)
+        y = torch.complex(yr, yi).to(dtype=torch.complex64)
         return y[: x.numel()].to(dtype=torch.complex64)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
@@ -1542,7 +1552,7 @@ def try_decode_from_symbols_numpy_legacy(
 
     train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
     train_end = train_start + TRAINING_LEN_BITS
-    if len(symbols_t) < train_end:
+    if symbols_t.numel() < train_end:
         return None
 
     rx_train = symbols[train_start:train_end]
@@ -1559,11 +1569,11 @@ def try_decode_from_symbols_numpy_legacy(
 
     hdr_start = ACCESS_BITS_LEN
     hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
-    if hdr_end > len(soft_bits):
+    if hdr_end > soft_bits.numel():
         return None
 
     payload_len = choose_valid_header_from_copies(
-        soft_bits[hdr_start:hdr_end].astype(np.float64, copy=False)
+        soft_bits[hdr_start:hdr_end].detach().cpu().numpy().astype(np.float64, copy=False)
     )
     if payload_len is None:
         return None
@@ -1577,7 +1587,7 @@ def try_decode_from_symbols_numpy_legacy(
 
     data_start = hdr_end
     data_end = data_start + payload_with_pilots_bits
-    if data_end > len(soft_bits):
+    if data_end > soft_bits.numel():
         return None
 
     eq_symbols = _as_numpy_complex64(
@@ -1669,6 +1679,88 @@ def try_decode_over_sample_deltas(
         if payload is not None:
             return payload, sample_delta
     return None, None
+
+
+def rx_command_iq_numpy_legacy(iq: Union[np.ndarray, torch.Tensor], meta: dict) -> dict:
+    x = _as_numpy_complex64(iq)
+    tx_sample_rate_hz = float(meta["sample_rate_hz"])
+    tx_absolute_rf_hz = float(meta["absolute_rf_hz"])
+    tx_rf_center_hz = float(meta["rf_center_hz"])
+
+    sps = int(meta["sps"])
+    beta = float(meta["beta"])
+    span = int(meta["span"])
+    fec = meta["fec"]
+    interleave = bool(meta["interleave"])
+    interleave_rows = int(meta["interleave_rows"])
+    symbol_rate_hz = tx_sample_rate_hz / sps
+
+    coarse_freq_search_hz = 25_000.0
+    coarse_freq_bins = 101
+    sample_phase_search = 3
+    eq_taps = 7
+
+    baseband_offset_hz = tx_absolute_rf_hz - tx_rf_center_hz
+    n = np.arange(len(x), dtype=np.float64)
+    x = (x * np.exp(-1j * 2.0 * np.pi * baseband_offset_hz * n / tx_sample_rate_hz)).astype(np.complex64)
+
+    x = _as_numpy_complex64(robust_agc_and_blanking(x, blanker_k=6.0))
+    ref = _as_numpy_complex64(tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span))
+
+    best_metric = -1.0
+    coarse_start = 0
+    coarse_cfo_hz = 0.0
+    bins = np.linspace(-coarse_freq_search_hz, coarse_freq_search_hz, coarse_freq_bins)
+    for f_hz in bins:
+        rot = np.exp(-1j * 2.0 * np.pi * f_hz * n / tx_sample_rate_hz).astype(np.complex64)
+        y = x * rot
+        corr = np.correlate(y, np.conjugate(ref[::-1]), mode="valid")
+        mag = np.abs(corr)
+        idx = int(np.argmax(mag))
+        metric = float(mag[idx])
+        if metric > best_metric:
+            best_metric = metric
+            coarse_start = idx
+            coarse_cfo_hz = float(f_hz)
+
+    x = (x * np.exp(-1j * 2.0 * np.pi * coarse_cfo_hz * n / tx_sample_rate_hz)).astype(np.complex64)
+    taps = rrc_taps(beta=beta, sps=sps, span=span).astype(np.float32)
+    mf = np.convolve(x, taps.astype(np.complex64), mode="full")[: len(x)].astype(np.complex64)
+
+    payload = None
+    sample_offset_used = None
+    for d in range(-sample_phase_search, sample_phase_search + 1):
+        first = coarse_start + 2 * span * sps + d
+        if first < 0 or first >= len(mf):
+            continue
+        symbols = mf[first::sps].astype(np.complex64)
+        payload = try_decode_from_symbols_numpy_legacy(
+            symbols=symbols,
+            fec_mode=fec,
+            interleave=interleave,
+            interleave_rows=interleave_rows,
+            symbol_rate_hz=symbol_rate_hz,
+            eq_taps=eq_taps,
+        )
+        if payload is not None:
+            sample_offset_used = d
+            break
+
+    if payload is None:
+        raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
+
+    try:
+        message_text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        message_text = None
+    return {
+        "payload_bytes": payload,
+        "payload_len": len(payload),
+        "message": message_text,
+        "sample_offset_used": sample_offset_used,
+        "coarse_cfo_hz": coarse_cfo_hz,
+        "coarse_metric": best_metric,
+    }
 
 
 def rx_command(args):
@@ -1769,6 +1861,7 @@ def rx_command_iq(iq, meta):
     # iq = load_iq(args.input)
     # meta = load_iq_metadata(args.input, metadata_path=args.metadata_path)
 
+    iq_input = iq
     iq = _as_complex_tensor(iq)
 
     tx_sample_rate_hz = float(meta["sample_rate_hz"])
@@ -1851,7 +1944,7 @@ def rx_command_iq(iq, meta):
     )
 
     if payload is None:
-        raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
+        return rx_command_iq_numpy_legacy(iq_input, meta)
             
     try:
         message_text = payload.decode("utf-8")
