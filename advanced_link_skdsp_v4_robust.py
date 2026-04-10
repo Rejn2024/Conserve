@@ -1523,6 +1523,11 @@ def try_decode_from_symbols_numpy_legacy(
     symbol_rate_hz: float,
     eq_taps: int,
 ) -> Optional[bytes]:
+    def _soft_bits_np(x: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+        if isinstance(x, torch.Tensor):
+            return x.real.detach().cpu().numpy().astype(np.float64, copy=False)
+        return np.real(np.asarray(x)).astype(np.float64, copy=False)
+
     symbols = _as_numpy_complex64(symbols)
     symbols_t = symbols  # legacy compatibility alias
     access_syms = _as_numpy_complex64(bpsk_map(ACCESS_BITS))
@@ -1550,7 +1555,7 @@ def try_decode_from_symbols_numpy_legacy(
     ph = np.angle(np.sum(rx_train_eq * np.conj(tx_train)))
     eq_symbols = (eq_symbols * np.exp(-1j * ph)).astype(np.complex64)
 
-    soft_bits = eq_symbols.real.to(dtype=torch.float64)
+    soft_bits = _soft_bits_np(eq_symbols)
 
     hdr_start = ACCESS_BITS_LEN
     hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
@@ -1583,7 +1588,7 @@ def try_decode_from_symbols_numpy_legacy(
             access_and_headers_len=data_start,
         )
     )
-    soft_bits = eq_symbols.real.to(dtype=torch.float64)
+    soft_bits = _soft_bits_np(eq_symbols)
 
     payload_soft_with_pilots = soft_bits[data_start:data_end].detach().cpu().numpy().astype(np.float64, copy=False)
     payload_soft = remove_pilots_soft(
