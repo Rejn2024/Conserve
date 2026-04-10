@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import concurrent.futures
 import json
 import math
 import struct
@@ -16,8 +17,14 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from scipy import signal
+import torch.nn.functional as F
 
+try:
+    import torchaudio.functional as AF
+except Exception:  # pragma: no cover - optional dependency
+    AF = None
+
+DEFAULT_TORCH_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 FEC_NONE = "none"
 FEC_REP3 = "rep3"
@@ -45,8 +52,8 @@ POSTAMBLE_BITS = 256
 # Raw IQ / metadata helpers
 # -----------------------------------------------------------------------------
 
-def save_iq(path: Union[str, Path], iq: np.ndarray) -> None:
-    np.asarray(iq, dtype=np.complex64).tofile(str(path))
+def save_iq(path: Union[str, Path], iq: Union[np.ndarray, torch.Tensor]) -> None:
+    np.asarray(_as_numpy_complex64(iq), dtype=np.complex64).tofile(str(path))
 
 
 def load_iq(path: Union[str, Path]) -> np.ndarray:
@@ -171,13 +178,67 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
 def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         return x.to(dtype=torch.complex64)
-    return torch.as_tensor(np.asarray(x), dtype=torch.complex64)
+    return torch.as_tensor(np.asarray(x), dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
 
 
 def _as_numpy_complex64(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> np.ndarray:
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy().astype(np.complex64, copy=False)
     return np.asarray(x, dtype=np.complex64)
+
+
+def _complex_lfilter_fir(
+    x: Union[np.ndarray, torch.Tensor, List[complex]],
+    taps: Union[np.ndarray, torch.Tensor, List[complex]],
+) -> torch.Tensor:
+    xt = _as_complex_tensor(x)
+    ht = _as_complex_tensor(taps)
+    if xt.numel() == 0:
+        return xt
+
+    xr = xt.real.to(dtype=torch.float32).reshape(1, 1, -1)
+    xi = xt.imag.to(dtype=torch.float32).reshape(1, 1, -1)
+    k_r = torch.flip(ht.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1).to(device=xr.device, dtype=xr.dtype)
+    k_i = torch.flip(ht.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1).to(device=xr.device, dtype=xr.dtype)
+    pad = ht.numel() - 1
+
+    xr_pad = F.pad(xr, (pad, 0))
+    xi_pad = F.pad(xi, (pad, 0))
+    yr = F.conv1d(xr_pad, k_r).reshape(-1) - F.conv1d(xi_pad, k_i).reshape(-1)
+    yi = F.conv1d(xr_pad, k_i).reshape(-1) + F.conv1d(xi_pad, k_r).reshape(-1)
+    return torch.complex(yr, yi).to(dtype=torch.complex64)
+
+
+def _resample_complex_to_len(
+    x: Union[np.ndarray, torch.Tensor, List[complex]],
+    new_len: int,
+) -> torch.Tensor:
+    xt = _as_complex_tensor(x)
+    if new_len <= 0:
+        raise ValueError("new_len must be positive")
+    if xt.numel() == 0:
+        return xt
+    if int(new_len) == int(xt.numel()):
+        return xt
+
+    old_len = int(xt.numel())
+    if AF is not None:
+        y_r = AF.resample(xt.real.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
+        y_i = AF.resample(xt.imag.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
+    else:
+        y_r = F.interpolate(
+            xt.real.reshape(1, 1, -1),
+            size=int(new_len),
+            mode="linear",
+            align_corners=False,
+        ).reshape(-1)
+        y_i = F.interpolate(
+            xt.imag.reshape(1, 1, -1),
+            size=int(new_len),
+            mode="linear",
+            align_corners=False,
+        ).reshape(-1)
+    return torch.complex(y_r, y_i).to(dtype=torch.complex64)
 
 
 def measure_power(x: Union[np.ndarray, torch.Tensor]) -> float:
@@ -194,76 +255,82 @@ def measure_peak_power(x: Union[np.ndarray, torch.Tensor]) -> float:
 
 
 def bpsk_map(bits: List[int]) -> torch.Tensor:
-    b = torch.tensor(bits, dtype=torch.int8)
-    return torch.where(b > 0, torch.tensor(1.0), torch.tensor(-1.0)).to(dtype=torch.complex64)
+    b = torch.tensor(bits, dtype=torch.int8, device=DEFAULT_TORCH_DEVICE)
+    return torch.where(
+        b > 0,
+        torch.tensor(1.0, device=b.device),
+        torch.tensor(-1.0, device=b.device),
+    ).to(dtype=torch.complex64)
 
 
-def upsample_and_shape(symbols: Union[np.ndarray, torch.Tensor], sps: int, taps: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+def upsample_and_shape(symbols: Union[np.ndarray, torch.Tensor], sps: int, taps: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     syms = _as_complex_tensor(symbols)
-    up = torch.zeros(syms.numel() * sps, dtype=torch.complex64)
+    up = torch.zeros(syms.numel() * sps, dtype=torch.complex64, device=syms.device)
     up[::sps] = syms
-    y = signal.lfilter(_as_numpy_complex64(taps), [1.0], _as_numpy_complex64(up))
-    return y.astype(np.complex64)
+    return _complex_lfilter_fir(up, taps)
 
 
-def tx_waveform(bits: List[int], sps: int, beta: float, span: int) -> np.ndarray:
+def tx_waveform(bits: List[int], sps: int, beta: float, span: int) -> torch.Tensor:
     syms = bpsk_map(bits)
     taps = rrc_taps(beta=beta, sps=sps, span=span)
     return upsample_and_shape(syms, sps=sps, taps=taps)
 
 
-def apply_carrier_frequency(iq: Union[np.ndarray, torch.Tensor], carrier_hz: float, sample_rate_hz: float) -> np.ndarray:
+def apply_carrier_frequency(iq: Union[np.ndarray, torch.Tensor], carrier_hz: float, sample_rate_hz: float) -> torch.Tensor:
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz must be positive")
     if abs(carrier_hz) >= sample_rate_hz / 2:
         raise ValueError("carrier_hz must satisfy |carrier_hz| < sample_rate_hz/2")
     x = _as_complex_tensor(iq)
     if carrier_hz == 0.0:
-        return _as_numpy_complex64(x)
-    n = torch.arange(x.numel(), dtype=torch.float64)
+        return x
+    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     phase = 2.0 * torch.pi * carrier_hz * n / sample_rate_hz
     rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-    return _as_numpy_complex64(x * rot)
+    return x * rot
 
 
-def apply_frequency_offset(iq: Union[np.ndarray, torch.Tensor], freq_offset: float) -> np.ndarray:
+def apply_frequency_offset(iq: Union[np.ndarray, torch.Tensor], freq_offset: float) -> torch.Tensor:
     x = _as_complex_tensor(iq)
     if freq_offset == 0.0:
-        return _as_numpy_complex64(x)
-    n = torch.arange(x.numel(), dtype=torch.float64)
+        return x
+    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     phase = 2.0 * torch.pi * freq_offset * n
     rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-    return _as_numpy_complex64(x * rot)
+    return x * rot
 
 
-def apply_timing_offset_resample(iq: Union[np.ndarray, torch.Tensor], timing_offset: float) -> np.ndarray:
-    x = _as_numpy_complex64(iq)
-    if timing_offset == 1.0 or len(x) == 0:
-        return x.astype(np.complex64)
-    new_len = max(1, int(round(len(x) / timing_offset)))
-    y = signal.resample(x, new_len)
-    if new_len > len(x):
-        y = y[:len(x)]
-    elif new_len < len(x):
-        y = np.concatenate([y, np.zeros(len(x) - new_len, dtype=y.dtype)])
-    return y.astype(np.complex64)
+def apply_timing_offset_resample(iq: Union[np.ndarray, torch.Tensor], timing_offset: float) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
+    if timing_offset == 1.0 or x.numel() == 0:
+        return x
+    target_len = int(x.numel())
+    new_len = max(1, int(round(target_len / timing_offset)))
+    y = _resample_complex_to_len(x, new_len)
+    if new_len > target_len:
+        y = y[:target_len]
+    elif new_len < target_len:
+        y = torch.cat([y, torch.zeros(target_len - new_len, dtype=y.dtype, device=y.device)])
+    return y
 
 
-def resample_iq(iq: np.ndarray, fs_in_hz: float, fs_out_hz: float) -> np.ndarray:
+def resample_iq(iq: Union[np.ndarray, torch.Tensor], fs_in_hz: float, fs_out_hz: float) -> torch.Tensor:
     if fs_in_hz <= 0 or fs_out_hz <= 0:
         raise ValueError("Sample rates must be positive")
     if np.isclose(fs_in_hz, fs_out_hz):
-        return iq.astype(np.complex64)
-    new_len = max(1, int(round(len(iq) * fs_out_hz / fs_in_hz)))
-    return signal.resample(iq, new_len).astype(np.complex64)
+        return _as_complex_tensor(iq)
+    x = _as_complex_tensor(iq)
+    new_len = max(1, int(round(x.numel() * fs_out_hz / fs_in_hz)))
+    return _resample_complex_to_len(x, new_len)
 
 
 def _complex_colored_noise(
     n: int,
     color: str,
     power: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
+    generator: Optional[torch.Generator] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     exponents = {
         "white": 0.0,
         "pink": 1.0,
@@ -275,64 +342,80 @@ def _complex_colored_noise(
         raise ValueError(f"Unsupported noise color: {color}")
     alpha = exponents[color]
 
-    def make_real():
-        freqs = np.fft.rfftfreq(n, d=1.0)
-        spec = rng.normal(size=len(freqs)) + 1j * rng.normal(size=len(freqs))
-        shaping = np.ones_like(freqs, dtype=np.float64)
+    if n <= 0:
+        return torch.zeros(0, dtype=torch.complex64, device=device or DEFAULT_TORCH_DEVICE)
+    dev = device or DEFAULT_TORCH_DEVICE
+
+    def make_real() -> torch.Tensor:
+        freqs = torch.fft.rfftfreq(n, d=1.0, device=dev)
+        spec = torch.complex(
+            torch.randn(len(freqs), generator=generator, device=dev),
+            torch.randn(len(freqs), generator=generator, device=dev),
+        )
+        shaping = torch.ones_like(freqs, dtype=torch.float32)
         nz = freqs > 0
         if alpha > 0:
             shaping[nz] = 1.0 / (freqs[nz] ** (alpha / 2.0))
         elif alpha < 0:
             shaping[nz] = freqs[nz] ** ((-alpha) / 2.0)
         shaping[~nz] = 0.0 if color in ("pink", "brown") else 1.0
-        y = np.fft.irfft(spec * shaping, n=n)
-        p = np.mean(y ** 2)
-        if p > 0:
-            y *= np.sqrt((power / 2.0) / p)
+        y = torch.fft.irfft(spec * shaping.to(spec.dtype), n=n)
+        p = torch.mean(y ** 2)
+        if float(p.item()) > 0:
+            y = y * torch.sqrt(torch.tensor((power / 2.0), device=dev, dtype=torch.float32) / p)
         return y
 
     i = make_real()
     q = make_real()
-    z = i + 1j * q
-    p = np.mean(np.abs(z) ** 2)
-    if p > 0:
-        z *= np.sqrt(power / p)
-    return z.astype(np.complex64)
+    z = torch.complex(i, q).to(dtype=torch.complex64)
+    p = torch.mean(torch.abs(z) ** 2)
+    if float(p.item()) > 0:
+        z = z * torch.sqrt(torch.tensor(power, device=dev, dtype=torch.float32) / p)
+    return z
 
 
 def apply_fading(
-    iq: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
     mode: str = "none",
     block_len: int = 256,
     rician_k_db: float = 6.0,
     multipath_taps: Optional[List[complex]] = None,
     seed: int = 1,
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    x = np.asarray(iq, dtype=np.complex64)
+) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
+    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen.manual_seed(seed)
 
     if mode == "none":
         return x
 
     if mode == "rayleigh_block":
-        out = np.empty_like(x)
-        for start in range(0, len(x), block_len):
-            end = min(start + block_len, len(x))
-            h = (rng.normal() + 1j * rng.normal()) / np.sqrt(2.0)
+        out = torch.empty_like(x)
+        for start in range(0, x.numel(), block_len):
+            end = min(start + block_len, x.numel())
+            h = torch.complex(
+                torch.randn((), generator=gen, device=x.device),
+                torch.randn((), generator=gen, device=x.device),
+            ) / math.sqrt(2.0)
             out[start:end] = x[start:end] * h
-        return out.astype(np.complex64)
+        return out.to(dtype=torch.complex64)
 
     if mode == "rician_block":
-        out = np.empty_like(x)
+        out = torch.empty_like(x)
         k_lin = 10.0 ** (rician_k_db / 10.0)
         los = np.sqrt(k_lin / (k_lin + 1.0))
         scat_scale = np.sqrt(1.0 / (k_lin + 1.0))
-        for start in range(0, len(x), block_len):
-            end = min(start + block_len, len(x))
-            scat = ((rng.normal() + 1j * rng.normal()) / np.sqrt(2.0)) * scat_scale
+        for start in range(0, x.numel(), block_len):
+            end = min(start + block_len, x.numel())
+            scat = (
+                torch.complex(
+                    torch.randn((), generator=gen, device=x.device),
+                    torch.randn((), generator=gen, device=x.device),
+                ) / math.sqrt(2.0)
+            ) * scat_scale
             h = los + scat
             out[start:end] = x[start:end] * h
-        return out.astype(np.complex64)
+        return out.to(dtype=torch.complex64)
 
     if mode == "multipath_static":
         taps = multipath_taps if multipath_taps is not None else [
@@ -340,14 +423,24 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        y = np.convolve(x, np.asarray(taps, dtype=np.complex64), mode="full")[:len(x)]
-        return y.astype(np.complex64)
+        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=torch.complex64)
+        xr = x.real.to(dtype=torch.float32).reshape(1, 1, -1)
+        xi = x.imag.to(dtype=torch.float32).reshape(1, 1, -1)
+        kr = torch.flip(taps_t.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+        ki = torch.flip(taps_t.imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+        pad = taps_t.numel() - 1
+        xr_pad = F.pad(xr, (pad, 0))
+        xi_pad = F.pad(xi, (pad, 0))
+        yr = F.conv1d(xr_pad, kr).reshape(-1) - F.conv1d(xi_pad, ki).reshape(-1)
+        yi = F.conv1d(xr_pad, ki).reshape(-1) + F.conv1d(xi_pad, kr).reshape(-1)
+        y = torch.complex(yr, yi).to(dtype=torch.complex64)
+        return y[: x.numel()].to(dtype=torch.complex64)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
 
 
 def add_impulsive_bursts(
-    iq: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
     base_noise_power: float,
     burst_probability: float = 0.0,
     burst_len_min: int = 16,
@@ -355,28 +448,30 @@ def add_impulsive_bursts(
     burst_power_ratio_db: float = 12.0,
     burst_color: str = "white",
     seed: int = 1,
-) -> np.ndarray:
-    if burst_probability <= 0.0 or len(iq) == 0:
-        return iq.astype(np.complex64)
+) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
+    if burst_probability <= 0.0 or x.numel() == 0:
+        return x
 
-    rng = np.random.default_rng(seed + 1000)
-    out = np.array(iq, copy=True, dtype=np.complex64)
+    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen.manual_seed(seed + 1000)
+    out = x.clone()
     burst_power = base_noise_power * (10.0 ** (burst_power_ratio_db / 10.0))
 
     idx = 0
-    while idx < len(out):
-        if rng.random() < burst_probability:
-            burst_len = int(rng.integers(burst_len_min, burst_len_max + 1))
-            end = min(idx + burst_len, len(out))
-            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, rng)
+    while idx < out.numel():
+        if float(torch.rand((), generator=gen).item()) < burst_probability:
+            burst_len = int(torch.randint(burst_len_min, burst_len_max + 1, (1,), generator=gen).item())
+            end = min(idx + burst_len, out.numel())
+            out[idx:end] += _complex_colored_noise(end - idx, burst_color, burst_power, generator=gen, device=out.device)
             idx = end
         else:
             idx += 1
-    return out.astype(np.complex64)
+    return out.to(dtype=torch.complex64)
 
 
 def impair_iq(
-    iq: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
     snr_db: Optional[float],
     noise_color: str,
     freq_offset: float,
@@ -391,9 +486,10 @@ def impair_iq(
     burst_power_ratio_db: float,
     burst_color: str,
     seed: int,
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    x = np.asarray(iq, dtype=np.complex64)
+) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
+    gen = torch.Generator(device=x.device if x.is_cuda else "cpu")
+    gen.manual_seed(seed)
 
     x = apply_fading(
         x,
@@ -413,7 +509,7 @@ def impair_iq(
         y = x
     else:
         noise_power = sig_power / (10.0 ** (snr_db / 10.0))
-        y = x + _complex_colored_noise(len(x), noise_color, noise_power, rng)
+        y = x + _complex_colored_noise(x.numel(), noise_color, noise_power, generator=gen, device=x.device)
 
     y = add_impulsive_bursts(
         y,
@@ -425,11 +521,11 @@ def impair_iq(
         burst_color=burst_color,
         seed=seed,
     )
-    return y.astype(np.complex64)
+    return y.to(dtype=torch.complex64)
 
 
-def limit_peak_power(iq: np.ndarray, max_peak_power: Optional[float]) -> Tuple[np.ndarray, bool, float]:
-    x = np.asarray(iq, dtype=np.complex64)
+def limit_peak_power(iq: Union[np.ndarray, torch.Tensor], max_peak_power: Optional[float]) -> Tuple[torch.Tensor, bool, float]:
+    x = _as_complex_tensor(iq)
     pre_peak_power = measure_peak_power(x)
     if max_peak_power is None:
         return x, False, pre_peak_power
@@ -438,28 +534,31 @@ def limit_peak_power(iq: np.ndarray, max_peak_power: Optional[float]) -> Tuple[n
     if pre_peak_power <= 0 or pre_peak_power <= max_peak_power:
         return x, False, pre_peak_power
     scale = math.sqrt(max_peak_power / pre_peak_power)
-    return (x * scale).astype(np.complex64), True, pre_peak_power
+    return (x * scale).to(dtype=torch.complex64), True, pre_peak_power
 
 
-def robust_agc_and_blanking(x: np.ndarray, blanker_k: float = 6.0) -> np.ndarray:
-    x = np.asarray(x, dtype=np.complex64)
-    x = x - np.mean(x)
+def robust_agc_and_blanking(x: Union[np.ndarray, torch.Tensor], blanker_k: float = 6.0) -> torch.Tensor:
+    xt = _as_complex_tensor(x)
+    if xt.numel() == 0:
+        return xt
 
-    mag = np.abs(x)
-    med = np.median(mag)
-    mad = np.median(np.abs(mag - med)) + 1e-12
+    xt = xt - torch.mean(xt)
+    mag = torch.abs(xt)
+    med = torch.median(mag)
+    mad = torch.median(torch.abs(mag - med)) + 1e-12
     thresh = med + blanker_k * 1.4826 * mad
 
-    if thresh > 0:
+    if float(thresh.item()) > 0.0:
         over = mag > thresh
-        if np.any(over):
-            x = np.array(x, copy=True)
-            x[over] = thresh * np.exp(1j * np.angle(x[over]))
+        if bool(torch.any(over).item()):
+            clamped = thresh * torch.exp(1j * torch.angle(xt[over]))
+            xt = xt.clone()
+            xt[over] = clamped
 
-    p = measure_power(x)
-    if p > 0:
-        x = x / np.sqrt(p)
-    return x.astype(np.complex64)
+    p = torch.mean(torch.abs(xt) ** 2)
+    if float(p.item()) > 0:
+        xt = xt / torch.sqrt(p)
+    return xt.to(dtype=torch.complex64)
 
 
 def lfsr_sequence(n: int, seed: int = 0x5D) -> List[int]:
@@ -740,7 +839,7 @@ def pilot_positions(total_data_len: int, interval: int = PILOT_INTERVAL_BITS, p_
 
 @dataclass
 class TXBuildResult:
-    iq: np.ndarray
+    iq: torch.Tensor
     metadata: dict
 
 
@@ -820,13 +919,13 @@ def build_tx_iq_object(
     one_burst_iq = tx_waveform(frame_bits, sps=sps, beta=beta, span=span)
 
     if target_num_samples is None:
-        iq = one_burst_iq.astype(np.complex64)
+        iq = one_burst_iq.to(dtype=torch.complex64)
         n_repeats = 1
     else:
         if target_num_samples <= 0:
             raise ValueError("target_num_samples must be > 0")
         n_repeats = int(math.ceil(target_num_samples / len(one_burst_iq)))
-        iq = np.tile(one_burst_iq, n_repeats)[:target_num_samples].astype(np.complex64)
+        iq = torch.tile(one_burst_iq, (n_repeats,))[:target_num_samples].to(dtype=torch.complex64)
 
     iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
 
@@ -857,7 +956,7 @@ def build_tx_iq_object(
         "payload_len": payload_len,
         "payload_len_bytes": payload_len,
         "target_num_samples": target_num_samples,
-        "actual_num_samples": int(len(iq)),
+        "actual_num_samples": int(iq.numel()),
         "payload_plain_bits": payload_plain_bits,
         "payload_coded_bits": payload_coded_bits,
         "payload_with_pilots_bits": payload_with_pilots_bits,
@@ -889,22 +988,22 @@ def build_tx_iq_object(
         "avg_power": measure_power(iq),
     }
 
-    return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
+    return TXBuildResult(iq=iq.to(dtype=torch.complex64), metadata=metadata)
 
 
-def _scale_iq_to_peak_power(iq: np.ndarray, peak_power: Optional[float]) -> np.ndarray:
-    x = np.asarray(iq, dtype=np.complex64)
+def _scale_iq_to_peak_power(iq: Union[np.ndarray, torch.Tensor], peak_power: Optional[float]) -> torch.Tensor:
+    x = _as_complex_tensor(iq)
     if peak_power is None:
         return x
     if peak_power <= 0.0:
         raise ValueError("peak_power must be > 0 when provided")
     if len(x) == 0:
         return x
-    current_peak_power = float(np.max(np.abs(x) ** 2))
+    current_peak_power = float(torch.max(torch.abs(x) ** 2).item())
     if current_peak_power <= 0.0:
         return x
     gain = np.sqrt(peak_power / current_peak_power)
-    return (x * gain).astype(np.complex64)
+    return (x * gain).to(dtype=torch.complex64)
 
 
 def build_tone_pulse_iq_object(
@@ -976,7 +1075,7 @@ def build_tone_pulse_iq_object(
     if total_samples <= 0:
         raise ValueError("target_num_samples must be > 0 when provided")
 
-    gate = np.zeros(total_samples, dtype=np.float32)
+    gate = torch.zeros(total_samples, dtype=torch.float32, device=DEFAULT_TORCH_DEVICE)
     for k in range(pulse_count):
         start = start_offset_samples + k * cycle_samples
         end = min(start + pulse_on_samples, total_samples)
@@ -984,13 +1083,14 @@ def build_tone_pulse_iq_object(
             break
         gate[start:end] = 1.0
 
-    n = np.arange(total_samples, dtype=np.float64)
-    iq = np.zeros(total_samples, dtype=np.complex128)
+    n = torch.arange(total_samples, dtype=torch.float64, device=DEFAULT_TORCH_DEVICE)
+    iq = torch.zeros(total_samples, dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
     for a, f_hz, ph in zip(tone_amplitudes, tone_frequencies_hz, tone_initial_phases_rad):
         if a == 0.0:
             continue
-        iq += a * np.exp(1j * (2.0 * np.pi * f_hz * n / sample_rate_hz + ph))
-    iq = (iq * gate).astype(np.complex64)
+        phase = 2.0 * torch.pi * f_hz * n / sample_rate_hz + ph
+        iq = iq + a * torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    iq = (iq * gate).to(dtype=torch.complex64)
 
     iq = _scale_iq_to_peak_power(iq, peak_power)
     iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
@@ -1019,7 +1119,7 @@ def build_tone_pulse_iq_object(
         "carrier_hz": carrier_hz,
         "absolute_rf_hz": rf_center_hz + carrier_hz,
         "target_num_samples": target_num_samples,
-        "actual_num_samples": int(len(iq)),
+        "actual_num_samples": int(iq.numel()),
         "num_tones": num_tones,
         "tone_frequencies_hz": [float(x) for x in tone_frequencies_hz],
         "tone_amplitudes": [float(x) for x in tone_amplitudes],
@@ -1044,9 +1144,9 @@ def build_tone_pulse_iq_object(
         "peak_power": peak_power,
         "seed": seed,
         "avg_power": measure_power(iq),
-        "measured_peak_power": float(np.max(np.abs(iq) ** 2)) if len(iq) else 0.0,
+        "measured_peak_power": float(torch.max(torch.abs(iq) ** 2).item()) if iq.numel() else 0.0,
     }
-    return TXBuildResult(iq=iq.astype(np.complex64), metadata=metadata)
+    return TXBuildResult(iq=iq.to(dtype=torch.complex64), metadata=metadata)
 
 
 def save_tx_iq_object(
@@ -1135,83 +1235,96 @@ def tx_command(args):
 
 
 def coarse_frequency_acquire(
-    iq: np.ndarray,
-    ref_waveform: np.ndarray,
+    iq: Union[np.ndarray, torch.Tensor],
+    ref_waveform: Union[np.ndarray, torch.Tensor],
     sample_rate_hz: float,
     search_hz: float,
     n_bins: int,
 ) -> Tuple[int, float, float]:
-    if len(iq) < len(ref_waveform):
+    x = _as_complex_tensor(iq)
+    ref = _as_complex_tensor(ref_waveform)
+    if x.numel() < ref.numel():
         raise RuntimeError("IQ shorter than reference waveform")
 
     best_metric = -1.0
     best_start = 0
     best_cfo = 0.0
 
-    n = np.arange(len(iq), dtype=np.float64)
-    bins = np.linspace(-search_hz, search_hz, n_bins)
-    ref = np.asarray(ref_waveform, dtype=np.complex64)
+    n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
+    bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
+    kr = torch.flip(torch.conj(ref).real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+    ki = torch.flip(torch.conj(ref).imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
 
     for f_hz in bins:
-        rot = np.exp(-1j * 2.0 * np.pi * f_hz * n / sample_rate_hz)
-        y = iq * rot
-        corr = signal.correlate(y, ref, mode="valid", method="fft")
-        mag = np.abs(corr)
-        idx = int(np.argmax(mag))
-        metric = float(mag[idx])
+        phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
+        rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+        y = x * rot
+
+        yr_in = y.real.to(dtype=torch.float32).reshape(1, 1, -1)
+        yi_in = y.imag.to(dtype=torch.float32).reshape(1, 1, -1)
+        yr = F.conv1d(yr_in, kr).reshape(-1) - F.conv1d(yi_in, ki).reshape(-1)
+        yi = F.conv1d(yr_in, ki).reshape(-1) + F.conv1d(yi_in, kr).reshape(-1)
+        mag = torch.abs(torch.complex(yr, yi))
+
+        idx = int(torch.argmax(mag).item())
+        metric = float(mag[idx].item())
         if metric > best_metric:
             best_metric = metric
             best_start = idx
-            best_cfo = float(f_hz)
+            best_cfo = float(f_hz.item())
 
     return best_start, best_cfo, best_metric
 
 
 def estimate_residual_cfo_from_preamble(
-    symbols: np.ndarray,
+    symbols: Union[np.ndarray, torch.Tensor],
     symbol_rate_hz: float,
 ) -> float:
+    syms = _as_complex_tensor(symbols)
     half = PREAMBLE_HALF_LEN_BITS
     reps = PREAMBLE_REPS
-    if len(symbols) < PREAMBLE_BITS_LEN:
+    if syms.numel() < PREAMBLE_BITS_LEN:
         return 0.0
 
     phases = []
     for r in range(reps - 1):
-        s1 = symbols[r * half:(r + 1) * half]
-        s2 = symbols[(r + 1) * half:(r + 2) * half]
-        if len(s1) == half and len(s2) == half:
-            ph = np.angle(np.sum(s2 * np.conj(s1)))
+        s1 = syms[r * half:(r + 1) * half]
+        s2 = syms[(r + 1) * half:(r + 2) * half]
+        if s1.numel() == half and s2.numel() == half:
+            ph = torch.angle(torch.sum(s2 * torch.conj(s1)))
             phases.append(ph / (2.0 * np.pi * half))
     if not phases:
         return 0.0
-    return float(np.mean(phases) * symbol_rate_hz)
+    return float(torch.mean(torch.stack(phases)).item() * symbol_rate_hz)
 
 
-def apply_symbol_rate_cfo(symbols: np.ndarray, cfo_hz: float, symbol_rate_hz: float) -> np.ndarray:
+def apply_symbol_rate_cfo(symbols: Union[np.ndarray, torch.Tensor], cfo_hz: float, symbol_rate_hz: float) -> torch.Tensor:
+    syms = _as_complex_tensor(symbols)
     if cfo_hz == 0.0:
-        return symbols.astype(np.complex64)
-    n = np.arange(len(symbols), dtype=np.float64)
-    rot = np.exp(-1j * 2.0 * np.pi * cfo_hz * n / symbol_rate_hz)
-    return (symbols * rot).astype(np.complex64)
+        return syms
+    n = torch.arange(syms.numel(), dtype=torch.float64, device=syms.device)
+    phase = -2.0 * torch.pi * cfo_hz * n / symbol_rate_hz
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    return (syms * rot).to(dtype=torch.complex64)
 
 
-def matched_filter(iq: np.ndarray, sps: int, beta: float, span: int) -> np.ndarray:
+def matched_filter(iq: Union[np.ndarray, torch.Tensor], sps: int, beta: float, span: int) -> torch.Tensor:
     taps = rrc_taps(beta=beta, sps=sps, span=span)
-    return signal.lfilter(taps, [1.0], iq).astype(np.complex64)
+    return _complex_lfilter_fir(iq, taps)
 
 
 def extract_symbols_from_start(
-    mf: np.ndarray,
+    mf: Union[np.ndarray, torch.Tensor],
     start_index_samples: int,
     sps: int,
     span: int,
     sample_delta: int = 0,
-) -> np.ndarray:
+) -> torch.Tensor:
+    mft = _as_complex_tensor(mf)
     first = start_index_samples + 2 * span * sps + sample_delta
-    if first < 0 or first >= len(mf):
-        return np.array([], dtype=np.complex64)
-    return np.asarray(mf[first::sps], dtype=np.complex64)
+    if first < 0 or first >= mft.numel():
+        return torch.zeros(0, dtype=torch.complex64, device=mft.device)
+    return mft[first::sps].to(dtype=torch.complex64)
 
 
 def design_symbol_equalizer_ls(
@@ -1219,74 +1332,85 @@ def design_symbol_equalizer_ls(
     tx_train: Union[np.ndarray, torch.Tensor],
     ntaps: int = 7,
     ridge: float = 1e-3,
-) -> np.ndarray:
-    rx_train_np = _as_numpy_complex64(rx_train)
-    tx_train_np = _as_numpy_complex64(tx_train)
+) -> torch.Tensor:
+    rx_train_t = _as_complex_tensor(rx_train).to(dtype=torch.complex128)
+    tx_train_t = _as_complex_tensor(tx_train).to(dtype=torch.complex128)
 
     if ntaps % 2 == 0:
         raise ValueError("ntaps must be odd")
-    if len(rx_train_np) != len(tx_train_np):
+    if rx_train_t.numel() != tx_train_t.numel():
         raise ValueError("Training sequences must have same length")
-    if len(rx_train_np) < ntaps:
-        return np.array([1.0 + 0.0j], dtype=np.complex64)
+    if rx_train_t.numel() < ntaps:
+        return torch.tensor([1.0 + 0.0j], dtype=torch.complex128, device=rx_train_t.device)
 
     half = ntaps // 2
-    rpad = np.pad(rx_train_np, (half, half), mode="constant")
-    X = np.stack([rpad[i:i + ntaps] for i in range(len(rx_train_np))], axis=0)
+    rpad = F.pad(rx_train_t.reshape(1, 1, -1), (half, half)).reshape(-1)
+    X = torch.stack([rpad[i:i + ntaps] for i in range(rx_train_t.numel())], dim=0)
 
-    A = X.conj().T @ X + ridge * np.eye(ntaps, dtype=np.complex128)
-    b = X.conj().T @ tx_train_np
-    w = np.linalg.solve(A, b)
-    return w.astype(np.complex64)
+    A = X.conj().T @ X + ridge * torch.eye(ntaps, dtype=torch.complex128, device=rx_train_t.device)
+    b = X.conj().T @ tx_train_t
+    w = torch.linalg.solve(A, b)
+    return w
 
 
-def apply_symbol_equalizer(symbols: np.ndarray, w: np.ndarray) -> np.ndarray:
-    ntaps = len(w)
+def apply_symbol_equalizer(symbols: Union[np.ndarray, torch.Tensor], w: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    sym_t = symbols if isinstance(symbols, torch.Tensor) else _as_complex_tensor(symbols)
+    w_t = w if isinstance(w, torch.Tensor) else _as_complex_tensor(w)
+    if not torch.is_complex(sym_t):
+        sym_t = sym_t.to(dtype=torch.complex64)
+    if not torch.is_complex(w_t):
+        w_t = w_t.to(dtype=torch.complex64)
+    common_dtype = torch.promote_types(sym_t.dtype, w_t.dtype)
+    sym_t = sym_t.to(dtype=common_dtype)
+    w_t = w_t.to(dtype=common_dtype)
+    ntaps = int(w_t.numel())
     if ntaps == 1:
-        return (symbols * w[0]).astype(np.complex64)
+        return sym_t * w_t[0]
 
     half = ntaps // 2
-    spad = np.pad(symbols, (half, half), mode="constant")
-    out = np.empty(len(symbols), dtype=np.complex64)
-
-    for i in range(len(symbols)):
-        x = spad[i:i + ntaps]
-        out[i] = np.dot(x, w)
-
+    spad = F.pad(sym_t.reshape(1, 1, -1), (half, half)).reshape(-1)
+    X = torch.stack([spad[i:i + ntaps] for i in range(sym_t.numel())], dim=0)
+    out = X @ w_t
     return out
 
 
 def apply_pilot_phase_tracking(
-    symbols: np.ndarray,
+    symbols: Union[np.ndarray, torch.Tensor],
     data_with_pilots_len: int,
     data_only_len: int,
     access_and_headers_len: int,
-) -> np.ndarray:
-    symbols = _as_numpy_complex64(symbols)
-    if len(symbols) < access_and_headers_len + data_with_pilots_len:
-        return symbols.astype(np.complex64)
+) -> torch.Tensor:
+    symbols_t = _as_complex_tensor(symbols)
+    if symbols_t.numel() < access_and_headers_len + data_with_pilots_len:
+        return symbols_t.to(dtype=torch.complex64)
 
-    y = np.array(symbols, copy=True)
+    y = symbols_t.clone()
     payload_stream = y[access_and_headers_len:access_and_headers_len + data_with_pilots_len]
 
     pos = pilot_positions(data_only_len, interval=PILOT_INTERVAL_BITS, p_len=PILOT_BLOCK_BITS)
-    pilot_syms = _as_numpy_complex64(bpsk_map(PILOT_BITS))
+    pilot_syms = bpsk_map(PILOT_BITS).to(device=symbols_t.device, dtype=symbols_t.dtype)
 
     phase_est = 0.0
     for data_start, data_end, pilot_start, pilot_end in pos:
-        if pilot_start >= 0 and pilot_end <= len(payload_stream):
+        if pilot_start >= 0 and pilot_end <= payload_stream.numel():
             rx_pilot = payload_stream[pilot_start:pilot_end]
-            if len(rx_pilot) == len(pilot_syms):
-                ph = np.angle(np.sum(rx_pilot * np.conj(pilot_syms)))
-                phase_est = ph
-                payload_stream[data_start:pilot_start] *= np.exp(-1j * phase_est)
+            if rx_pilot.numel() == pilot_syms.numel():
+                ph = torch.angle(torch.sum(rx_pilot * torch.conj(pilot_syms)))
+                phase_est = float(ph.item())
+                payload_stream[data_start:pilot_start] *= torch.exp(
+                    torch.tensor(-1j * phase_est, dtype=symbols_t.dtype, device=symbols_t.device)
+                )
             else:
-                payload_stream[data_start:data_end] *= np.exp(-1j * phase_est)
+                payload_stream[data_start:data_end] *= torch.exp(
+                    torch.tensor(-1j * phase_est, dtype=symbols_t.dtype, device=symbols_t.device)
+                )
         else:
-            payload_stream[data_start:data_end] *= np.exp(-1j * phase_est)
+            payload_stream[data_start:data_end] *= torch.exp(
+                torch.tensor(-1j * phase_est, dtype=symbols_t.dtype, device=symbols_t.device)
+            )
 
     y[access_and_headers_len:access_and_headers_len + data_with_pilots_len] = payload_stream
-    return y.astype(np.complex64)
+    return y
 
 
 def choose_valid_header_from_copies(header_soft_all: np.ndarray) -> Optional[int]:
@@ -1315,14 +1439,109 @@ def try_decode_from_symbols(
     symbol_rate_hz: float,
     eq_taps: int,
 ) -> Optional[bytes]:
+    symbols_t = _as_complex_tensor(symbols).to(dtype=torch.complex128)
+    access_syms = bpsk_map(ACCESS_BITS).to(device=symbols_t.device, dtype=torch.complex128)
+
+    if symbols_t.numel() < access_syms.numel() + HEADER_COPIES * HEADER_PROT_BITS_LEN:
+        return None
+
+    residual_cfo_hz = estimate_residual_cfo_from_preamble(symbols_t[:PREAMBLE_BITS_LEN], symbol_rate_hz)
+    symbols_t = apply_symbol_rate_cfo(symbols_t, residual_cfo_hz, symbol_rate_hz)
+
+    train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
+    train_end = train_start + TRAINING_LEN_BITS
+    if symbols_t.numel() < train_end:
+        return None
+
+    rx_train = symbols_t[train_start:train_end]
+    tx_train = access_syms[train_start:train_end]
+
+    w = design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3)
+    eq_symbols = apply_symbol_equalizer(symbols_t, w)
+
+    rx_train_eq = eq_symbols[train_start:train_end]
+    ph = torch.angle(torch.sum(rx_train_eq * torch.conj(tx_train)))
+    eq_symbols = eq_symbols * torch.exp(torch.tensor(-1j * float(ph.item()), dtype=eq_symbols.dtype, device=eq_symbols.device))
+
+    soft_bits = eq_symbols.real.to(dtype=torch.float64)
+
+    hdr_start = ACCESS_BITS_LEN
+    hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
+    if hdr_end > soft_bits.numel():
+        return None
+
+    payload_len = choose_valid_header_from_copies(
+        soft_bits[hdr_start:hdr_end].detach().cpu().numpy().astype(np.float64, copy=False)
+    )
+    if payload_len is None:
+        return None
+
+    payload_plain_bits = (payload_len + 4) * 8
+    fec = FECCodec(fec_mode)
+    payload_coded_bits = fec.encoded_length(payload_plain_bits)
+
+    n_pilot_blocks = max(0, math.ceil(max(payload_coded_bits - PILOT_INTERVAL_BITS, 0) / PILOT_INTERVAL_BITS))
+    payload_with_pilots_bits = payload_coded_bits + n_pilot_blocks * PILOT_BLOCK_BITS
+
+    data_start = hdr_end
+    data_end = data_start + payload_with_pilots_bits
+    if data_end > soft_bits.numel():
+        return None
+
+    eq_symbols = apply_pilot_phase_tracking(
+        eq_symbols,
+        data_with_pilots_len=payload_with_pilots_bits,
+        data_only_len=payload_coded_bits,
+        access_and_headers_len=data_start,
+    )
+    soft_bits = eq_symbols.real.to(dtype=torch.float64)
+
+    payload_soft_with_pilots = soft_bits[data_start:data_end].detach().cpu().numpy().astype(np.float64, copy=False)
+    payload_soft = remove_pilots_soft(
+        payload_soft_with_pilots,
+        original_data_len=payload_coded_bits,
+        interval=PILOT_INTERVAL_BITS,
+        pilot_bits=PILOT_BITS,
+    )
+
+    if interleave:
+        payload_soft = block_deinterleave_soft(payload_soft, rows=interleave_rows)
+
+    decoded_bits = fec.decode_soft(payload_soft)
+    if len(decoded_bits) < payload_plain_bits:
+        return None
+
+    decoded_bits = decoded_bits[:payload_plain_bits]
+    decoded_bits = descramble_bits(decoded_bits, seed=0x5D)
+    decoded_bytes = bits_to_bytes_msb(decoded_bits)
+
+    return parse_payload_bytes(decoded_bytes, payload_len)
+
+
+def try_decode_from_symbols_numpy_legacy(
+    symbols: Union[np.ndarray, torch.Tensor],
+    fec_mode: str,
+    interleave: bool,
+    interleave_rows: int,
+    symbol_rate_hz: float,
+    eq_taps: int,
+) -> Optional[bytes]:
+    def _soft_bits_np(x: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+        if isinstance(x, torch.Tensor):
+            return x.real.detach().cpu().numpy().astype(np.float64, copy=False)
+        return np.real(np.asarray(x)).astype(np.float64, copy=False)
+
     symbols = _as_numpy_complex64(symbols)
+    symbols_t = symbols  # legacy compatibility alias
     access_syms = _as_numpy_complex64(bpsk_map(ACCESS_BITS))
 
-    if len(symbols) < len(access_syms) + HEADER_COPIES * HEADER_PROT_BITS_LEN:
+    if len(symbols_t) < len(access_syms) + HEADER_COPIES * HEADER_PROT_BITS_LEN:
         return None
 
     residual_cfo_hz = estimate_residual_cfo_from_preamble(symbols[:PREAMBLE_BITS_LEN], symbol_rate_hz)
-    symbols = apply_symbol_rate_cfo(symbols, residual_cfo_hz, symbol_rate_hz)
+    if residual_cfo_hz != 0.0:
+        n = np.arange(len(symbols), dtype=np.float64)
+        symbols = (symbols * np.exp(-1j * 2.0 * np.pi * residual_cfo_hz * n / symbol_rate_hz)).astype(np.complex64)
 
     train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
     train_end = train_start + TRAINING_LEN_BITS
@@ -1330,16 +1549,16 @@ def try_decode_from_symbols(
         return None
 
     rx_train = symbols[train_start:train_end]
-    tx_train = _as_numpy_complex64(access_syms[train_start:train_end])
+    tx_train = access_syms[train_start:train_end]
 
-    w = design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3)
-    eq_symbols = apply_symbol_equalizer(symbols, w)
+    w = _as_numpy_complex64(design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3))
+    eq_symbols = _as_numpy_complex64(apply_symbol_equalizer(symbols, w))
 
     rx_train_eq = eq_symbols[train_start:train_end]
-    ph = np.angle(np.sum(_as_numpy_complex64(rx_train_eq) * np.conj(tx_train)))
-    eq_symbols *= np.exp(-1j * ph)
+    ph = np.angle(np.sum(rx_train_eq * np.conj(tx_train)))
+    eq_symbols = (eq_symbols * np.exp(-1j * ph)).astype(np.complex64)
 
-    soft_bits = np.real(eq_symbols).astype(np.float64)
+    soft_bits = _soft_bits_np(eq_symbols)
 
     hdr_start = ACCESS_BITS_LEN
     hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
@@ -1362,13 +1581,15 @@ def try_decode_from_symbols(
     if data_end > len(soft_bits):
         return None
 
-    eq_symbols = apply_pilot_phase_tracking(
-        eq_symbols,
-        data_with_pilots_len=payload_with_pilots_bits,
-        data_only_len=payload_coded_bits,
-        access_and_headers_len=data_start,
+    eq_symbols = _as_numpy_complex64(
+        apply_pilot_phase_tracking(
+            eq_symbols,
+            data_with_pilots_len=payload_with_pilots_bits,
+            data_only_len=payload_coded_bits,
+            access_and_headers_len=data_start,
+        )
     )
-    soft_bits = np.real(eq_symbols).astype(np.float64)
+    soft_bits = _soft_bits_np(eq_symbols)
 
     payload_soft_with_pilots = soft_bits[data_start:data_end]
     payload_soft = remove_pilots_soft(
@@ -1388,12 +1609,71 @@ def try_decode_from_symbols(
     decoded_bits = decoded_bits[:payload_plain_bits]
     decoded_bits = descramble_bits(decoded_bits, seed=0x5D)
     decoded_bytes = bits_to_bytes_msb(decoded_bits)
-
     return parse_payload_bytes(decoded_bytes, payload_len)
 
 
+def try_decode_over_sample_deltas(
+    mf: Union[np.ndarray, torch.Tensor],
+    start_index_samples: int,
+    sps: int,
+    span: int,
+    sample_phase_search: int,
+    fec_mode: str,
+    interleave: bool,
+    interleave_rows: int,
+    symbol_rate_hz: float,
+    eq_taps: int,
+) -> Tuple[Optional[bytes], Optional[int]]:
+    deltas = list(range(-sample_phase_search, sample_phase_search + 1))
+    mf_t = _as_complex_tensor(mf)
+
+    def _worker(sample_delta: int) -> Tuple[int, Optional[bytes]]:
+        symbols = extract_symbols_from_start(
+            mf=mf_t,
+            start_index_samples=start_index_samples,
+            sps=sps,
+            span=span,
+            sample_delta=sample_delta,
+        )
+        payload = try_decode_from_symbols(
+            symbols=symbols,
+            fec_mode=fec_mode,
+            interleave=interleave,
+            interleave_rows=interleave_rows,
+            symbol_rate_hz=symbol_rate_hz,
+            eq_taps=eq_taps,
+        )
+        if payload is None:
+            payload = try_decode_from_symbols_numpy_legacy(
+                symbols=symbols,
+                fec_mode=fec_mode,
+                interleave=interleave,
+                interleave_rows=interleave_rows,
+                symbol_rate_hz=symbol_rate_hz,
+                eq_taps=eq_taps,
+            )
+        return sample_delta, payload
+
+    # GPU tensor decode attempts are kept sequential for determinism/stability.
+    if mf_t.is_cuda:
+        for d in deltas:
+            sample_delta, payload = _worker(d)
+            if payload is not None:
+                return payload, sample_delta
+        return None, None
+
+    max_workers = max(1, min(len(deltas), 8))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        results = list(ex.map(_worker, deltas))
+
+    for sample_delta, payload in results:
+        if payload is not None:
+            return payload, sample_delta
+    return None, None
+
+
 def rx_command(args):
-    iq = load_iq(args.input)
+    iq = _as_complex_tensor(load_iq(args.input))
     meta = load_iq_metadata(args.input, metadata_path=args.metadata_path)
 
     if meta is not None:
@@ -1446,28 +1726,18 @@ def rx_command(args):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=args.beta, span=args.span)
 
-    payload = None
-    sample_offset_used = None
-
-    for sample_delta in range(-args.sample_phase_search, args.sample_phase_search + 1):
-        symbols = extract_symbols_from_start(
-            mf=mf,
-            start_index_samples=coarse_start,
-            sps=sps,
-            span=args.span,
-            sample_delta=sample_delta,
-        )
-        payload = try_decode_from_symbols(
-            symbols=symbols,
-            fec_mode=args.fec,
-            interleave=args.interleave,
-            interleave_rows=args.interleave_rows,
-            symbol_rate_hz=symbol_rate_hz,
-            eq_taps=args.eq_taps,
-        )
-        if payload is not None:
-            sample_offset_used = sample_delta
-            break
+    payload, sample_offset_used = try_decode_over_sample_deltas(
+        mf=mf,
+        start_index_samples=coarse_start,
+        sps=sps,
+        span=args.span,
+        sample_phase_search=args.sample_phase_search,
+        fec_mode=args.fec,
+        interleave=args.interleave,
+        interleave_rows=args.interleave_rows,
+        symbol_rate_hz=symbol_rate_hz,
+        eq_taps=args.eq_taps,
+    )
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
@@ -1500,7 +1770,7 @@ def rx_command_iq(iq, meta):
     # iq = load_iq(args.input)
     # meta = load_iq_metadata(args.input, metadata_path=args.metadata_path)
 
-    iq = _as_numpy_complex64(iq)
+    iq = _as_complex_tensor(iq)
 
     tx_sample_rate_hz = float(meta["sample_rate_hz"])
     tx_rf_center_hz = float(meta["rf_center_hz"])
@@ -1558,28 +1828,18 @@ def rx_command_iq(iq, meta):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
 
-    payload = None
-    sample_offset_used = None
-
-    for sample_delta in range(-sample_phase_search, sample_phase_search + 1):
-        symbols = extract_symbols_from_start(
-            mf=mf,
-            start_index_samples=coarse_start,
-            sps=sps,
-            span=span,
-            sample_delta=sample_delta,
-        )
-        payload = try_decode_from_symbols(
-            symbols=symbols,
-            fec_mode=fec,
-            interleave=interleave,
-            interleave_rows=interleave_rows,
-            symbol_rate_hz=symbol_rate_hz,
-            eq_taps=eq_taps,
-        )
-        if payload is not None:
-            sample_offset_used = sample_delta
-            break
+    payload, sample_offset_used = try_decode_over_sample_deltas(
+        mf=mf,
+        start_index_samples=coarse_start,
+        sps=sps,
+        span=span,
+        sample_phase_search=sample_phase_search,
+        fec_mode=fec,
+        interleave=interleave,
+        interleave_rows=interleave_rows,
+        symbol_rate_hz=symbol_rate_hz,
+        eq_taps=eq_taps,
+    )
 
     if payload is None:
         raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
