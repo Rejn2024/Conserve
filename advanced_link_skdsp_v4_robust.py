@@ -1254,8 +1254,8 @@ def coarse_frequency_acquire(
 
     n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
-    kr = torch.flip(torch.conj(ref).real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
-    ki = torch.flip(torch.conj(ref).imag.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
+    kr = torch.conj(ref).real.to(dtype=torch.float32).reshape(1, 1, -1)
+    ki = torch.conj(ref).imag.to(dtype=torch.float32).reshape(1, 1, -1)
 
     for f_hz in bins:
         phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
