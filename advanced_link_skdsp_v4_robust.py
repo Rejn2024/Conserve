@@ -1925,7 +1925,7 @@ def rx_command_iq(iq, meta):
         n_bins=coarse_freq_bins,
     )
 
-    
+    print(f'coarse_start: {coarse_start}, coarse_cfo_hz : {coarse_cfo_hz}, coarse_metric : {coarse_metric}')
 
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)

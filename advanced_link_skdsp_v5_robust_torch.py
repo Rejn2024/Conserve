@@ -649,14 +649,30 @@ def try_decode_from_symbols(symbols, fec_mode, interleave, interleave_rows, symb
 
 def rx_command_iq(iq, meta):
     tx_sample_rate_hz = float(meta["sample_rate_hz"]); tx_rf_center_hz = float(meta["rf_center_hz"]); tx_absolute_rf_hz = float(meta["absolute_rf_hz"])
-    sps, beta, span = 8, 0.35, 6
+    sps = int(meta["sps"])
+    beta = float(meta["beta"])
+    span = int(meta["span"])
+    sample_rate_hz = float(meta["sample_rate_hz"])
+    rf_center_hz = float(meta["rf_center_hz"])
+
+    fec = meta['fec']
+    # print(f'fec : {fec}')
+    interleave = bool(meta['interleave'])
+    interleave_rows = int(meta['interleave_rows'])
+
+    coarse_freq_search_hz = 25_000.0 # float(meta["coarse_freq_search_hz"])
+    coarse_freq_bins = 101 # int(meta["coarse_freq_bins"])
+    sample_phase_search = 3 # float(meta["sample_phase_search"])
+    eq_taps = 7 # int(meta["eq_taps"])
+    
     symbol_rate_hz = tx_sample_rate_hz / sps
+    
     iq = apply_carrier_frequency(iq, carrier_hz=-(tx_absolute_rf_hz - tx_rf_center_hz), sample_rate_hz=tx_sample_rate_hz)
     iq = robust_agc_and_blanking(iq, blanker_k=6.0)
     access_ref_waveform = tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span)
     coarse_start, coarse_cfo_hz, coarse_metric = coarse_frequency_acquire(iq, access_ref_waveform, tx_sample_rate_hz, 25_000.0, 101)
     mf = matched_filter(apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=tx_sample_rate_hz), sps=sps, beta=beta, span=span)
-    payload = try_decode_from_symbols(extract_symbols_from_start(mf, coarse_start, sps, span, sample_delta=3), FEC_NONE, True, 8, symbol_rate_hz, 7)
+    payload = try_decode_from_symbols(extract_symbols_from_start(mf, coarse_start, sps, span, sample_delta=3), FEC_NONE, interleave, interleave_rows, symbol_rate_hz, 7)
     if payload is None: raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
     try: message_text = payload.decode("utf-8")
     except UnicodeDecodeError: message_text = None

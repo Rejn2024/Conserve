@@ -1299,17 +1299,23 @@ def rx_command_iq(iq, meta):
 
     rx_sample_rate_hz = tx_sample_rate_hz
     rx_rf_center_hz = tx_rf_center_hz
-    sps = 8 # default
-    beta = 0.35 # default
-    span = 6 # default
-    coarse_freq_search_hz = 25_000.0
-    coarse_freq_bins = 101
-    sample_phase_search = 3
-    eq_taps = 7
+   
+    sps = int(meta["sps"])
+    beta = float(meta["beta"])
+    span = int(meta["span"])
+    sample_rate_hz = float(meta["sample_rate_hz"])
+    rf_center_hz = float(meta["rf_center_hz"])
 
-    fec = FEC_NONE
-    interleave = True
-    interleave_rows = 8
+    fec = meta['fec']
+    # print(f'fec : {fec}')
+    interleave = bool(meta['interleave'])
+    interleave_rows = int(meta['interleave_rows'])
+
+    coarse_freq_search_hz = 25_000.0 # float(meta["coarse_freq_search_hz"])
+    coarse_freq_bins = 101 # int(meta["coarse_freq_bins"])
+    sample_phase_search = 3 # float(meta["sample_phase_search"])
+    eq_taps = 7 # int(meta["eq_taps"])
+
     
     symbol_rate_hz = tx_sample_rate_hz / sps
 
@@ -1344,7 +1350,7 @@ def rx_command_iq(iq, meta):
     payload = None
     sample_offset_used = None
 
-    for sample_delta in range(sample_phase_search, sample_phase_search + 1):
+    for sample_delta in range(-sample_phase_search, sample_phase_search + 1):
         symbols = extract_symbols_from_start(
             mf=mf,
             start_index_samples=coarse_start,

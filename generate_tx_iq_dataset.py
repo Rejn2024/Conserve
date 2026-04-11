@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-import advanced_link_skdsp_v4_robust as link
+import advanced_link_skdsp_v5_robust as link
 
 
 ALPHANUM_SPACE = string.ascii_letters + string.digits + "     "
