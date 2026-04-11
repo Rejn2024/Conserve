@@ -1653,14 +1653,15 @@ def try_decode_over_sample_deltas(
             eq_taps=eq_taps,
         )
         if payload is None:
-            payload = try_decode_from_symbols_numpy_legacy(
-                symbols=symbols,
-                fec_mode=fec_mode,
-                interleave=interleave,
-                interleave_rows=interleave_rows,
-                symbol_rate_hz=symbol_rate_hz,
-                eq_taps=eq_taps,
-            )
+            raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
+            # payload = try_decode_from_symbols_numpy_legacy(
+            #     symbols=symbols,
+            #     fec_mode=fec_mode,
+            #     interleave=interleave,
+            #     interleave_rows=interleave_rows,
+            #     symbol_rate_hz=symbol_rate_hz,
+            #     eq_taps=eq_taps,
+            # )
         return sample_delta, payload
 
     # GPU tensor decode attempts are kept sequential for determinism/stability.
