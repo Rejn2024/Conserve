@@ -342,6 +342,21 @@ def build_controlled_tone_pulse_from_variable_inputs(
     seed: int = 1,
     device: str = "cpu",
 ) -> Dict[str, object]:
+    """
+    Build a controlled tone-pulse transmission from variable-length RX IQ windows.
+
+    Returns:
+        A dictionary containing:
+          - tx_config: Decoded controller output as `TonePulseControlConfig`; this is the
+            concrete parameter set used to synthesize TX IQ.
+          - tx_metadata: Generation metadata from `txflex.build_tone_pulse_iq_object(...)`
+            augmented with controller-centric diagnostics such as input window lengths and
+            estimated RX input power.
+          - model_outputs: Raw neural-network head outputs before decode.
+          - tx_iq: Generated complex TX IQ samples.
+          - rx_input_power: Mean measured input power across provided RX windows.
+          - rf_center_est_hz: Mean estimated spectral peak used as RF center prior.
+    """
     if not rx_iq_windows:
         raise ValueError("rx_iq_windows must contain at least one IQ array")
 
