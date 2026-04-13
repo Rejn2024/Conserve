@@ -19,6 +19,7 @@ import json
 import random
 import string
 import tempfile
+import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -200,7 +201,7 @@ def _decode_candidate_with_v4(
         iq_path = td_path / "candidate.iq"
         meta_path = td_path / "candidate.iq.json"
 
-        np.asarray(iq, dtype=np.complex64).tofile(iq_path)
+        np.asarray(iq.detach().cpu(), dtype=np.complex64).tofile(iq_path)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -334,7 +335,13 @@ def build_decodable_sample(
             }
 
             print("sucessfully generated data")
-            return tx_result.iq.astype(np.complex64), whole_meta
+            
+            if isinstance(tx_result.iq, np.ndarray):
+                return tx_result.iq.astype(np.complex64), whole_meta
+            elif isinstance(tx_result.iq, torch.Tensor):
+                tri = tx_result.iq.detach().cpu().numpy()
+                return tri.astype(np.complex64), whole_meta
+
 
     raise RuntimeError(
         f"Failed to generate a decodable transmission after {max_attempts_per_sample} attempts "
