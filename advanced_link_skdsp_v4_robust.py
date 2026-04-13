@@ -222,7 +222,14 @@ def _resample_complex_to_len(
         return xt
 
     old_len = int(xt.numel())
-    if AF is not None:
+    # NOTE:
+    # torchaudio.functional.resample builds a sinc kernel whose memory scales with
+    # both orig_freq and new_freq. Here, we pass signal lengths as those values so
+    # near-1.0 timing offsets on long vectors can trigger huge temporary tensors
+    # (especially on CUDA) and OOM. For large length pairs, switch to linear
+    # interpolation which has predictable memory behavior.
+    use_torchaudio = AF is not None and (old_len * int(new_len) <= 16_000_000)
+    if use_torchaudio:
         y_r = AF.resample(xt.real.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
         y_i = AF.resample(xt.imag.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
     else:
