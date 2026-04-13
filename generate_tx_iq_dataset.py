@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-import advanced_link_skdsp_v4_robust as link
+import advanced_link_skdsp_v6_robust as link
 
 
 ALPHANUM_SPACE = string.ascii_letters + string.digits + "     "
@@ -129,20 +129,25 @@ def cut_random_sections(
     num_sections: int,
     section_len: int,
     seed: int,
+    lengthening_factor: int = 5 # present to provide a hedge against lower jammer sampling frequencies 
 ) -> Dict:
+    
+    lengthened_section = lengthening_factor * section_len
+
     if len(iq) < section_len:
         raise ValueError("IQ shorter than section length")
 
     rng = np.random.default_rng(seed)
-    max_start = len(iq) - section_len
+    max_start = len(iq) - 5*section_len
     starts = [int(rng.integers(0, max_start + 1)) for _ in range(num_sections)]
-    sections = np.stack([iq[s:s + section_len] for s in starts], axis=0)
+    sections = np.stack([iq[s:s + lengthened_section] for s in starts], axis=0)
 
     return {
         "sections": sections.astype(np.complex64),
         "starts": starts,
         "section_len": section_len,
         "num_sections": num_sections,
+        "lengthening_factor": lengthening_factor
     }
 
 
