@@ -175,7 +175,6 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
     h /= np.sqrt(np.sum(h ** 2))
     return h.astype(np.float64)
 
-
 def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         return x.to(dtype=torch.complex64).to(DEFAULT_TORCH_DEVICE)
@@ -848,7 +847,13 @@ class TXBuildResult:
 
 @lru_cache(maxsize=64)
 def _cached_rrc_taps_cpu(beta: float, sps: int, span: int) -> torch.Tensor:
-    return rrc_taps(beta=beta, sps=sps, span=span).detach().to(dtype=torch.float32, device="cpu").contiguous()
+    rt = rrc_taps(beta=beta, sps=sps, span=span)
+    if isinstance(rt, torch.Tensor):
+        return rt.detach().to(dtype=torch.float32, device=DEFAULT_TORCH_DEVICE).contiguous()
+    elif isinstance(rt, np.ndarray):
+        return torch.tensor(rt, dtype=torch.float32, device=DEFAULT_TORCH_DEVICE).contiguous()
+    else: 
+        raise TypeError(f'rrc_taps returns an unrecognised type, type: {type(rt)}')
 
 
 @lru_cache(maxsize=64)
