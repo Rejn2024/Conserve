@@ -174,6 +174,13 @@ class TonePulseTXControlNetVarLen(nn.Module):
     """Shared STFT encoder over a variable-length list of IQ windows."""
 
     def __init__(self, in_ch: int = 4, base_ch: int = 24, n_scalar_features: int = 6, max_tones: int = 8):
+        """
+        Args:
+            in_ch: Number of channels per STFT input map [B, C, F, T].
+            base_ch: Base convolution width used by the STFT encoder.
+            n_scalar_features: Number of non-image scalar side features fused with STFT features.
+            max_tones: Upper bound on synthesized tone count (also output width for tone amplitudes).
+        """
         super().__init__()
         self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
