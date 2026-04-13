@@ -174,6 +174,13 @@ class TonePulseTXControlNetVarLen(nn.Module):
     """Shared STFT encoder over a variable-length list of IQ windows."""
 
     def __init__(self, in_ch: int = 4, base_ch: int = 24, n_scalar_features: int = 6, max_tones: int = 8):
+        """
+        Args:
+            in_ch: Number of channels per STFT input map [B, C, F, T].
+            base_ch: Base convolution width used by the STFT encoder.
+            n_scalar_features: Number of non-image scalar side features fused with STFT features.
+            max_tones: Upper bound on synthesized tone count (also output width for tone amplitudes).
+        """
         super().__init__()
         self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
@@ -335,6 +342,21 @@ def build_controlled_tone_pulse_from_variable_inputs(
     seed: int = 1,
     device: str = "cpu",
 ) -> Dict[str, object]:
+    """
+    Build a controlled tone-pulse transmission from variable-length RX IQ windows.
+
+    Returns:
+        A dictionary containing:
+          - tx_config: Decoded controller output as `TonePulseControlConfig`; this is the
+            concrete parameter set used to synthesize TX IQ.
+          - tx_metadata: Generation metadata from `txflex.build_tone_pulse_iq_object(...)`
+            augmented with controller-centric diagnostics such as input window lengths and
+            estimated RX input power.
+          - model_outputs: Raw neural-network head outputs before decode.
+          - tx_iq: Generated complex TX IQ samples.
+          - rx_input_power: Mean measured input power across provided RX windows.
+          - rf_center_est_hz: Mean estimated spectral peak used as RF center prior.
+    """
     if not rx_iq_windows:
         raise ValueError("rx_iq_windows must contain at least one IQ array")
 
