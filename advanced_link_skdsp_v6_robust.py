@@ -221,23 +221,24 @@ def _resample_complex_to_len(
     if int(new_len) == int(xt.numel()):
         return xt
 
-    old_len = int(xt.numel())
-    if AF is not None:
-        y_r = AF.resample(xt.real.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
-        y_i = AF.resample(xt.imag.unsqueeze(0), orig_freq=old_len, new_freq=int(new_len)).squeeze(0)
-    else:
-        y_r = F.interpolate(
-            xt.real.reshape(1, 1, -1),
-            size=int(new_len),
-            mode="linear",
-            align_corners=False,
-        ).reshape(-1)
-        y_i = F.interpolate(
-            xt.imag.reshape(1, 1, -1),
-            size=int(new_len),
-            mode="linear",
-            align_corners=False,
-        ).reshape(-1)
+    # NOTE:
+    # We intentionally avoid torchaudio.functional.resample here.
+    # Using sequence lengths as "orig_freq/new_freq" can create extremely large
+    # sinc kernels when gcd(orig_freq, new_freq) is small, which can cause OOM
+    # on GPU for long vectors. Linear interpolation has predictable memory usage
+    # and is sufficient for our synthetic timing-offset perturbation.
+    y_r = F.interpolate(
+        xt.real.reshape(1, 1, -1),
+        size=int(new_len),
+        mode="linear",
+        align_corners=False,
+    ).reshape(-1)
+    y_i = F.interpolate(
+        xt.imag.reshape(1, 1, -1),
+        size=int(new_len),
+        mode="linear",
+        align_corners=False,
+    ).reshape(-1)
     return torch.complex(y_r, y_i).to(dtype=torch.complex64)
 
 
@@ -302,7 +303,9 @@ def apply_frequency_offset(iq: Union[np.ndarray, torch.Tensor], freq_offset: flo
 
 def apply_timing_offset_resample(iq: Union[np.ndarray, torch.Tensor], timing_offset: float) -> torch.Tensor:
     x = _as_complex_tensor(iq)
-    if timing_offset == 1.0 or x.numel() == 0:
+    if timing_offset <= 0:
+        raise ValueError("timing_offset must be positive")
+    if np.isclose(timing_offset, 1.0, rtol=1e-7, atol=1e-9) or x.numel() == 0:
         return x
     target_len = int(x.numel())
     new_len = max(1, int(round(target_len / timing_offset)))
