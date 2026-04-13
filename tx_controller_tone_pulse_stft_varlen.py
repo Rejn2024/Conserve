@@ -7,7 +7,7 @@ with variable-length IQ inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,64 @@ def robust_mad_scale(x: Union[torch.Tensor, List[complex]], eps: float = 1e-12) 
     return (xt / sigma).to(dtype=torch.complex64)
 
 
+
+
+def _as_batch_complex_tensor(iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]) -> torch.Tensor:
+    if isinstance(iq_batch, torch.Tensor):
+        return iq_batch.to(dtype=torch.complex64)
+
+    if len(iq_batch) == 0:
+        raise ValueError("iq_batch must contain at least one IQ array")
+
+    rows = [_as_complex_tensor(x) for x in iq_batch]
+    lengths = [int(r.numel()) for r in rows]
+    max_len = max(lengths)
+    if max_len <= 0:
+        raise ValueError("iq_batch entries must contain at least one sample")
+
+    padded = []
+    for row in rows:
+        if row.numel() < max_len:
+            row = F.pad(row, (0, max_len - int(row.numel())))
+        padded.append(row)
+    return torch.stack(padded, dim=0).to(dtype=torch.complex64)
+
+
+def preprocess_batched_iq_to_stft_feature(
+    iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]],
+    sample_rate_hz: float,
+    nperseg: int = 128,
+    noverlap: int = 96,
+    nfft: int = 128,
+) -> Dict[str, torch.Tensor]:
+    x_batch = _as_batch_complex_tensor(iq_batch)
+    if x_batch.ndim != 2:
+        raise ValueError(f"iq_batch must have shape [B, T], got {tuple(x_batch.shape)}")
+
+    feats = []
+    rx_powers = []
+    peaks = []
+    lengths = []
+    for i in range(x_batch.shape[0]):
+        x = x_batch[i]
+        lengths.append(int(x.numel()))
+        proc = preprocess_iq_to_stft_feature(
+            iq=x,
+            sample_rate_hz=sample_rate_hz,
+            nperseg=nperseg,
+            noverlap=noverlap,
+            nfft=nfft,
+        )
+        feats.append(proc["feature"])
+        rx_powers.append(proc["rx_power"].to(dtype=torch.float32))
+        peaks.append(proc["peak_hz"].to(dtype=torch.float32))
+
+    return {
+        "feature": torch.stack(feats, dim=0).to(dtype=torch.float32),
+        "rx_power": torch.stack(rx_powers, dim=0).to(dtype=torch.float32),
+        "peak_hz": torch.stack(peaks, dim=0).to(dtype=torch.float32),
+        "lengths": torch.as_tensor(lengths, dtype=torch.float32),
+    }
 def preprocess_iq_to_stft_feature(
     iq: Union[torch.Tensor, List[complex]],
     sample_rate_hz: float,
@@ -342,104 +400,120 @@ def build_controlled_tone_pulse_from_variable_inputs(
     seed: int = 1,
     device: str = "cpu",
 ) -> Dict[str, object]:
-    """
-    Build a controlled tone-pulse transmission from variable-length RX IQ windows.
-
-    Returns:
-        A dictionary containing:
-          - tx_config: Decoded controller output as `TonePulseControlConfig`; this is the
-            concrete parameter set used to synthesize TX IQ.
-          - tx_metadata: Generation metadata from `txflex.build_tone_pulse_iq_object(...)`
-            augmented with controller-centric diagnostics such as input window lengths and
-            estimated RX input power.
-          - model_outputs: Raw neural-network head outputs before decode.
-          - tx_iq: Generated complex TX IQ samples.
-          - rx_input_power: Mean measured input power across provided RX windows.
-          - rf_center_est_hz: Mean estimated spectral peak used as RF center prior.
-    """
-    if not rx_iq_windows:
-        raise ValueError("rx_iq_windows must contain at least one IQ array")
-
-    proc = [preprocess_iq_to_stft_feature(x, intake_sample_rate_hz) for x in rx_iq_windows]
-    stft_tensors = [p["feature"].unsqueeze(0).to(device) for p in proc]
-
-    rx_power_t = torch.stack([p["rx_power"].to(dtype=torch.float32) for p in proc]).to(device)
-    peak_t = torch.stack([p["peak_hz"].to(dtype=torch.float32) for p in proc]).to(device)
-    rx_input_power = float(rx_power_t.mean().item())
-    rf_center_est_hz = float(peak_t.mean().item())
-
-    lengths = torch.tensor([int(_as_complex_tensor(x).numel()) for x in rx_iq_windows], dtype=torch.float32, device=device)
-    max_len = torch.clamp(torch.max(lengths), min=1.0)
-    scalar_side = torch.tensor(
-        [[
-            (torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32, device=device)) / 10.0).item(),
-            (torch.mean(lengths) / max_len).item(),
-            (torch.std(lengths, unbiased=False) / max_len).item(),
-            rx_input_power,
-            (peak_t.mean() / max(intake_sample_rate_hz, 1.0)).item(),
-            (peak_t.std(unbiased=False) / max(intake_sample_rate_hz, 1.0)).item(),
-        ]],
-        dtype=torch.float32,
-        device=device,
-    )
-
-    model = model.to(device)
-    # model.eval()
-    # with torch.no_grad():
-    y = model(stft_tensors, scalar_side)
-
-    cfg = decode_tone_pulse_config(
-        model_out=y,
-        intake_sample_rate_hz=float(intake_sample_rate_hz),
-        rf_center_est_hz=rf_center_est_hz,
+    """Build one controlled tone-pulse transmission from three RX IQ windows."""
+    batched = [_as_batch_complex_tensor([x]) for x in rx_iq_windows]
+    out = build_controlled_tone_pulse_batch_from_iq_batches(
+        model=model,
+        rx_iq_batches=batched,
+        intake_sample_rate_hz=intake_sample_rate_hz,
         desired_output_iq_len=desired_output_iq_len,
         user_peak_power_fraction=user_peak_power_fraction,
-        rx_input_power=rx_input_power,
-        max_tones=model.max_tones,
         seed=seed,
+        device=device,
     )
+    return out[0]
 
-    tx_result = txflex.build_tone_pulse_iq_object(
-        sample_rate_hz=cfg.sample_rate_hz,
-        rf_center_hz=cfg.rf_center_hz,
-        carrier_hz=cfg.carrier_hz,
-        target_num_samples=desired_output_iq_len,
-        num_tones=cfg.num_tones,
-        tone_frequencies_hz=cfg.tone_frequencies_hz,
-        tone_amplitudes=cfg.tone_amplitudes,
-        pulse_on_samples=cfg.pulse_on_samples,
-        pulse_off_samples=cfg.pulse_off_samples,
-        pulse_count=cfg.pulse_count,
-        start_offset_samples=cfg.start_offset_samples,
-        snr_db=cfg.snr_db,
-        noise_color=cfg.noise_color,
-        freq_offset=cfg.freq_offset,
-        timing_offset=cfg.timing_offset,
-        fading_mode=cfg.fading_mode,
-        fading_block_len=cfg.fading_block_len,
-        rician_k_db=cfg.rician_k_db,
-        multipath_taps=None,
-        burst_probability=cfg.burst_probability,
-        burst_len_min=cfg.burst_len_min,
-        burst_len_max=cfg.burst_len_max,
-        burst_power_ratio_db=cfg.burst_power_ratio_db,
-        burst_color=cfg.burst_color,
-        peak_power=cfg.peak_power,
-        seed=cfg.seed,
-    )
 
-    tx_metadata = dict(tx_result.metadata)
-    tx_metadata["controller_input_lengths"] = [int(v) for v in lengths.tolist()]
-    tx_metadata["controller_rx_input_power"] = rx_input_power
+def build_controlled_tone_pulse_batch_from_iq_batches(
+    model: TonePulseTXControlNetVarLen,
+    rx_iq_batches: Sequence[Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]],
+    intake_sample_rate_hz: float,
+    desired_output_iq_len: Optional[int] = None,
+    user_peak_power_fraction: Optional[float] = None,
+    seed: int = 1,
+    device: str = "cpu",
+) -> List[Dict[str, object]]:
+    if len(rx_iq_batches) != 3:
+        raise ValueError(f"rx_iq_batches must contain exactly 3 IQ batch inputs, got {len(rx_iq_batches)}")
 
-    return {
-        "tx_config": cfg,
-        "model_outputs": y,
-        "tx_iq": _as_complex_tensor(tx_result.iq),
-        "tx_metadata": tx_metadata,
-        "rx_input_power": rx_input_power,
-        "rf_center_est_hz": rf_center_est_hz,
-    }
+    proc = [preprocess_batched_iq_to_stft_feature(x, intake_sample_rate_hz) for x in rx_iq_batches]
+    batch_size = int(proc[0]["feature"].shape[0])
+    if any(int(p["feature"].shape[0]) != batch_size for p in proc):
+        raise ValueError("All three IQ inputs must use the same batch size")
+
+    stft_tensors = [p["feature"].to(device) for p in proc]
+    rx_power_stack = torch.stack([p["rx_power"].to(device) for p in proc], dim=0)
+    peak_stack = torch.stack([p["peak_hz"].to(device) for p in proc], dim=0)
+    rx_input_power_t = rx_power_stack.mean(dim=0)
+    rf_center_est_t = peak_stack.mean(dim=0)
+
+    lengths = torch.stack([p["lengths"].to(device) for p in proc], dim=0).transpose(0, 1)
+    max_len = torch.clamp(torch.max(lengths, dim=1).values, min=1.0)
+    scalar_side = torch.stack(
+        [
+            torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32, device=device)) / 10.0
+            * torch.ones(batch_size, dtype=torch.float32, device=device),
+            torch.mean(lengths, dim=1) / max_len,
+            torch.std(lengths, dim=1, unbiased=False) / max_len,
+            rx_input_power_t.to(dtype=torch.float32),
+            peak_stack.mean(dim=0) / max(intake_sample_rate_hz, 1.0),
+            peak_stack.std(dim=0, unbiased=False) / max(intake_sample_rate_hz, 1.0),
+        ],
+        dim=1,
+    ).to(dtype=torch.float32, device=device)
+
+    model = model.to(device)
+    y = model(stft_tensors, scalar_side)
+
+    out = []
+    for i in range(batch_size):
+        model_out_i = {k: v[i : i + 1] for k, v in y.items()}
+        cfg = decode_tone_pulse_config(
+            model_out=model_out_i,
+            intake_sample_rate_hz=float(intake_sample_rate_hz),
+            rf_center_est_hz=float(rf_center_est_t[i].item()),
+            desired_output_iq_len=desired_output_iq_len,
+            user_peak_power_fraction=user_peak_power_fraction,
+            rx_input_power=float(rx_input_power_t[i].item()),
+            max_tones=model.max_tones,
+            seed=seed + i,
+        )
+
+        tx_result = txflex.build_tone_pulse_iq_object(
+            sample_rate_hz=cfg.sample_rate_hz,
+            rf_center_hz=cfg.rf_center_hz,
+            carrier_hz=cfg.carrier_hz,
+            target_num_samples=desired_output_iq_len,
+            num_tones=cfg.num_tones,
+            tone_frequencies_hz=cfg.tone_frequencies_hz,
+            tone_amplitudes=cfg.tone_amplitudes,
+            pulse_on_samples=cfg.pulse_on_samples,
+            pulse_off_samples=cfg.pulse_off_samples,
+            pulse_count=cfg.pulse_count,
+            start_offset_samples=cfg.start_offset_samples,
+            snr_db=cfg.snr_db,
+            noise_color=cfg.noise_color,
+            freq_offset=cfg.freq_offset,
+            timing_offset=cfg.timing_offset,
+            fading_mode=cfg.fading_mode,
+            fading_block_len=cfg.fading_block_len,
+            rician_k_db=cfg.rician_k_db,
+            multipath_taps=None,
+            burst_probability=cfg.burst_probability,
+            burst_len_min=cfg.burst_len_min,
+            burst_len_max=cfg.burst_len_max,
+            burst_power_ratio_db=cfg.burst_power_ratio_db,
+            burst_color=cfg.burst_color,
+            peak_power=cfg.peak_power,
+            seed=cfg.seed,
+        )
+
+        tx_metadata = dict(tx_result.metadata)
+        tx_metadata["controller_input_lengths"] = [int(v) for v in lengths[i].tolist()]
+        tx_metadata["controller_rx_input_power"] = float(rx_input_power_t[i].item())
+
+        out.append(
+            {
+                "tx_config": cfg,
+                "model_outputs": model_out_i,
+                "tx_iq": _as_complex_tensor(tx_result.iq),
+                "tx_metadata": tx_metadata,
+                "rx_input_power": float(rx_input_power_t[i].item()),
+                "rf_center_est_hz": float(rf_center_est_t[i].item()),
+            }
+        )
+
+    return out
 
 
 if __name__ == "__main__":
