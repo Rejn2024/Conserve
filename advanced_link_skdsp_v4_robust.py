@@ -1252,35 +1252,57 @@ def coarse_frequency_acquire(
     best_start = 0
     best_cfo = 0.0
 
+    # n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
+    # bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
+    # kr = torch.conj(ref).real.to(dtype=torch.float32).reshape(1, 1, -1)
+    # ki = torch.conj(ref).imag.to(dtype=torch.float32).reshape(1, 1, -1)
+
+    # for f_hz in bins:
+    #     phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
+    #     rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    #     y = x * rot
+
+    #     yr_in = y.real.to(dtype=torch.float32).reshape(1, 1, -1)
+    #     yi_in = y.imag.to(dtype=torch.float32).reshape(1, 1, -1)
+    #     yr = F.conv1d(yr_in, kr).reshape(-1) - F.conv1d(yi_in, ki).reshape(-1)
+    #     yi = F.conv1d(yr_in, ki).reshape(-1) + F.conv1d(yi_in, kr).reshape(-1)
+    #     mag = torch.abs(torch.complex(yr, yi))
+
+    #     idx = int(torch.argmax(mag).item())
+    #     metric = float(mag[idx].item())
+    #     if metric > best_metric:
+    #         best_metric = metric
+    #         best_start = idx
+    #         best_cfo = float(f_hz.item())
+
     n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     bins = torch.linspace(-search_hz, search_hz, n_bins, dtype=torch.float64, device=x.device)
     kr = torch.conj(ref).real.to(dtype=torch.float32).reshape(1, 1, -1)
     ki = torch.conj(ref).imag.to(dtype=torch.float32).reshape(1, 1, -1)
 
-    for f_hz in bins:
-        phase = -2.0 * torch.pi * f_hz * n / sample_rate_hz
-        rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-        y = x * rot
+    phase = -2.0 * torch.pi * bins[:, None] * n[None, :] / sample_rate_hz
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    y = x[None, :] * rot  # [n_bins, n_samples]
 
-        yr_in = y.real.to(dtype=torch.float32).reshape(1, 1, -1)
-        yi_in = y.imag.to(dtype=torch.float32).reshape(1, 1, -1)
-        yr = F.conv1d(yr_in, kr).reshape(-1) - F.conv1d(yi_in, ki).reshape(-1)
-        yi = F.conv1d(yr_in, ki).reshape(-1) + F.conv1d(yi_in, kr).reshape(-1)
-        mag = torch.abs(torch.complex(yr, yi))
+    yr_in = y.real.to(dtype=torch.float32).unsqueeze(1)  # [B,1,N]
+    yi_in = y.imag.to(dtype=torch.float32).unsqueeze(1)  # [B,1,N]
+    yr = F.conv1d(yr_in, kr).squeeze(1) - F.conv1d(yi_in, ki).squeeze(1)
+    yi = F.conv1d(yr_in, ki).squeeze(1) + F.conv1d(yi_in, kr).squeeze(1)
+    mag = torch.abs(torch.complex(yr, yi))  # [B, valid_len]
 
-        idx = int(torch.argmax(mag).item())
-        metric = float(mag[idx].item())
-        if metric > best_metric:
-            best_metric = metric
-            best_start = idx
-            best_cfo = float(f_hz.item())
+    per_bin_metric, per_bin_idx = torch.max(mag, dim=1)
+    best_bin = int(torch.argmax(per_bin_metric).item())
+    best_metric = float(per_bin_metric[best_bin].item())
+    best_start = int(per_bin_idx[best_bin].item())
+    best_cfo = float(bins[best_bin].item())
 
-    print(f'from loop best_start : {best_start}, type : {type(best_start)}')
-    print(f'from loop best_cfo : {best_cfo}, type : {type(best_cfo)}')
-    print(f'from loop best_metric : {best_metric}, type : {type(best_metric)}')
+    metric_div = ((per_bin_metric[best_bin] - torch.mean(per_bin_metric))/ torch.std(per_bin_metric)).requires_grad_()
+    # print(f'from loop best_start : {best_start}, type : {type(best_start)}')
+    # print(f'from loop best_cfo : {best_cfo}, type : {type(best_cfo)}')
+    # print(f'from loop best_metric : {best_metric}, type : {type(best_metric)}')
 
     
-    return best_start, best_cfo, best_metric
+    return best_start, best_cfo, best_metric, metric_div
 
 
 def estimate_residual_cfo_from_preamble(
@@ -1633,12 +1655,12 @@ def try_decode_over_sample_deltas(
     symbol_rate_hz: float,
     eq_taps: int,
 ) -> Tuple[Optional[bytes], Optional[int]]:
+
     deltas = list(range(-sample_phase_search, sample_phase_search + 1))
-    mf_t = _as_complex_tensor(mf)
 
     def _worker(sample_delta: int) -> Tuple[int, Optional[bytes]]:
         symbols = extract_symbols_from_start(
-            mf=mf_t,
+            mf=mf,
             start_index_samples=start_index_samples,
             sps=sps,
             span=span,
@@ -1652,25 +1674,7 @@ def try_decode_over_sample_deltas(
             symbol_rate_hz=symbol_rate_hz,
             eq_taps=eq_taps,
         )
-        if payload is None:
-            raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
-            # payload = try_decode_from_symbols_numpy_legacy(
-            #     symbols=symbols,
-            #     fec_mode=fec_mode,
-            #     interleave=interleave,
-            #     interleave_rows=interleave_rows,
-            #     symbol_rate_hz=symbol_rate_hz,
-            #     eq_taps=eq_taps,
-            # )
         return sample_delta, payload
-
-    # GPU tensor decode attempts are kept sequential for determinism/stability.
-    if mf_t.is_cuda:
-        for d in deltas:
-            sample_delta, payload = _worker(d)
-            if payload is not None:
-                return payload, sample_delta
-        return None, None
 
     max_workers = max(1, min(len(deltas), 8))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1680,6 +1684,54 @@ def try_decode_over_sample_deltas(
         if payload is not None:
             return payload, sample_delta
     return None, None
+    
+    # deltas = list(range(-sample_phase_search, sample_phase_search + 1))
+    # mf_t = _as_complex_tensor(mf)
+
+    # def _worker(sample_delta: int) -> Tuple[int, Optional[bytes]]:
+    #     symbols = extract_symbols_from_start(
+    #         mf=mf_t,
+    #         start_index_samples=start_index_samples,
+    #         sps=sps,
+    #         span=span,
+    #         sample_delta=sample_delta,
+    #     )
+    #     payload = try_decode_from_symbols(
+    #         symbols=symbols,
+    #         fec_mode=fec_mode,
+    #         interleave=interleave,
+    #         interleave_rows=interleave_rows,
+    #         symbol_rate_hz=symbol_rate_hz,
+    #         eq_taps=eq_taps,
+    #     )
+    #     # if payload is None:
+    #     #     raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
+    #         # payload = try_decode_from_symbols_numpy_legacy(
+    #         #     symbols=symbols,
+    #         #     fec_mode=fec_mode,
+    #         #     interleave=interleave,
+    #         #     interleave_rows=interleave_rows,
+    #         #     symbol_rate_hz=symbol_rate_hz,
+    #         #     eq_taps=eq_taps,
+    #         # )
+    #     return sample_delta, payload
+
+    # # GPU tensor decode attempts are kept sequential for determinism/stability.
+    # if mf_t.is_cuda:
+    #     for d in deltas:
+    #         sample_delta, payload = _worker(d)
+    #         if payload is not None:
+    #             return payload, sample_delta
+    #     return None, None
+
+    # max_workers = max(1, min(len(deltas), 8))
+    # with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+    #     results = list(ex.map(_worker, deltas))
+
+    # for sample_delta, payload in results:
+    #     if payload is not None:
+    #         return payload, sample_delta
+    # return None, None
 
 
 def rx_command_iq_numpy_legacy(iq: Union[np.ndarray, torch.Tensor], meta: dict) -> dict:
@@ -1807,7 +1859,7 @@ def rx_command(args):
 
     access_ref_waveform = tx_waveform(ACCESS_BITS, sps=sps, beta=args.beta, span=args.span)
 
-    coarse_start, coarse_cfo_hz, coarse_metric = coarse_frequency_acquire(
+    coarse_start, coarse_cfo_hz, coarse_metric, metric_div = coarse_frequency_acquire(
         iq=iq,
         ref_waveform=access_ref_waveform,
         sample_rate_hz=dsp_sample_rate_hz,
@@ -1846,6 +1898,7 @@ def rx_command(args):
         "sample_offset_used": sample_offset_used,
         "coarse_cfo_hz": coarse_cfo_hz,
         "coarse_metric": coarse_metric,
+        "metric_div": metric_div
     }
 
     if args.output_file:
@@ -1918,7 +1971,7 @@ def rx_command_iq(iq, meta):
     #     n_bins=coarse_freq_bins,
     # )
     
-    coarse_start, coarse_cfo_hz, coarse_metric = coarse_frequency_acquire(
+    coarse_start, coarse_cfo_hz, coarse_metric, metric_div = coarse_frequency_acquire(
         iq=iq,
         ref_waveform=access_ref_waveform,
         sample_rate_hz=dsp_sample_rate_hz,
@@ -1926,7 +1979,7 @@ def rx_command_iq(iq, meta):
         n_bins=coarse_freq_bins,
     )
 
-    print(f'coarse_start: {coarse_start}, coarse_cfo_hz : {coarse_cfo_hz}, coarse_metric : {coarse_metric}')
+    # print(f'coarse_start: {coarse_start}, coarse_cfo_hz : {coarse_cfo_hz}, coarse_metric : {coarse_metric}')
 
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
@@ -1944,21 +1997,28 @@ def rx_command_iq(iq, meta):
         eq_taps=eq_taps,
     )
 
+    paylen = 0
     if payload is None:
-        return rx_command_iq_numpy_legacy(iq_input, meta)
-            
-    try:
-        message_text = payload.decode("utf-8")
-    except UnicodeDecodeError:
+        # return rx_command_iq_numpy_legacy(iq_input, meta)
         message_text = None
+    else:
+        # return rx_command_iq_numpy_legacy(iq_input, meta)
+        paylen = len(payload)
+
+    if not isinstance(payload, type(None)):
+        try:
+            message_text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            message_text = None
 
     result = {
         "payload_bytes": payload,
-        "payload_len": len(payload),
+        "payload_len": paylen,
         "message": message_text,
         "sample_offset_used": sample_offset_used,
         "coarse_cfo_hz": coarse_cfo_hz,
         "coarse_metric": coarse_metric,
+        "metric_div": metric_div
     }
 
 
