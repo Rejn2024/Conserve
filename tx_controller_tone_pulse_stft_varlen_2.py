@@ -42,6 +42,31 @@ def robust_mad_scale(x: Union[torch.Tensor, List[complex]], eps: float = 1e-12) 
     return (xt / sigma).to(dtype=torch.complex64)
 
 
+def _torch_unwrap(x: torch.Tensor, dim: int = -1, period: float = 2 * torch.pi) -> torch.Tensor:
+    """Compatibility shim for torch versions without torch.unwrap."""
+    if hasattr(torch, "unwrap"):
+        return torch.unwrap(x, dim=dim)  # type: ignore[attr-defined]
+
+    if x.numel() == 0:
+        return x
+
+    dd = torch.diff(x, dim=dim)
+    half_period = period / 2
+    ddmod = torch.remainder(dd + half_period, period) - half_period
+    boundary = (ddmod == -half_period) & (dd > 0)
+    ddmod = torch.where(boundary, torch.full_like(ddmod, half_period), ddmod)
+    ph_correct = ddmod - dd
+    ph_correct = torch.where(torch.abs(dd) < half_period, torch.zeros_like(ph_correct), ph_correct)
+
+    csum = torch.cumsum(ph_correct, dim=dim)
+    head = torch.index_select(
+        x,
+        dim=dim,
+        index=torch.tensor([0], device=x.device),
+    )
+    return torch.cat([head, x.narrow(dim, 1, x.shape[dim] - 1) + csum], dim=dim)
+
+
 
 
 def _as_batch_complex_tensor(iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]) -> torch.Tensor:
@@ -160,7 +185,7 @@ def preprocess_iq_to_stft_feature(
     delta_t_mag = torch.diff(mag, dim=1, prepend=mag[:, :1])
     delta_f_mag = torch.diff(mag, dim=0, prepend=mag[:1, :])
     delta_t_power = torch.diff(power_log, dim=1, prepend=power_log[:, :1])
-    phase_unwrapped_t = torch.unwrap(phase, dim=1)
+    phase_unwrapped_t = _torch_unwrap(phase, dim=1)
     delta_t_phase = torch.diff(phase_unwrapped_t, dim=1, prepend=phase_unwrapped_t[:, :1])
 
     feat = torch.stack(
