@@ -166,6 +166,36 @@ def test_maybe_compile_model_falls_back_on_triton_runtime_error(monkeypatch):
     assert failing.calls == 1
 
 
+def test_maybe_compile_model_falls_back_on_cuda_illegal_access_runtime_error(monkeypatch):
+    class ToyModel(torch.nn.Module):
+        def forward(self, x):
+            return x + 1
+
+    class FailingCompiled(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    failing = FailingCompiled()
+
+    def fake_compile(_model):
+        return failing
+
+    model = ToyModel()
+    monkeypatch.setattr(atu.torch, "compile", fake_compile)
+    wrapped = atu.maybe_compile_model(model, enabled=True)
+    out = wrapped(torch.tensor([1.0]))
+    out2 = wrapped(torch.tensor([2.0]))
+
+    assert torch.allclose(out, torch.tensor([2.0]))
+    assert torch.allclose(out2, torch.tensor([3.0]))
+    assert failing.calls == 1
+
+
 def test_run_epoch_cached_train_path_skips_backward_when_loss_has_no_grad(tmp_path: Path, monkeypatch):
     cache_root = tmp_path / "cache"
     cache_root.mkdir(parents=True, exist_ok=True)
