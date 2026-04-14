@@ -163,13 +163,42 @@ def create_cached_dataloader(
 
 
 def maybe_compile_model(model: torch.nn.Module, enabled: bool = True) -> torch.nn.Module:
-    """Compile model when supported (PyTorch 2.x), otherwise return unchanged."""
+    """Compile model when supported (PyTorch 2.x), otherwise return unchanged.
+
+    TorchDynamo + Inductor compilation can fail lazily on first invocation
+    (for example when Triton is unavailable). In that case we fallback to the
+    original eager model so training can continue.
+    """
     if not enabled:
         return model
     try:
-        return torch.compile(model)
+        compiled_model = torch.compile(model)
     except Exception:
         return model
+    return _CompileFallbackModel(compiled_model=compiled_model, eager_model=model)
+
+
+class _CompileFallbackModel(torch.nn.Module):
+    """Wrapper that falls back to eager mode if compiled execution fails."""
+
+    def __init__(self, *, compiled_model: torch.nn.Module, eager_model: torch.nn.Module):
+        super().__init__()
+        self._compiled_model = compiled_model
+        self._eager_model = eager_model
+        self._use_eager = False
+
+    def forward(self, *args, **kwargs):
+        if self._use_eager:
+            return self._eager_model(*args, **kwargs)
+        try:
+            return self._compiled_model(*args, **kwargs)
+        except Exception as exc:
+            message = str(exc).lower()
+            triton_compile_failure = "triton" in message or "torch._inductor" in message
+            if not triton_compile_failure:
+                raise
+            self._use_eager = True
+            return self._eager_model(*args, **kwargs)
 
 
 def autocast_context(device: str, enabled: bool = True, dtype: Optional[torch.dtype] = None):
