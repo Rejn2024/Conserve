@@ -331,9 +331,12 @@ def run_epoch_cached(
                     continue
                 if grad_scaler is not None and device == "cuda" and amp_enabled:
                     grad_scaler.scale(loss).backward()
+                    did_step = False
                     if _optimizer_has_any_grad(optimizer):
                         grad_scaler.step(optimizer)
-                    grad_scaler.update()
+                        did_step = True
+                    if did_step:
+                        grad_scaler.update()
                 else:
                     loss.backward()
                     if _optimizer_has_any_grad(optimizer):
