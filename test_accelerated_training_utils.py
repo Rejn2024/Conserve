@@ -164,3 +164,72 @@ def test_maybe_compile_model_falls_back_on_triton_runtime_error(monkeypatch):
     assert torch.allclose(out, torch.tensor([2.0]))
     assert torch.allclose(out2, torch.tensor([3.0]))
     assert failing.calls == 1
+
+
+def test_run_epoch_cached_train_path_skips_backward_when_loss_has_no_grad(tmp_path: Path, monkeypatch):
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        {
+            "sample_name": "sample_000000",
+            "source_dir": str(tmp_path),
+            "whole_iq": torch.ones(512, dtype=torch.complex64),
+            "whole_meta": {"sample_rate_hz": 1_000_000.0},
+            "whole_sample_rate_hz": 1_000_000.0,
+            "jammer_sampling_freq": 2e9,
+            "iq1": torch.ones(256, dtype=torch.complex64),
+            "iq2": torch.ones(256, dtype=torch.complex64),
+            "iq3": torch.ones(256, dtype=torch.complex64),
+        },
+        cache_root / "sample_000000.pt",
+    )
+
+    loader = atu.create_cached_dataloader(
+        cache_root,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    def fake_build(**_kwargs):
+        return [{"tx_iq": torch.zeros(128, dtype=torch.complex64)}]
+
+    monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, x):
+            return x * self.w
+
+    def repeat_to_length(x, n):
+        xt = torch.as_tensor(x, dtype=torch.complex64)
+        reps = (n + xt.numel() - 1) // xt.numel()
+        return xt.repeat(reps)[:n]
+
+    # Returns a tensor without grad_fn by construction.
+    def criterion(_jammed, _whole, _meta):
+        return torch.tensor(0.25)
+
+    model = DummyModel()
+    opt = torch.optim.SGD(model.parameters(), lr=1.0)
+    initial = model.w.detach().clone()
+
+    loss = atu.run_epoch_cached(
+        dataloader=loader,
+        model=model,
+        optimizer=opt,
+        criterion=criterion,
+        jammer_sampling_freq=2e9,
+        repeat_to_length_fn=repeat_to_length,
+        train_mode=True,
+        device="cpu",
+        amp_enabled=False,
+    )
+
+    assert loss is not None
+    assert torch.allclose(model.w.detach(), initial)
