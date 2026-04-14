@@ -7,6 +7,7 @@ with variable-length IQ inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List, Optional, Sequence, Union
 
 import torch
@@ -384,19 +385,23 @@ def decode_tone_pulse_config(
     max_tones: int,
     seed: int,
 ) -> TonePulseControlConfig:
+    def _safe_scalar(name: str, default: float) -> float:
+        value = float(model_out[name].item())
+        return value if math.isfinite(value) else float(default)
+
     noise_color = NOISE_COLORS[int(torch.argmax(model_out["noise_color_logits"], dim=-1).item())]
     fading_mode = FADING_MODES[int(torch.argmax(model_out["fading_mode_logits"], dim=-1).item())]
     burst_color = NOISE_COLORS[int(torch.argmax(model_out["burst_color_logits"], dim=-1).item())]
 
-    sample_rate_hz = float(intake_sample_rate_hz * model_out["sample_rate_scale"].item())
-    rf_center_hz = float(rf_center_est_hz + model_out["rf_center_delta_hz"].item())
-    carrier_hz = float(model_out["carrier_hz_norm"].item()) * sample_rate_hz
+    sample_rate_hz = float(intake_sample_rate_hz * _safe_scalar("sample_rate_scale", 1.0))
+    rf_center_hz = float(rf_center_est_hz + _safe_scalar("rf_center_delta_hz", 0.0))
+    carrier_hz = float(_safe_scalar("carrier_hz_norm", 0.0)) * sample_rate_hz
 
-    num_tones = int(round(float(model_out["num_tones_cont"].item())))
+    num_tones = int(round(_safe_scalar("num_tones_cont", 1.0)))
     num_tones = max(1, min(num_tones, max_tones))
 
-    base_f = float(model_out["base_tone_norm"].item()) * sample_rate_hz
-    spacing = float(model_out["tone_spacing_norm"].item()) * sample_rate_hz
+    base_f = float(_safe_scalar("base_tone_norm", 0.0)) * sample_rate_hz
+    spacing = float(_safe_scalar("tone_spacing_norm", 0.0)) * sample_rate_hz
     offsets = (torch.arange(num_tones, dtype=torch.float64) - 0.5 * (num_tones - 1)) * spacing
     tone_frequencies_hz = [
         float(
@@ -414,10 +419,10 @@ def decode_tone_pulse_config(
 
     peak_power = None if user_peak_power_fraction is None else float(user_peak_power_fraction) * float(rx_input_power)
 
-    pulse_on_samples = int(round(float(model_out["pulse_on_samples"].item())))
-    pulse_off_samples = int(round(float(model_out["pulse_off_samples"].item())))
-    pulse_count = int(round(float(model_out["pulse_count"].item())))
-    start_offset_samples = int(round(float(model_out["start_offset"].item())))
+    pulse_on_samples = int(round(_safe_scalar("pulse_on_samples", 128.0)))
+    pulse_off_samples = int(round(_safe_scalar("pulse_off_samples", 0.0)))
+    pulse_count = int(round(_safe_scalar("pulse_count", 1.0)))
+    start_offset_samples = int(round(_safe_scalar("start_offset", 0.0)))
 
     if desired_output_iq_len is not None and desired_output_iq_len > 0:
         pulse_on_samples = min(pulse_on_samples, desired_output_iq_len)
@@ -434,17 +439,17 @@ def decode_tone_pulse_config(
         pulse_off_samples=max(0, pulse_off_samples),
         pulse_count=max(1, pulse_count),
         start_offset_samples=max(0, start_offset_samples),
-        snr_db=float(model_out["snr_db"].item()),
+        snr_db=_safe_scalar("snr_db", 0.0),
         noise_color=noise_color,
-        freq_offset=float(model_out["freq_offset"].item()),
-        timing_offset=float(model_out["timing_offset"].item()),
+        freq_offset=_safe_scalar("freq_offset", 0.0),
+        timing_offset=_safe_scalar("timing_offset", 1.0),
         fading_mode=fading_mode,
-        fading_block_len=_nearest_block_len(float(model_out["fading_block_len_norm"].item())),
-        rician_k_db=float(model_out["rician_k_db"].item()),
-        burst_probability=float(model_out["burst_probability"].item()),
+        fading_block_len=_nearest_block_len(_safe_scalar("fading_block_len_norm", 0.0)),
+        rician_k_db=_safe_scalar("rician_k_db", 0.0),
+        burst_probability=_safe_scalar("burst_probability", 0.0),
         burst_len_min=16,
         burst_len_max=64,
-        burst_power_ratio_db=float(model_out["burst_power_ratio_db"].item()),
+        burst_power_ratio_db=_safe_scalar("burst_power_ratio_db", 0.0),
         burst_color=burst_color,
         peak_power=peak_power,
         seed=seed,
