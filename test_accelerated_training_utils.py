@@ -131,3 +131,36 @@ def test_run_epoch_cached_eval_path(tmp_path: Path, monkeypatch):
 
     assert loss is not None
     assert loss >= 0.0
+
+
+def test_maybe_compile_model_falls_back_on_triton_runtime_error(monkeypatch):
+    class ToyModel(torch.nn.Module):
+        def forward(self, x):
+            return x + 1
+
+    class FailingCompiled(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            raise RuntimeError("TritonMissing: Cannot find a working triton installation.")
+
+    failing = FailingCompiled()
+
+    def fake_compile(_model):
+        return failing
+
+    model = ToyModel()
+    compiled = atu.maybe_compile_model(model, enabled=False)
+    assert compiled is model
+
+    monkeypatch.setattr(atu.torch, "compile", fake_compile)
+    wrapped = atu.maybe_compile_model(model, enabled=True)
+    out = wrapped(torch.tensor([1.0]))
+    out2 = wrapped(torch.tensor([2.0]))
+
+    assert torch.allclose(out, torch.tensor([2.0]))
+    assert torch.allclose(out2, torch.tensor([3.0]))
+    assert failing.calls == 1
