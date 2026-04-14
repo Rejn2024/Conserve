@@ -205,12 +205,25 @@ class _CompileFallbackModel(torch.nn.Module):
         try:
             return self._compiled_model(*args, **kwargs)
         except Exception as exc:
-            message = str(exc).lower()
-            triton_compile_failure = "triton" in message or "torch._inductor" in message
-            if not triton_compile_failure:
+            if not _should_fallback_to_eager(exc):
                 raise
             self._use_eager = True
             return self._eager_model(*args, **kwargs)
+
+
+def _should_fallback_to_eager(exc: Exception) -> bool:
+    """Return True when compiled execution should fallback to eager mode."""
+    message = str(exc).lower()
+
+    compile_runtime_markers = (
+        "triton",
+        "torch._inductor",
+        "cuda error",
+        "illegal memory access",
+        "device-side assert",
+        "cuda kernel errors might be asynchronously reported",
+    )
+    return any(marker in message for marker in compile_runtime_markers)
 
 
 def autocast_context(device: str, enabled: bool = True, dtype: Optional[torch.dtype] = None):
