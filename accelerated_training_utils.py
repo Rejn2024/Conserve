@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from tx_controller_tone_pulse_stft_varlen import build_controlled_tone_pulse_batch_from_iq_batches
+from tx_controller_tone_pulse_stft_varlen_2 import build_controlled_tone_pulse_batch_from_iq_batches
 
 
 def _to_complex64_tensor(x: Any) -> torch.Tensor:
