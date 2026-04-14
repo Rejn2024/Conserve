@@ -287,6 +287,13 @@ def run_epoch_cached(
 
     losses: List[float] = []
 
+    def _optimizer_has_any_grad(opt: torch.optim.Optimizer) -> bool:
+        for group in opt.param_groups:
+            for param in group["params"]:
+                if param is not None and param.grad is not None:
+                    return True
+        return False
+
     for batch_idx, batch in enumerate(dataloader):
         iq1 = batch["iq1"].to(device=device, non_blocking=True)
         iq2 = batch["iq2"].to(device=device, non_blocking=True)
@@ -320,13 +327,17 @@ def run_epoch_cached(
 
             if train_mode and optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
+                if not loss.requires_grad:
+                    continue
                 if grad_scaler is not None and device == "cuda" and amp_enabled:
                     grad_scaler.scale(loss).backward()
-                    grad_scaler.step(optimizer)
+                    if _optimizer_has_any_grad(optimizer):
+                        grad_scaler.step(optimizer)
                     grad_scaler.update()
                 else:
                     loss.backward()
-                    optimizer.step()
+                    if _optimizer_has_any_grad(optimizer):
+                        optimizer.step()
 
         losses.append(float(loss.detach().cpu().item()))
 
