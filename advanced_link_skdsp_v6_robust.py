@@ -1398,14 +1398,23 @@ def design_symbol_equalizer_ls(
         raise ValueError("Training sequences must have same length")
     if rx_train_t.numel() < ntaps:
         return torch.tensor([1.0 + 0.0j], dtype=torch.complex128, device=rx_train_t.device)
+    if (not torch.isfinite(rx_train_t).all()) or (not torch.isfinite(tx_train_t).all()):
+        return torch.tensor([1.0 + 0.0j], dtype=torch.complex128, device=rx_train_t.device)
 
     half = ntaps // 2
     rpad = F.pad(rx_train_t.reshape(1, 1, -1), (half, half)).reshape(-1)
     X = torch.stack([rpad[i:i + ntaps] for i in range(rx_train_t.numel())], dim=0)
 
-    A = X.conj().T @ X + ridge * torch.eye(ntaps, dtype=torch.complex128, device=rx_train_t.device)
+    ridge_eff = float(max(ridge, 1e-9))
+    A = X.conj().T @ X + ridge_eff * torch.eye(ntaps, dtype=torch.complex128, device=rx_train_t.device)
     b = X.conj().T @ tx_train_t
-    w = torch.linalg.solve(A, b)
+    try:
+        w = torch.linalg.solve(A, b)
+    except RuntimeError:
+        # Robust fallback when A is numerically singular/ill-conditioned for solve().
+        w = torch.linalg.pinv(A) @ b
+        if not torch.isfinite(w).all():
+            w = torch.tensor([1.0 + 0.0j], dtype=torch.complex128, device=rx_train_t.device)
     return w
 
 
