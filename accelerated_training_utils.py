@@ -187,6 +187,18 @@ class _CompileFallbackModel(torch.nn.Module):
         self._eager_model = eager_model
         self._use_eager = False
 
+    def __getattr__(self, name: str):
+        """Proxy unknown attributes to the wrapped eager model.
+
+        This preserves access to custom model attributes (e.g. `max_tones`)
+        even when the model is wrapped for compile fallback.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            eager_model = super().__getattr__("_eager_model")
+            return getattr(eager_model, name)
+
     def forward(self, *args, **kwargs):
         if self._use_eager:
             return self._eager_model(*args, **kwargs)
