@@ -455,6 +455,33 @@ class ActorCritic(nn.Module):
         entropy = dist.entropy()
         return log_prob, entropy, value
 
+    def get_action_value_logp(
+        self,
+        observation: Dict[str, torch.Tensor],
+        action: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        PPO-friendly helper used by notebook training loops.
+
+        Args:
+            observation: Dict containing:
+                - "stft_feature_list": List[Tensor[B, C, F, T]]
+                - "scalar_side": Tensor[B, n_scalar_features]
+            action: Optional Tensor[B] of preselected discrete actions.
+                If omitted, an action is sampled (or argmax if deterministic=True).
+            deterministic: If True and `action` is None, choose argmax action.
+
+        Returns:
+            Tuple of (action, value, log_prob), each shaped [B].
+        """
+        logits, value = self.forward_observation(observation)
+        dist = torch.distributions.Categorical(logits=logits)
+        if action is None:
+            action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, value, log_prob
+
 
 def _nearest_block_len(x_norm: float) -> int:
     choices = torch.tensor([128, 256, 512, 1024, 2048, 4096], dtype=torch.int64)
