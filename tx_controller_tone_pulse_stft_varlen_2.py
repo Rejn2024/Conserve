@@ -337,12 +337,20 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.burst_prob_head = nn.Linear(96, 1)
         self.burst_power_ratio_head = nn.Linear(96, 1)
 
-    def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def encode_fused_features(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> torch.Tensor:
+        """
+        Encode variable-length STFT observations and scalar side information into a shared latent.
+
+        This method is used by supervised control heads in this class and by the RL ActorCritic
+        wrapper so both training modes share the same representation network.
+        """
         emb = [self.encoder(x) for x in stft_feature_list]
         z_stft = torch.stack(emb, dim=0).mean(dim=0)
         z = torch.cat([z_stft, self.scalar_proj(scalar_side)], dim=-1)
-        z = self.fusion(z)
+        return self.fusion(z)
 
+    def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z = self.encode_fused_features(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
         return {
             "noise_color_logits": self.noise_color_head(z),
             "fading_mode_logits": self.fading_mode_head(z),
@@ -366,6 +374,86 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "burst_probability": 1e-2 * torch.sigmoid(self.burst_prob_head(z)),
             "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z)),
         }
+
+
+class ActorCritic(nn.Module):
+    """
+    RL-friendly Actor-Critic model that reuses the TonePulseTXControlNetVarLen shared network.
+
+    The backbone is exactly the variable-length STFT encoder + scalar fusion stack used by
+    TonePulseTXControlNetVarLen. The actor/critic heads expose the typical interfaces used by
+    policy-gradient / PPO style loops in RL notebooks.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        in_ch: int = 14,
+        base_ch: int = 24,
+        n_scalar_features: int = 6,
+        max_tones: int = 8,
+    ):
+        super().__init__()
+        if action_dim <= 0:
+            raise ValueError("action_dim must be positive")
+
+        self.backbone = TonePulseTXControlNetVarLen(
+            in_ch=in_ch,
+            base_ch=base_ch,
+            n_scalar_features=n_scalar_features,
+            max_tones=max_tones,
+        )
+        self.policy_head = nn.Linear(96, action_dim)
+        self.value_head = nn.Linear(96, 1)
+
+    def _encode(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> torch.Tensor:
+        return self.backbone.encode_fused_features(
+            stft_feature_list=stft_feature_list,
+            scalar_side=scalar_side,
+        )
+
+    def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = self._encode(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        logits = self.policy_head(z)
+        value = self.value_head(z).squeeze(-1)
+        return logits, value
+
+    def forward_observation(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convenience wrapper for notebook-style observations.
+
+        Expected keys:
+            observation["stft_feature_list"] -> List[Tensor[B, C, F, T]]
+            observation["scalar_side"] -> Tensor[B, n_scalar_features]
+        """
+        return self.forward(
+            stft_feature_list=observation["stft_feature_list"],
+            scalar_side=observation["scalar_side"],
+        )
+
+    def act(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits, value = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        dist = torch.distributions.Categorical(logits=logits)
+        action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob, value
+
+    def evaluate_actions(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits, value = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        dist = torch.distributions.Categorical(logits=logits)
+        log_prob = dist.log_prob(actions)
+        entropy = dist.entropy()
+        return log_prob, entropy, value
 
 
 def _nearest_block_len(x_norm: float) -> int:
