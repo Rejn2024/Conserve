@@ -17,7 +17,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from tx_controller_tone_pulse_stft_varlen_2 import build_controlled_tone_pulse_batch_from_iq_batches
+from tx_controller_tone_pulse_stft_varlen_3 import (
+    build_controlled_tone_pulse_batch_from_iq_batches,
+    preprocess_batched_iq_to_stft_feature,
+)
 
 
 def _to_complex64_tensor(x: Any) -> torch.Tensor:
@@ -585,3 +588,31 @@ def run_epoch_cached(
     if not losses:
         return None
     return float(sum(losses) / len(losses))
+
+
+def build_stft_observation_from_iq_batch(
+    *,
+    iq1: torch.Tensor,
+    iq2: torch.Tensor,
+    iq3: torch.Tensor,
+    intake_sample_rate_hz: float,
+    device: str = "cpu",
+) -> Dict[str, List[torch.Tensor]]:
+    """Build the ActorCritic observation payload from cached IQ sections.
+
+    The controller v3 observation is image-only and contains:
+    - stft_feature_list[0]: STFT feature map for iq1, shape [B, C, F, T1]
+    - stft_feature_list[1]: STFT feature map for iq2, shape [B, C, F, T2]
+    - stft_feature_list[2]: STFT feature map for iq3, shape [B, C, F, T3]
+    """
+
+    proc1 = preprocess_batched_iq_to_stft_feature(iq1, sample_rate_hz=intake_sample_rate_hz)
+    proc2 = preprocess_batched_iq_to_stft_feature(iq2, sample_rate_hz=intake_sample_rate_hz)
+    proc3 = preprocess_batched_iq_to_stft_feature(iq3, sample_rate_hz=intake_sample_rate_hz)
+    return {
+        "stft_feature_list": [
+            proc1["feature"].to(device=device, dtype=torch.float32),
+            proc2["feature"].to(device=device, dtype=torch.float32),
+            proc3["feature"].to(device=device, dtype=torch.float32),
+        ]
+    }

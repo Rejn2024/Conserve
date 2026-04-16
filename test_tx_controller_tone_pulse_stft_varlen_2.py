@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from tx_controller_tone_pulse_stft_varlen_2 import ActorCritic, decode_tone_pulse_config
+from tx_controller_tone_pulse_stft_varlen_3 import ActorCritic, decode_tone_pulse_config
 
 
 def test_decode_tone_pulse_config_handles_nan_scalars():
@@ -52,7 +52,7 @@ def test_decode_tone_pulse_config_handles_nan_scalars():
 
 
 def test_actor_critic_reuses_varlen_backbone_and_returns_rl_shapes():
-    model = ActorCritic(action_dim=7, in_ch=14, base_ch=16, n_scalar_features=6, max_tones=8)
+    model = ActorCritic(action_dim=7, in_ch=14, base_ch=16, max_tones=8)
     model.eval()
 
     batch_size = 3
@@ -61,20 +61,17 @@ def test_actor_critic_reuses_varlen_backbone_and_returns_rl_shapes():
         torch.randn(batch_size, 14, 64, 21),
         torch.randn(batch_size, 14, 64, 13),
     ]
-    scalar_side = torch.randn(batch_size, 6)
-
-    logits, values = model(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+    logits, values = model(stft_feature_list=stft_feature_list)
     assert logits.shape == (batch_size, 7)
     assert values.shape == (batch_size,)
 
-    action, log_prob, act_values = model.act(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+    action, log_prob, act_values = model.act(stft_feature_list=stft_feature_list)
     assert action.shape == (batch_size,)
     assert log_prob.shape == (batch_size,)
     assert act_values.shape == (batch_size,)
 
     eval_log_prob, entropy, eval_values = model.evaluate_actions(
         stft_feature_list=stft_feature_list,
-        scalar_side=scalar_side,
         actions=action,
     )
     assert eval_log_prob.shape == (batch_size,)
