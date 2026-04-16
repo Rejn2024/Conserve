@@ -263,3 +263,80 @@ def test_run_epoch_cached_train_path_skips_backward_when_loss_has_no_grad(tmp_pa
 
     assert loss is not None
     assert torch.allclose(model.w.detach(), initial)
+
+
+
+def test_jammer_controller_adapter_uses_build_function(monkeypatch):
+    called = {}
+
+    def fake_build(**kwargs):
+        called.update(kwargs)
+        return [{"tx_iq": torch.ones(16, dtype=torch.complex64), "tx_metadata": {"ok": True}}]
+
+    monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
+
+    sample = {
+        "iq1": torch.ones(32, dtype=torch.complex64),
+        "iq2": torch.ones(32, dtype=torch.complex64),
+        "iq3": torch.ones(32, dtype=torch.complex64),
+    }
+
+    out = atu.jammer_controller(
+        model=torch.nn.Identity(),
+        sample=sample,
+        action={"desired_output_iq_len": 256, "user_peak_power_fraction": 12.5, "seed": 99},
+        jammer_sampling_freq=2e9,
+        device="cpu",
+    )
+
+    assert out["tx_iq"].shape[0] == 16
+    assert called["desired_output_iq_len"] == 256
+    assert called["user_peak_power_fraction"] == pytest.approx(12.5)
+    assert called["seed"] == 99
+    assert called["rx_iq_batches"][0].shape == (1, 32)
+
+
+def test_jammer_vec_env_batches_rollout(monkeypatch):
+    build_calls = {"n": 0}
+
+    def fake_build(**kwargs):
+        build_calls["n"] += 1
+        bs = kwargs["rx_iq_batches"][0].shape[0]
+        return [
+            {
+                "tx_iq": torch.ones(20, dtype=torch.complex64) * (i + 1),
+                "tx_metadata": {"row": i},
+            }
+            for i in range(bs)
+        ]
+
+    monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
+
+    samples = [
+        {
+            "sample_name": f"s{i}",
+            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 1),
+            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 2),
+            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 3),
+        }
+        for i in range(4)
+    ]
+
+    env = atu.JammerVecEnv(
+        samples=samples,
+        model=torch.nn.Identity(),
+        jammer_sampling_freq=2e9,
+        num_envs=3,
+        max_steps=1,
+    )
+
+    obs = env.reset()
+    assert obs["iq1"].shape == (3, 32)
+
+    next_obs, rewards, dones, infos = env.step(actions=[{"seed": 5}] * 3)
+
+    assert build_calls["n"] == 1
+    assert next_obs["iq1"].shape == (3, 32)
+    assert rewards.shape == (3,)
+    assert all(dones)
+    assert len(infos) == 3

@@ -14,10 +14,14 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from tx_controller_tone_pulse_stft_varlen_2 import build_controlled_tone_pulse_batch_from_iq_batches
+from tx_controller_tone_pulse_stft_varlen_3 import (
+    build_controlled_tone_pulse_batch_from_iq_batches,
+    preprocess_batched_iq_to_stft_feature,
+)
 
 
 def _to_complex64_tensor(x: Any) -> torch.Tensor:
@@ -277,6 +281,238 @@ def compute_batch_scores(
     return torch.stack(scores)
 
 
+
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _as_float(value: Any, default: float) -> float:
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _normalize_action(action: Any) -> Dict[str, Any]:
+    """Normalize PPO action payloads into controller kwargs.
+
+    Supported forms:
+    - dict with optional keys: desired_output_iq_len, user_peak_power_fraction, seed
+    - sequence/tensor of up to 3 items in the same order as above
+    - scalar/tensor scalar interpreted as user_peak_power_fraction
+    """
+
+    if isinstance(action, dict):
+        return dict(action)
+
+    if torch.is_tensor(action):
+        if action.ndim == 0:
+            return {"user_peak_power_fraction": float(action.detach().cpu().item())}
+        action = action.detach().cpu().reshape(-1).tolist()
+
+    if isinstance(action, (list, tuple)):
+        out: Dict[str, Any] = {}
+        if len(action) >= 1:
+            out["desired_output_iq_len"] = action[0]
+        if len(action) >= 2:
+            out["user_peak_power_fraction"] = action[1]
+        if len(action) >= 3:
+            out["seed"] = action[2]
+        return out
+
+    if action is None:
+        return {}
+
+    return {"user_peak_power_fraction": action}
+
+
+def jammer_controller(
+    *,
+    model: torch.nn.Module,
+    sample: Dict[str, Any],
+    action: Any,
+    jammer_sampling_freq: float,
+    device: str = "cpu",
+    default_output_len: int = 8_000,
+    default_peak_power_fraction: float = 40.0,
+    default_seed: int = 11,
+) -> Dict[str, Any]:
+    """Concrete (sample, action) adapter around build_controlled_tone_pulse_batch_from_iq_batches."""
+
+    action_cfg = _normalize_action(action)
+    desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
+    user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
+    seed = _as_int(action_cfg.get("seed"), default_seed)
+
+    jam_batch = build_controlled_tone_pulse_batch_from_iq_batches(
+        model=model,
+        rx_iq_batches=[
+            sample["iq1"].unsqueeze(0),
+            sample["iq2"].unsqueeze(0),
+            sample["iq3"].unsqueeze(0),
+        ],
+        intake_sample_rate_hz=jammer_sampling_freq,
+        desired_output_iq_len=desired_output_iq_len,
+        user_peak_power_fraction=user_peak_power_fraction,
+        seed=seed,
+        device=device,
+    )
+    return jam_batch[0]
+
+
+def jammer_controller_batch(
+    *,
+    model: torch.nn.Module,
+    samples: Sequence[Dict[str, Any]],
+    actions: Sequence[Any],
+    jammer_sampling_freq: float,
+    device: str = "cpu",
+    default_output_len: int = 8_000,
+    default_peak_power_fraction: float = 40.0,
+    default_seed: int = 11,
+) -> List[Dict[str, Any]]:
+    """Batch adapter for vectorized env rollouts.
+
+    For maximal throughput this performs one model forward call for the whole vector.
+    The first action's scalar controls are applied batch-wide.
+    """
+
+    if len(samples) != len(actions):
+        raise ValueError("samples and actions must have the same length")
+    if not samples:
+        return []
+
+    action_cfg = _normalize_action(actions[0])
+    desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
+    user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
+    seed = _as_int(action_cfg.get("seed"), default_seed)
+
+    iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
+    iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
+    iq3 = torch.stack([s["iq3"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
+
+    return build_controlled_tone_pulse_batch_from_iq_batches(
+        model=model,
+        rx_iq_batches=[iq1, iq2, iq3],
+        intake_sample_rate_hz=jammer_sampling_freq,
+        desired_output_iq_len=desired_output_iq_len,
+        user_peak_power_fraction=user_peak_power_fraction,
+        seed=seed,
+        device=device,
+    )
+
+
+class JammerVecEnv:
+    """Vectorized jammer environment with batched controller calls for PPO rollouts."""
+
+    def __init__(
+        self,
+        *,
+        samples: Sequence[Dict[str, Any]],
+        model: torch.nn.Module,
+        jammer_sampling_freq: float,
+        num_envs: int,
+        reward_fn: Optional[Callable[[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]], torch.Tensor]] = None,
+        max_steps: int = 1,
+        device: str = "cpu",
+    ):
+        if not samples:
+            raise ValueError("samples must be non-empty")
+        if num_envs <= 0:
+            raise ValueError("num_envs must be positive")
+
+        self.samples = list(samples)
+        self.model = model
+        self.jammer_sampling_freq = float(jammer_sampling_freq)
+        self.num_envs = int(num_envs)
+        self.max_steps = int(max_steps)
+        self.device = device
+        self.reward_fn = reward_fn or self._default_reward
+
+        self._cursor = 0
+        self._step_count = 0
+        self._active: List[Dict[str, Any]] = []
+
+    def _next_samples(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for _ in range(self.num_envs):
+            out.append(self.samples[self._cursor % len(self.samples)])
+            self._cursor += 1
+        return out
+
+    @staticmethod
+    def _default_reward(jam_batch: Sequence[Dict[str, Any]], _samples: Sequence[Dict[str, Any]]) -> torch.Tensor:
+        # Cheap proxy objective for PPO warm-starts: maximize jammer energy.
+        vals = [torch.mean(torch.abs(item["tx_iq"]).float()).detach().cpu() for item in jam_batch]
+        return torch.stack(vals).to(dtype=torch.float32)
+
+    @staticmethod
+    def _obs_from_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        return {
+            "iq1": torch.stack([s["iq1"] for s in samples], dim=0),
+            "iq2": torch.stack([s["iq2"] for s in samples], dim=0),
+            "iq3": torch.stack([s["iq3"] for s in samples], dim=0),
+        }
+
+    def reset(self) -> Dict[str, torch.Tensor]:
+        self._step_count = 0
+        self._active = self._next_samples()
+        return self._obs_from_samples(self._active)
+
+    def step(self, actions: Sequence[Any]):
+        # Convenience for single-env training loops: if a single action vector
+        # (e.g. shape [action_dim]) is provided, wrap it into a batch.
+        if self.num_envs == 1 and isinstance(actions, torch.Tensor) and actions.ndim >= 1:
+            actions = [actions]
+        elif self.num_envs == 1 and isinstance(actions, np.ndarray) and actions.ndim >= 1:
+            actions = [actions]
+
+        if len(actions) != self.num_envs:
+            raise ValueError(f"actions is of length {len(actions)} but must contain {self.num_envs} entries")
+        if not self._active:
+            self._active = self._next_samples()
+
+        jam_batch = jammer_controller_batch(
+            model=self.model,
+            samples=self._active,
+            actions=actions,
+            jammer_sampling_freq=self.jammer_sampling_freq,
+            device=self.device,
+        )
+        rewards_t = self.reward_fn(jam_batch, self._active)
+        rewards = torch.as_tensor(rewards_t, dtype=torch.float32).cpu().numpy()
+
+        self._step_count += 1
+        done = self._step_count >= self.max_steps
+        dones = [bool(done)] * self.num_envs
+
+        infos = [
+            {
+                "tx_metadata": jam_item.get("tx_metadata", {}),
+                "sample_name": sample.get("sample_name"),
+            }
+            for jam_item, sample in zip(jam_batch, self._active)
+        ]
+
+        if done:
+            self._active = self._next_samples()
+            next_obs = self._obs_from_samples(self._active)
+            self._step_count = 0
+        else:
+            next_obs = self._obs_from_samples(self._active)
+
+        return next_obs, rewards, dones, infos
+
+
 def run_epoch_cached(
     *,
     dataloader: Iterable[Dict[str, Any]],
@@ -360,3 +596,31 @@ def run_epoch_cached(
     if not losses:
         return None
     return float(sum(losses) / len(losses))
+
+
+def build_stft_observation_from_iq_batch(
+    *,
+    iq1: torch.Tensor,
+    iq2: torch.Tensor,
+    iq3: torch.Tensor,
+    intake_sample_rate_hz: float,
+    device: str = "cpu",
+) -> Dict[str, List[torch.Tensor]]:
+    """Build the ActorCritic observation payload from cached IQ sections.
+
+    The controller v3 observation is image-only and contains:
+    - stft_feature_list[0]: STFT feature map for iq1, shape [B, C, F, T1]
+    - stft_feature_list[1]: STFT feature map for iq2, shape [B, C, F, T2]
+    - stft_feature_list[2]: STFT feature map for iq3, shape [B, C, F, T3]
+    """
+
+    proc1 = preprocess_batched_iq_to_stft_feature(iq1.squeeze(0), sample_rate_hz=intake_sample_rate_hz)
+    proc2 = preprocess_batched_iq_to_stft_feature(iq2.squeeze(0), sample_rate_hz=intake_sample_rate_hz)
+    proc3 = preprocess_batched_iq_to_stft_feature(iq3.squeeze(0), sample_rate_hz=intake_sample_rate_hz)
+    return {
+        "stft_feature_list": [
+            proc1["feature"].to(device=device, dtype=torch.float32),
+            proc2["feature"].to(device=device, dtype=torch.float32),
+            proc3["feature"].to(device=device, dtype=torch.float32),
+        ]
+    }

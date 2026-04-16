@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -292,22 +292,19 @@ class VarLenSTFTEncoder(nn.Module):
 class TonePulseTXControlNetVarLen(nn.Module):
     """Shared STFT encoder over a variable-length list of IQ windows."""
 
-    def __init__(self, in_ch: int = 14, base_ch: int = 24, n_scalar_features: int = 6, max_tones: int = 8):
+    def __init__(self, in_ch: int = 14, base_ch: int = 24, max_tones: int = 8):
         """
         Args:
             in_ch: Number of channels per STFT input map [B, C, F, T].
             base_ch: Base convolution width used by the STFT encoder.
-            n_scalar_features: Number of non-image scalar side features fused with STFT features.
             max_tones: Upper bound on synthesized tone count (also output width for tone amplitudes).
         """
         super().__init__()
         self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
 
-        self.scalar_proj = nn.Sequential(nn.Linear(n_scalar_features, 48), nn.ReLU(inplace=True))
-        fused_dim = self.encoder.feature_dim + 48
         self.fusion = nn.Sequential(
-            nn.Linear(fused_dim, 160),
+            nn.Linear(self.encoder.feature_dim, 160),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(160, 96),
@@ -337,20 +334,19 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.burst_prob_head = nn.Linear(96, 1)
         self.burst_power_ratio_head = nn.Linear(96, 1)
 
-    def encode_fused_features(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> torch.Tensor:
+    def encode_fused_features(self, stft_feature_list: List[torch.Tensor]) -> torch.Tensor:
         """
-        Encode variable-length STFT observations and scalar side information into a shared latent.
+        Encode variable-length STFT observations into a shared latent.
 
         This method is used by supervised control heads in this class and by the RL ActorCritic
         wrapper so both training modes share the same representation network.
         """
         emb = [self.encoder(x) for x in stft_feature_list]
         z_stft = torch.stack(emb, dim=0).mean(dim=0)
-        z = torch.cat([z_stft, self.scalar_proj(scalar_side)], dim=-1)
-        return self.fusion(z)
+        return self.fusion(z_stft)
 
-    def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Dict[str, torch.Tensor]:
-        z = self.encode_fused_features(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+    def forward(self, stft_feature_list: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        z = self.encode_fused_features(stft_feature_list=stft_feature_list)
         return {
             "noise_color_logits": self.noise_color_head(z),
             "fading_mode_logits": self.fading_mode_head(z),
@@ -390,7 +386,6 @@ class ActorCritic(nn.Module):
         action_dim: int,
         in_ch: int = 14,
         base_ch: int = 24,
-        n_scalar_features: int = 6,
         max_tones: int = 8,
     ):
         super().__init__()
@@ -400,20 +395,18 @@ class ActorCritic(nn.Module):
         self.backbone = TonePulseTXControlNetVarLen(
             in_ch=in_ch,
             base_ch=base_ch,
-            n_scalar_features=n_scalar_features,
             max_tones=max_tones,
         )
         self.policy_head = nn.Linear(96, action_dim)
         self.value_head = nn.Linear(96, 1)
 
-    def _encode(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> torch.Tensor:
+    def _encode(self, stft_feature_list: List[torch.Tensor]) -> torch.Tensor:
         return self.backbone.encode_fused_features(
             stft_feature_list=stft_feature_list,
-            scalar_side=scalar_side,
         )
 
-    def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = self._encode(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+    def forward(self, stft_feature_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = self._encode(stft_feature_list=stft_feature_list)
         logits = self.policy_head(z)
         value = self.value_head(z).squeeze(-1)
         return logits, value
@@ -424,20 +417,17 @@ class ActorCritic(nn.Module):
 
         Expected keys:
             observation["stft_feature_list"] -> List[Tensor[B, C, F, T]]
-            observation["scalar_side"] -> Tensor[B, n_scalar_features]
         """
         return self.forward(
             stft_feature_list=observation["stft_feature_list"],
-            scalar_side=observation["scalar_side"],
         )
 
     def act(
         self,
         stft_feature_list: List[torch.Tensor],
-        scalar_side: torch.Tensor,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        logits, value = self.forward(stft_feature_list=stft_feature_list)
         dist = torch.distributions.Categorical(logits=logits)
         action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
         log_prob = dist.log_prob(action)
@@ -446,10 +436,9 @@ class ActorCritic(nn.Module):
     def evaluate_actions(
         self,
         stft_feature_list: List[torch.Tensor],
-        scalar_side: torch.Tensor,
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        logits, value = self.forward(stft_feature_list=stft_feature_list)
         dist = torch.distributions.Categorical(logits=logits)
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
@@ -467,7 +456,6 @@ class ActorCritic(nn.Module):
         Args:
             observation: Dict containing:
                 - "stft_feature_list": List[Tensor[B, C, F, T]]
-                - "scalar_side": Tensor[B, n_scalar_features]
             action: Optional Tensor[B] of preselected discrete actions.
                 If omitted, an action is sampled (or argmax if deterministic=True).
             deterministic: If True and `action` is None, choose argmax action.
@@ -618,22 +606,8 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
     rf_center_est_t = peak_stack.mean(dim=0)
 
     lengths = torch.stack([p["lengths"].to(device) for p in proc], dim=0).transpose(0, 1)
-    max_len = torch.clamp(torch.max(lengths, dim=1).values, min=1.0)
-    scalar_side = torch.stack(
-        [
-            torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32, device=device)) / 10.0
-            * torch.ones(batch_size, dtype=torch.float32, device=device),
-            torch.mean(lengths, dim=1) / max_len,
-            torch.std(lengths, dim=1, unbiased=False) / max_len,
-            rx_input_power_t.to(dtype=torch.float32),
-            peak_stack.mean(dim=0) / max(intake_sample_rate_hz, 1.0),
-            peak_stack.std(dim=0, unbiased=False) / max(intake_sample_rate_hz, 1.0),
-        ],
-        dim=1,
-    ).to(dtype=torch.float32, device=device)
-
     model = model.to(device)
-    y = model(stft_tensors, scalar_side)
+    y = model(stft_tensors)
 
     out = []
     for i in range(batch_size):
@@ -701,7 +675,7 @@ if __name__ == "__main__":
     iq_b = torch.complex(torch.randn(1700), torch.randn(1700)).to(dtype=torch.complex64)
     iq_c = torch.complex(torch.randn(3200), torch.randn(3200)).to(dtype=torch.complex64)
 
-    model = TonePulseTXControlNetVarLen(in_ch=14, base_ch=16, n_scalar_features=6, max_tones=8)
+    model = TonePulseTXControlNetVarLen(in_ch=14, base_ch=16, max_tones=8)
     out = build_controlled_tone_pulse_from_variable_inputs(
         model=model,
         rx_iq_windows=[iq_a, iq_b, iq_c],
