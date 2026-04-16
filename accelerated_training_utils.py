@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -468,6 +469,13 @@ class JammerVecEnv:
         return self._obs_from_samples(self._active)
 
     def step(self, actions: Sequence[Any]):
+        # Convenience for single-env training loops: if a single action vector
+        # (e.g. shape [action_dim]) is provided, wrap it into a batch.
+        if self.num_envs == 1 and isinstance(actions, torch.Tensor) and actions.ndim >= 1:
+            actions = [actions]
+        elif self.num_envs == 1 and isinstance(actions, np.ndarray) and actions.ndim >= 1:
+            actions = [actions]
+
         if len(actions) != self.num_envs:
             raise ValueError(f"actions must contain {self.num_envs} entries")
         if not self._active:
