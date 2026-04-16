@@ -477,7 +477,7 @@ class JammerVecEnv:
             actions = [actions]
 
         if len(actions) != self.num_envs:
-            raise ValueError(f"actions must contain {self.num_envs} entries")
+            raise ValueError(f"actions is of length {len(actions)} but must contain {self.num_envs} entries")
         if not self._active:
             self._active = self._next_samples()
 
@@ -614,9 +614,9 @@ def build_stft_observation_from_iq_batch(
     - stft_feature_list[2]: STFT feature map for iq3, shape [B, C, F, T3]
     """
 
-    proc1 = preprocess_batched_iq_to_stft_feature(iq1, sample_rate_hz=intake_sample_rate_hz)
-    proc2 = preprocess_batched_iq_to_stft_feature(iq2, sample_rate_hz=intake_sample_rate_hz)
-    proc3 = preprocess_batched_iq_to_stft_feature(iq3, sample_rate_hz=intake_sample_rate_hz)
+    proc1 = preprocess_batched_iq_to_stft_feature(iq1.squeeze(0), sample_rate_hz=intake_sample_rate_hz)
+    proc2 = preprocess_batched_iq_to_stft_feature(iq2.squeeze(0), sample_rate_hz=intake_sample_rate_hz)
+    proc3 = preprocess_batched_iq_to_stft_feature(iq3.squeeze(0), sample_rate_hz=intake_sample_rate_hz)
     return {
         "stft_feature_list": [
             proc1["feature"].to(device=device, dtype=torch.float32),
