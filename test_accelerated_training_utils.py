@@ -340,3 +340,55 @@ def test_jammer_vec_env_batches_rollout(monkeypatch):
     assert rewards.shape == (3,)
     assert all(dones)
     assert len(infos) == 3
+
+
+def test_jammer_vec_env_accepts_cached_dataloader_batches(monkeypatch):
+    build_calls = {"n": 0}
+
+    def fake_build(**kwargs):
+        build_calls["n"] += 1
+        bs = kwargs["rx_iq_batches"][0].shape[0]
+        return [
+            {
+                "tx_iq": torch.ones(20, dtype=torch.complex64) * (i + 1),
+                "tx_metadata": {"row": i},
+            }
+            for i in range(bs)
+        ]
+
+    monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
+
+    rows = [
+        {
+            "sample_name": f"s{i}",
+            "source_dir": "tmp",
+            "whole_iq": torch.ones(64, dtype=torch.complex64),
+            "whole_meta": {"sample_rate_hz": 1_000_000.0},
+            "whole_sample_rate_hz": 1_000_000.0,
+            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 1),
+            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 2),
+            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 3),
+        }
+        for i in range(4)
+    ]
+    loader = torch.utils.data.DataLoader(rows, batch_size=2, shuffle=False, collate_fn=atu.collate_cached_iq)
+
+    env = atu.JammerVecEnv(
+        samples=loader,
+        model=torch.nn.Identity(),
+        jammer_sampling_freq=2e9,
+        num_envs=2,
+        max_steps=1,
+    )
+
+    obs = env.reset()
+    assert obs["iq1"].shape == (2, 32)
+    assert env.samples[0]["sample_name"] == "s0"
+
+    next_obs, rewards, dones, infos = env.step(actions=[{"seed": 5}] * 2)
+
+    assert build_calls["n"] == 1
+    assert next_obs["iq1"].shape == (2, 32)
+    assert rewards.shape == (2,)
+    assert all(dones)
+    assert len(infos) == 2

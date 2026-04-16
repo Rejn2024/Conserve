@@ -417,7 +417,7 @@ class JammerVecEnv:
     def __init__(
         self,
         *,
-        samples: Sequence[Dict[str, Any]],
+        samples: Iterable[Dict[str, Any]],
         model: torch.nn.Module,
         jammer_sampling_freq: float,
         num_envs: int,
@@ -425,12 +425,12 @@ class JammerVecEnv:
         max_steps: int = 1,
         device: str = "cpu",
     ):
-        if not samples:
-            raise ValueError("samples must be non-empty")
         if num_envs <= 0:
             raise ValueError("num_envs must be positive")
 
-        self.samples = list(samples)
+        self.samples = self._coerce_samples(samples)
+        if not self.samples:
+            raise ValueError("samples must be non-empty")
         self.model = model
         self.jammer_sampling_freq = float(jammer_sampling_freq)
         self.num_envs = int(num_envs)
@@ -441,6 +441,56 @@ class JammerVecEnv:
         self._cursor = 0
         self._step_count = 0
         self._active: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _expand_cached_batch(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+        iq1 = batch["iq1"]
+        iq2 = batch["iq2"]
+        iq3 = batch["iq3"]
+
+        if not torch.is_tensor(iq1) or not torch.is_tensor(iq2) or not torch.is_tensor(iq3):
+            raise TypeError("cached batch iq1/iq2/iq3 must be torch tensors")
+        if iq1.ndim != 2 or iq2.ndim != 2 or iq3.ndim != 2:
+            raise ValueError("cached batch iq1/iq2/iq3 must have shape [batch, samples]")
+
+        bs = int(iq1.shape[0])
+        sample_names = batch.get("sample_names")
+        source_dirs = batch.get("source_dirs")
+        whole_iq_list = batch.get("whole_iq_list")
+        whole_meta_list = batch.get("whole_meta_list")
+        whole_sr_list = batch.get("whole_sr_list")
+
+        out: List[Dict[str, Any]] = []
+        for i in range(bs):
+            out.append(
+                {
+                    "sample_name": sample_names[i] if sample_names is not None else None,
+                    "source_dir": source_dirs[i] if source_dirs is not None else None,
+                    "whole_iq": whole_iq_list[i] if whole_iq_list is not None else None,
+                    "whole_meta": whole_meta_list[i] if whole_meta_list is not None else None,
+                    "whole_sample_rate_hz": whole_sr_list[i] if whole_sr_list is not None else None,
+                    "iq1": iq1[i],
+                    "iq2": iq2[i],
+                    "iq3": iq3[i],
+                }
+            )
+        return out
+
+    @classmethod
+    def _coerce_samples(cls, samples: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        materialized: List[Dict[str, Any]] = []
+        for item in samples:
+            if not isinstance(item, dict):
+                raise TypeError("samples must contain dict entries or cached batch dicts")
+            if "iq1" not in item or "iq2" not in item or "iq3" not in item:
+                raise ValueError("each sample/batch dict must include iq1, iq2, iq3")
+
+            iq1 = item["iq1"]
+            if torch.is_tensor(iq1) and iq1.ndim == 2:
+                materialized.extend(cls._expand_cached_batch(item))
+            else:
+                materialized.append(item)
+        return materialized
 
     def _next_samples(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
