@@ -383,21 +383,25 @@ class ActorCritic(nn.Module):
 
     def __init__(
         self,
-        action_dim: int,
+        action_dim: Optional[int] = None,
         in_ch: int = 14,
         base_ch: int = 24,
         max_tones: int = 8,
+        action_std_init: float = 0.25,
     ):
         super().__init__()
-        if action_dim <= 0:
-            raise ValueError("action_dim must be positive")
-
         self.backbone = TonePulseTXControlNetVarLen(
             in_ch=in_ch,
             base_ch=base_ch,
             max_tones=max_tones,
         )
-        self.policy_head = nn.Linear(96, action_dim)
+        self.max_tones = max_tones
+        self.action_dim = int(action_dim) if action_dim is not None else (12 + int(max_tones))
+        if self.action_dim <= 0:
+            raise ValueError("action_dim must be positive")
+
+        self._action_std_floor = 1e-4
+        self.log_std = nn.Parameter(torch.full((self.action_dim,), math.log(max(action_std_init, self._action_std_floor))))
         self.value_head = nn.Linear(96, 1)
 
     def _encode(self, stft_feature_list: List[torch.Tensor]) -> torch.Tensor:
@@ -405,11 +409,44 @@ class ActorCritic(nn.Module):
             stft_feature_list=stft_feature_list,
         )
 
+    def _continuous_action_mean(
+        self,
+        stft_feature_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        y = self.backbone(stft_feature_list)
+
+        def _expected_index(logits: torch.Tensor) -> torch.Tensor:
+            probs = torch.softmax(logits, dim=-1)
+            idx = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype)
+            return (probs * idx).sum(dim=-1, keepdim=True)
+
+        pieces = [
+            _expected_index(y["noise_color_logits"]),
+            _expected_index(y["fading_mode_logits"]),
+            _expected_index(y["burst_color_logits"]),
+            y["rf_center_delta_hz"],
+            y["carrier_hz_norm"],
+            y["num_tones_cont"],
+            y["base_tone_norm"],
+            y["tone_spacing_norm"],
+            y["tone_amp_raw"],
+            y["pulse_on_samples"],
+            y["pulse_off_samples"],
+            y["pulse_count"],
+            y["start_offset"],
+        ]
+        action_mean = torch.cat(pieces, dim=-1)
+        if action_mean.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Action mean width {action_mean.shape[-1]} does not match action_dim {self.action_dim}. "
+                "Set action_dim to 12 + max_tones (default) or a matching custom width."
+            )
+        return action_mean
+
     def forward(self, stft_feature_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = self._encode(stft_feature_list=stft_feature_list)
-        logits = self.policy_head(z)
-        value = self.value_head(z).squeeze(-1)
-        return logits, value
+        action_mean = self._continuous_action_mean(stft_feature_list=stft_feature_list)
+        value = self.value_head(self._encode(stft_feature_list=stft_feature_list)).squeeze(-1)
+        return action_mean, value
 
     def forward_observation(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -422,15 +459,20 @@ class ActorCritic(nn.Module):
             stft_feature_list=observation["stft_feature_list"],
         )
 
+    def _action_distribution(self, action_mean: torch.Tensor) -> torch.distributions.Normal:
+        std = torch.exp(self.log_std).clamp_min(self._action_std_floor)
+        std = std.view(1, -1).expand_as(action_mean)
+        return torch.distributions.Normal(loc=action_mean, scale=std)
+
     def act(
         self,
         stft_feature_list: List[torch.Tensor],
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value = self.forward(stft_feature_list=stft_feature_list)
-        dist = torch.distributions.Categorical(logits=logits)
-        action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
-        log_prob = dist.log_prob(action)
+        action_mean, value = self.forward(stft_feature_list=stft_feature_list)
+        dist = self._action_distribution(action_mean=action_mean)
+        action = action_mean if deterministic else dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
         return action, log_prob, value
 
     def evaluate_actions(
@@ -438,10 +480,10 @@ class ActorCritic(nn.Module):
         stft_feature_list: List[torch.Tensor],
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits, value = self.forward(stft_feature_list=stft_feature_list)
-        dist = torch.distributions.Categorical(logits=logits)
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
+        action_mean, value = self.forward(stft_feature_list=stft_feature_list)
+        dist = self._action_distribution(action_mean=action_mean)
+        log_prob = dist.log_prob(actions).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
         return log_prob, entropy, value
 
     def get_action_value_logp(
@@ -456,18 +498,18 @@ class ActorCritic(nn.Module):
         Args:
             observation: Dict containing:
                 - "stft_feature_list": List[Tensor[B, C, F, T]]
-            action: Optional Tensor[B] of preselected discrete actions.
-                If omitted, an action is sampled (or argmax if deterministic=True).
-            deterministic: If True and `action` is None, choose argmax action.
+            action: Optional Tensor[B, action_dim] of preselected continuous actions.
+                If omitted, an action is sampled (or mean action if deterministic=True).
+            deterministic: If True and `action` is None, choose mean action.
 
         Returns:
-            Tuple of (action, value, log_prob), each shaped [B].
+            Tuple of (action, value, log_prob) with action shaped [B, action_dim].
         """
-        logits, value = self.forward_observation(observation)
-        dist = torch.distributions.Categorical(logits=logits)
+        action_mean, value = self.forward_observation(observation)
+        dist = self._action_distribution(action_mean=action_mean)
         if action is None:
-            action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
-        log_prob = dist.log_prob(action)
+            action = action_mean if deterministic else dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
         return action, value, log_prob
 
 
@@ -487,6 +529,7 @@ def decode_tone_pulse_config(
     rx_input_power: float,
     max_tones: int,
     seed: int,
+    action_overrides: Optional[Dict[str, object]] = None,
 ) -> TonePulseControlConfig:
     def _safe_scalar(name: str, default: float) -> float:
         value = float(model_out[name].item())
@@ -505,6 +548,46 @@ def decode_tone_pulse_config(
 
     base_f = float(_safe_scalar("base_tone_norm", 0.0)) * sample_rate_hz
     spacing = float(_safe_scalar("tone_spacing_norm", 0.0)) * sample_rate_hz
+
+    amp_raw = model_out["tone_amp_raw"].detach().reshape(-1)[:num_tones]
+
+    if action_overrides:
+        def _override_scalar(name: str, default: float) -> float:
+            v = action_overrides.get(name, default)
+            try:
+                out = float(v)
+            except Exception:
+                out = float(default)
+            return out if math.isfinite(out) else float(default)
+
+        noise_idx = int(round(_override_scalar("noise_color", NOISE_COLORS.index(noise_color))))
+        noise_idx = max(0, min(noise_idx, len(NOISE_COLORS) - 1))
+        noise_color = NOISE_COLORS[noise_idx]
+
+        fading_idx = int(round(_override_scalar("fading_mode", FADING_MODES.index(fading_mode))))
+        fading_idx = max(0, min(fading_idx, len(FADING_MODES) - 1))
+        fading_mode = FADING_MODES[fading_idx]
+
+        burst_idx = int(round(_override_scalar("burst_color", NOISE_COLORS.index(burst_color))))
+        burst_idx = max(0, min(burst_idx, len(NOISE_COLORS) - 1))
+        burst_color = NOISE_COLORS[burst_idx]
+
+        rf_center_hz = _override_scalar("rf_center_hz", rf_center_hz)
+        carrier_hz = _override_scalar("carrier_hz", carrier_hz)
+        num_tones = int(round(_override_scalar("num_tones", num_tones)))
+        num_tones = max(1, min(num_tones, max_tones))
+        base_f = _override_scalar("base_f", base_f)
+        spacing = abs(_override_scalar("spacing", spacing))
+
+        amp_raw_override = action_overrides.get("amp_raw", None)
+        if amp_raw_override is not None:
+            try:
+                amp_raw_t = torch.as_tensor(amp_raw_override, dtype=torch.float32).reshape(-1)
+                if amp_raw_t.numel() > 0:
+                    amp_raw = amp_raw_t[:num_tones]
+            except Exception:
+                pass
+
     offsets = (torch.arange(num_tones, dtype=torch.float64) - 0.5 * (num_tones - 1)) * spacing
     tone_frequencies_hz = [
         float(
@@ -517,7 +600,6 @@ def decode_tone_pulse_config(
         for df in offsets
     ]
 
-    amp_raw = model_out["tone_amp_raw"].detach().reshape(-1)[:num_tones]
     tone_amplitudes = (0.05 + 0.95 * torch.sigmoid(amp_raw)).to(dtype=torch.float64).tolist()
 
     peak_power = None if user_peak_power_fraction is None else float(user_peak_power_fraction) * float(rx_input_power)
@@ -526,6 +608,17 @@ def decode_tone_pulse_config(
     pulse_off_samples = int(round(_safe_scalar("pulse_off_samples", 0.0)))
     pulse_count = int(round(_safe_scalar("pulse_count", 1.0)))
     start_offset_samples = int(round(_safe_scalar("start_offset", 0.0)))
+    if action_overrides:
+        def _to_int(name: str, default: int) -> int:
+            try:
+                return int(round(float(action_overrides.get(name, default))))
+            except Exception:
+                return int(default)
+
+        pulse_on_samples = _to_int("pulse_on_samples", pulse_on_samples)
+        pulse_off_samples = _to_int("pulse_off_samples", pulse_off_samples)
+        pulse_count = _to_int("pulse_count", pulse_count)
+        start_offset_samples = _to_int("start_offset_samples", start_offset_samples)
 
     if desired_output_iq_len is not None and desired_output_iq_len > 0:
         pulse_on_samples = min(pulse_on_samples, desired_output_iq_len)
@@ -588,6 +681,7 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
     intake_sample_rate_hz: float,
     desired_output_iq_len: Optional[int] = None,
     user_peak_power_fraction: Optional[float] = None,
+    action_overrides: Optional[Sequence[Optional[Dict[str, object]]]] = None,
     seed: int = 1,
     device: str = "cpu",
 ) -> List[Dict[str, object]]:
@@ -608,10 +702,19 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
     lengths = torch.stack([p["lengths"].to(device) for p in proc], dim=0).transpose(0, 1)
     model = model.to(device)
     y = model(stft_tensors)
+    if isinstance(y, tuple):
+        if hasattr(model, "backbone"):
+            y = model.backbone(stft_tensors)
+        else:
+            raise TypeError("model(stft_tensors) returned tuple; expected dict of control heads")
+
+    if action_overrides is not None and len(action_overrides) != batch_size:
+        raise ValueError("action_overrides must have one entry per batch sample")
 
     out = []
     for i in range(batch_size):
         model_out_i = {k: v[i : i + 1] for k, v in y.items()}
+        action_override_i = None if action_overrides is None else action_overrides[i]
         cfg = decode_tone_pulse_config(
             model_out=model_out_i,
             intake_sample_rate_hz=float(intake_sample_rate_hz),
@@ -621,6 +724,7 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
             rx_input_power=float(rx_input_power_t[i].item()),
             max_tones=model.max_tones,
             seed=seed + i,
+            action_overrides=action_override_i,
         )
 
         tx_result = txflex.build_tone_pulse_iq_object(

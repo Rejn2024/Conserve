@@ -306,8 +306,17 @@ def _normalize_action(action: Any) -> Dict[str, Any]:
     """Normalize PPO action payloads into controller kwargs.
 
     Supported forms:
-    - dict with optional keys: desired_output_iq_len, user_peak_power_fraction, seed
-    - sequence/tensor of up to 3 items in the same order as above
+    - dict with optional keys:
+        desired_output_iq_len, user_peak_power_fraction, seed,
+        noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
+        num_tones, base_f, spacing, amp_raw, pulse_on_samples,
+        pulse_off_samples, pulse_count, start_offset_samples
+    - sequence/tensor:
+        * up to 3 items mapped to desired_output_iq_len, user_peak_power_fraction, seed
+        * > 3 items interpreted as continuous control action vector in this order:
+          noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
+          num_tones, base_f, spacing, [amp_raw...], pulse_on_samples,
+          pulse_off_samples, pulse_count, start_offset_samples
     - scalar/tensor scalar interpreted as user_peak_power_fraction
     """
 
@@ -320,6 +329,27 @@ def _normalize_action(action: Any) -> Dict[str, Any]:
         action = action.detach().cpu().reshape(-1).tolist()
 
     if isinstance(action, (list, tuple)):
+        if len(action) > 3:
+            vec = [float(x) for x in action]
+            if len(vec) < 12:
+                raise ValueError("continuous action vector must contain at least 12 values")
+            amp_width = len(vec) - 12
+            return {
+                "noise_color": vec[0],
+                "fading_mode": vec[1],
+                "burst_color": vec[2],
+                "rf_center_hz": vec[3],
+                "carrier_hz": vec[4],
+                "num_tones": vec[5],
+                "base_f": vec[6],
+                "spacing": vec[7],
+                "amp_raw": vec[8 : 8 + amp_width],
+                "pulse_on_samples": vec[8 + amp_width],
+                "pulse_off_samples": vec[9 + amp_width],
+                "pulse_count": vec[10 + amp_width],
+                "start_offset_samples": vec[11 + amp_width],
+            }
+
         out: Dict[str, Any] = {}
         if len(action) >= 1:
             out["desired_output_iq_len"] = action[0]
@@ -353,6 +383,26 @@ def jammer_controller(
     user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
 
+    action_overrides = {
+        k: action_cfg[k]
+        for k in (
+            "noise_color",
+            "fading_mode",
+            "burst_color",
+            "rf_center_hz",
+            "carrier_hz",
+            "num_tones",
+            "base_f",
+            "spacing",
+            "amp_raw",
+            "pulse_on_samples",
+            "pulse_off_samples",
+            "pulse_count",
+            "start_offset_samples",
+        )
+        if k in action_cfg
+    }
+
     jam_batch = build_controlled_tone_pulse_batch_from_iq_batches(
         model=model,
         rx_iq_batches=[
@@ -363,6 +413,7 @@ def jammer_controller(
         intake_sample_rate_hz=jammer_sampling_freq,
         desired_output_iq_len=desired_output_iq_len,
         user_peak_power_fraction=user_peak_power_fraction,
+        action_overrides=[action_overrides if action_overrides else None],
         seed=seed,
         device=device,
     )
@@ -395,6 +446,29 @@ def jammer_controller_batch(
     desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
     user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
+    action_overrides: List[Optional[Dict[str, Any]]] = []
+    for action in actions:
+        cfg_i = _normalize_action(action)
+        ov_i = {
+            k: cfg_i[k]
+            for k in (
+                "noise_color",
+                "fading_mode",
+                "burst_color",
+                "rf_center_hz",
+                "carrier_hz",
+                "num_tones",
+                "base_f",
+                "spacing",
+                "amp_raw",
+                "pulse_on_samples",
+                "pulse_off_samples",
+                "pulse_count",
+                "start_offset_samples",
+            )
+            if k in cfg_i
+        }
+        action_overrides.append(ov_i if ov_i else None)
 
     iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
     iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
@@ -406,6 +480,7 @@ def jammer_controller_batch(
         intake_sample_rate_hz=jammer_sampling_freq,
         desired_output_iq_len=desired_output_iq_len,
         user_peak_power_fraction=user_peak_power_fraction,
+        action_overrides=action_overrides,
         seed=seed,
         device=device,
     )
