@@ -378,6 +378,7 @@ def jammer_controller_batch(
     device: str = "cpu",
     default_output_len: int = 8_000,
     default_peak_power_fraction: float = 40.0,
+    user_peak_power_fraction: float = 40.0,
     default_seed: int = 11,
 ) -> List[Dict[str, Any]]:
     """Batch adapter for vectorized env rollouts.
@@ -393,7 +394,7 @@ def jammer_controller_batch(
 
     action_cfg = _normalize_action(actions[0])
     desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
-    user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
+    # user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
 
     iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
@@ -401,7 +402,7 @@ def jammer_controller_batch(
     iq3 = torch.stack([s["iq3"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
 
     return build_controlled_tone_pulse_batch_from_iq_batches(
-        model=model,
+        model=model.backbone,
         rx_iq_batches=[iq1, iq2, iq3],
         intake_sample_rate_hz=jammer_sampling_freq,
         desired_output_iq_len=desired_output_iq_len,
@@ -423,6 +424,7 @@ class JammerVecEnv:
         num_envs: int,
         reward_fn: Optional[Callable[[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]], torch.Tensor]] = None,
         max_steps: int = 1,
+        user_peak_power_fraction: float = 40.0,
         device: str = "cpu",
     ):
         if num_envs <= 0:
@@ -437,6 +439,7 @@ class JammerVecEnv:
         self.max_steps = int(max_steps)
         self.device = device
         self.reward_fn = reward_fn or self._default_reward
+        self.user_peak_power_fraction = user_peak_power_fraction
 
         self._cursor = 0
         self._step_count = 0
@@ -536,6 +539,7 @@ class JammerVecEnv:
             samples=self._active,
             actions=actions,
             jammer_sampling_freq=self.jammer_sampling_freq,
+            user_peak_power_fraction = self.user_peak_power_fraction,
             device=self.device,
         )
         rewards_t = self.reward_fn(jam_batch, self._active)
