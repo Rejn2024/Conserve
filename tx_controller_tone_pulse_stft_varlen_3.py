@@ -347,7 +347,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
 
     def forward(self, stft_feature_list: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         z = self.encode_fused_features(stft_feature_list=stft_feature_list)
-        return {
+        r = {
             "noise_color_logits": self.noise_color_head(z),
             "fading_mode_logits": self.fading_mode_head(z),
             "burst_color_logits": self.burst_color_head(z),
@@ -371,6 +371,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z)),
         }
 
+        return r
 
 class ActorCritic(nn.Module):
     """
