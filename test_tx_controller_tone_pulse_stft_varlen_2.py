@@ -52,7 +52,7 @@ def test_decode_tone_pulse_config_handles_nan_scalars():
 
 
 def test_actor_critic_reuses_varlen_backbone_and_returns_rl_shapes():
-    model = ActorCritic(action_dim=7, in_ch=14, base_ch=16, max_tones=8)
+    model = ActorCritic(action_dim=20, in_ch=14, base_ch=16, max_tones=8)
     model.eval()
 
     batch_size = 3
@@ -61,12 +61,12 @@ def test_actor_critic_reuses_varlen_backbone_and_returns_rl_shapes():
         torch.randn(batch_size, 14, 64, 21),
         torch.randn(batch_size, 14, 64, 13),
     ]
-    logits, values = model(stft_feature_list=stft_feature_list)
-    assert logits.shape == (batch_size, 7)
+    action_mean, values = model(stft_feature_list=stft_feature_list)
+    assert action_mean.shape == (batch_size, 20)
     assert values.shape == (batch_size,)
 
     action, log_prob, act_values = model.act(stft_feature_list=stft_feature_list)
-    assert action.shape == (batch_size,)
+    assert action.shape == (batch_size, 20)
     assert log_prob.shape == (batch_size,)
     assert act_values.shape == (batch_size,)
 
