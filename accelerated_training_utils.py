@@ -578,9 +578,53 @@ class JammerVecEnv:
         return out
 
     @staticmethod
-    def _default_reward(jam_batch: Sequence[Dict[str, Any]], _samples: Sequence[Dict[str, Any]]) -> torch.Tensor:
-        # Cheap proxy objective for PPO warm-starts: maximize jammer energy.
-        vals = [torch.mean(torch.abs(item["tx_iq"]).float()).detach().cpu() for item in jam_batch]
+    def _default_reward(jam_batch: Sequence[Dict[str, Any]], samples: Sequence[Dict[str, Any]]) -> torch.Tensor:
+        """Default reward used by PPO loops.
+
+        Mirrors the decode-side objective from `JammerLoss` in
+        `generating_sample_transmissions.ipynb`:
+            reward = score_decode(rx_result, whole_meta) + alpha * metric_div
+        with `alpha=10`.
+
+        If decode/score inputs are unavailable for a row, this falls back to a
+        cheap energy proxy for that row.
+        """
+
+        alpha = 10.0
+        vals: List[torch.Tensor] = []
+
+        try:
+            import advanced_link_skdsp_v6_robust as link6
+            import score_iq_decode as scorer
+        except Exception:
+            # Preserve historical behavior when decode stack is unavailable.
+            vals = [torch.mean(torch.abs(item["tx_iq"]).float()).detach().cpu() for item in jam_batch]
+            return torch.stack(vals).to(dtype=torch.float32)
+
+        for jam_item, sample in zip(jam_batch, samples):
+            tx_iq = jam_item["tx_iq"]
+            whole_meta = sample.get("whole_meta")
+            whole_iq = sample.get("whole_iq")
+
+            if whole_meta is None or whole_iq is None:
+                vals.append(torch.mean(torch.abs(tx_iq).float()).detach().cpu())
+                continue
+
+            try:
+                jammed = whole_iq + tx_iq
+                rx_result = link6.rx_command_iq(jammed, whole_meta)
+
+                score = torch.tensor(-1.0, dtype=torch.float32)
+                if rx_result.get("message") is not None:
+                    score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
+
+                metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
+                vals.append((score + (alpha * metric_div)).detach().cpu())
+            except Exception:
+                vals.append(torch.mean(torch.abs(tx_iq).float()).detach().cpu())
+
+        if not vals:
+            return torch.empty((0,), dtype=torch.float32)
         return torch.stack(vals).to(dtype=torch.float32)
 
     @staticmethod
