@@ -19,7 +19,7 @@ class PPOConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Discrete action space size consumed by tx_controller_tone_pulse_stft_varlen_3.ActorCritic
-ACTION_DIM = 8
+ACTION_DIM = 20
 
 
 def obs_to_model_obs(obs: Dict[str, torch.Tensor], jammer_sampling_freq: float, device: str) -> Dict[str, List[torch.Tensor]]:
@@ -56,7 +56,8 @@ def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DI
             action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
             # The vectorized env accepts per-env action payloads.
-            actions = [int(a.item()) for a in action_t.detach().cpu()]
+            # actions = [int(a.item()) for a in action_t.detach().cpu()]
+            actions = action_t.detach().cpu().squeeze()
             next_obs, rewards, dones, infos = env.step(actions)
 
             obs_buf.append(model_obs)
@@ -79,7 +80,7 @@ def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DI
         if (update + 1) % 10 == 0:
             print(f"update={update + 1} loss={float(loss.item()):.4f}")
 
-    return policy
+    return policy, returns, values, loss
 
 
 # --- Accelerated training loop using cached inputs + DataLoader + AMP/compile helpers ---
@@ -142,7 +143,7 @@ jve = JammerVecEnv(
         samples = train_loader,
         model = ac,
         jammer_sampling_freq = float(jammer_sampling_freq),
-        num_envs = 2,
+        num_envs = 1,
         reward_fn = None,
         user_peak_power_fraction= 40.0,
         max_steps = 1,
