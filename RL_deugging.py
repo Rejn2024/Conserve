@@ -14,7 +14,7 @@ from tx_controller_tone_pulse_stft_varlen_3 import ActorCritic, TonePulseTXContr
 class PPOConfig:
     rollout_steps: int = 1#28
     updates: int = 1#00
-    epochs: int = 1
+    epochs: int = 2
     gamma: float = 0.99
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -23,7 +23,9 @@ class PPOConfig:
 ACTION_DIM = 20
 
 
-def obs_to_model_obs(obs: Dict[str, torch.Tensor], jammer_sampling_freq: float, device: str) -> Dict[str, List[torch.Tensor]]:
+def obs_to_model_obs(obs: Dict[str, torch.Tensor],
+                     jammer_sampling_freq: float,
+                     device: str) -> Dict[str, List[torch.Tensor]]:
     """Convert vectorized env IQ observation into the controller-v3 observation payload.
 
     The model now consumes only 2D STFT feature maps and no scalar_side tensor.
@@ -54,9 +56,13 @@ def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
     return max(1, int(np.ceil(len(env.samples) / max(1, env.num_envs))))
 
 
-def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM):
+def train_rl_loop(policy: ActorCritic,
+                  env: JammerVecEnv,
+                  cfg: PPOConfig,
+                  action_dim: int = ACTION_DIM):
+
     device = cfg.device
-    policy = ActorCritic(action_dim=action_dim, in_ch=14, base_ch=24, max_tones=8).to(device)
+
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
 
     obs = env.reset()
@@ -72,22 +78,22 @@ def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DI
         for update in range(total_updates):
             obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
-        for _ in range(cfg.rollout_steps):
-            model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
-            action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
+            for _ in range(cfg.rollout_steps):
+                model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
+                action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
-            # The vectorized env accepts per-env action payloads.
-            # actions = [int(a.item()) for a in action_t.detach().cpu()]
-            actions = action_t.detach().cpu().squeeze()
-            next_obs, rewards, dones, infos = env.step(actions)
+                # The vectorized env accepts per-env action payloads.
+                # actions = [int(a.item()) for a in action_t.detach().cpu()]
+                actions = action_t.detach().cpu().squeeze()
+                next_obs, rewards, dones, infos = env.step(actions)
 
-            obs_buf.append(model_obs)
-            act_buf.append(action_t)
-            val_buf.append(value_t)
-            logp_buf.append(logp_t)
-            rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
+                obs_buf.append(model_obs)
+                act_buf.append(action_t)
+                val_buf.append(value_t)
+                logp_buf.append(logp_t)
+                rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
 
-            obs = next_obs
+                obs = next_obs
 
         # Example placeholder objective using rewards and value baseline.
         returns = torch.stack(rew_buf, dim=0).mean(dim=0)
@@ -98,12 +104,12 @@ def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DI
         loss.backward()
         optimizer.step()
 
-        print(
-            f"epoch={epoch + 1}/{epochs} "
-            f"updates={total_updates} "
-            f"steps_per_epoch={steps_per_epoch} "
-            f"loss={float(loss.item()):.4f}"
-        )
+    print(
+        f"epoch={epoch + 1}/{epochs} "
+        f"updates={total_updates} "
+        f"steps_per_epoch={steps_per_epoch} "
+        f"loss={float(loss.item()):.4f}"
+    )
 
     return policy, returns, values, loss
 
@@ -168,6 +174,7 @@ ac = ActorCritic(
 
 jve = JammerVecEnv(
         samples = train_loader,
+        test_samples = test_loader,
         model = ac,
         jammer_sampling_freq = float(jammer_sampling_freq),
         num_envs = 1,
@@ -177,7 +184,13 @@ jve = JammerVecEnv(
         device = device)
 
 cfg = PPOConfig()
+policy = ActorCritic(action_dim=ACTION_DIM,
+                     in_ch=14,
+                     base_ch=24,
+                     max_tones=8).to(device)
 
-p = train_rl_loop(jve, cfg)
+p = train_rl_loop(jve.model,
+                  jve,
+                  cfg)
 
 print(f'p : {p}')
