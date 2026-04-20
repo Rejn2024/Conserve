@@ -20,6 +20,8 @@ class PPOConfig:
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     tensorboard_log_dir: str = "runs/train_rl_loop"
+    checkpoint_dir: str = "checkpoints_rl"
+    checkpoint_name: str = "best_model.pt"
 
 # Discrete action space size consumed by tx_controller_tone_pulse_stft_varlen_3.ActorCritic
 ACTION_DIM = 20
@@ -58,6 +60,34 @@ def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
     return max(1, int(np.ceil(len(env.samples) / max(1, env.num_envs))))
 
 
+@torch.no_grad()
+def _evaluate_test_loss(policy: ActorCritic, env: JammerVecEnv, cfg: PPOConfig) -> float:
+    """Evaluate a simple validation loss on the env test split.
+
+    Lower is better; defined as negative mean reward so that improving
+    rewards correspond to decreasing loss.
+    """
+    if not getattr(env, "test_samples", None):
+        return float("inf")
+
+    original_mode = env.mode
+    try:
+        env.set_mode("test")
+        obs = env.reset()
+        rew_buf = []
+        eval_steps = max(1, int(cfg.rollout_steps))
+        for _ in range(eval_steps):
+            model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=cfg.device)
+            action_t, _, _ = policy.get_action_value_logp(model_obs)
+            actions = action_t.detach().cpu().squeeze()
+            obs, rewards, _, _ = env.step(actions)
+            rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=cfg.device))
+        mean_reward = torch.stack(rew_buf, dim=0).mean()
+        return float((-mean_reward).item())
+    finally:
+        env.set_mode(original_mode)
+
+
 def train_rl_loop(policy: ActorCritic,
                   env: JammerVecEnv,
                   cfg: PPOConfig,
@@ -76,6 +106,10 @@ def train_rl_loop(policy: ActorCritic,
     loss = torch.tensor(0.0, dtype=torch.float32, device=device)
     global_step = 0
     writer = SummaryWriter(log_dir=cfg.tensorboard_log_dir)
+    checkpoint_dir = Path(cfg.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_checkpoint_path = checkpoint_dir / cfg.checkpoint_name
+    best_test_loss = float("inf")
 
     try:
         for epoch in range(epochs):
@@ -119,11 +153,29 @@ def train_rl_loop(policy: ActorCritic,
                 writer.add_scalar("train/update", update, global_step)
                 global_step += 1
 
+            test_loss = _evaluate_test_loss(policy, env, cfg)
+            writer.add_scalar("test/loss", test_loss, epoch)
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": policy.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "best_test_loss": best_test_loss,
+                        "cfg": cfg.__dict__,
+                    },
+                    best_checkpoint_path,
+                )
+                print(f"Saved improved checkpoint at epoch={epoch + 1} test_loss={test_loss:.6f} -> {best_checkpoint_path}")
+
             print(
                 f"epoch={epoch + 1}/{epochs} "
                 f"updates={total_updates} "
                 f"steps_per_epoch={steps_per_epoch} "
-                f"loss={float(loss.item()):.4f}"
+                f"loss={float(loss.item()):.4f} "
+                f"test_loss={test_loss:.4f} "
+                f"best_test_loss={best_test_loss:.4f}"
             )
     finally:
         writer.close()
