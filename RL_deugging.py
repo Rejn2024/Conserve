@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from pathlib import Path
 import os
+from torch.utils.tensorboard import SummaryWriter
 
 from accelerated_training_utils import JammerVecEnv, build_stft_observation_from_iq_batch
 from tx_controller_tone_pulse_stft_varlen_3 import ActorCritic, TonePulseTXControlNetVarLen, build_controlled_tone_pulse_batch_from_iq_batches
@@ -18,6 +19,7 @@ class PPOConfig:
     gamma: float = 0.99
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    tensorboard_log_dir: str = "runs/train_rl_loop"
 
 # Discrete action space size consumed by tx_controller_tone_pulse_stft_varlen_3.ActorCritic
 ACTION_DIM = 20
@@ -72,43 +74,59 @@ def train_rl_loop(policy: ActorCritic,
     returns = torch.zeros((env.num_envs,), dtype=torch.float32, device=device)
     values = torch.zeros((env.num_envs,), dtype=torch.float32, device=device)
     loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+    global_step = 0
+    writer = SummaryWriter(log_dir=cfg.tensorboard_log_dir)
 
-    for epoch in range(epochs):
-        for update in range(total_updates):
-            obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
+    try:
+        for epoch in range(epochs):
+            for update in range(total_updates):
+                obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
-            for _ in range(cfg.rollout_steps):
-                model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
-                action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
+                for _ in range(cfg.rollout_steps):
+                    model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
+                    action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
-                # The vectorized env accepts per-env action payloads.
-                # actions = [int(a.item()) for a in action_t.detach().cpu()]
-                actions = action_t.detach().cpu().squeeze()
-                next_obs, rewards, dones, infos = env.step(actions)
+                    # The vectorized env accepts per-env action payloads.
+                    # actions = [int(a.item()) for a in action_t.detach().cpu()]
+                    actions = action_t.detach().cpu().squeeze()
+                    next_obs, rewards, dones, infos = env.step(actions)
 
-                obs_buf.append(model_obs)
-                act_buf.append(action_t)
-                val_buf.append(value_t)
-                logp_buf.append(logp_t)
-                rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
+                    obs_buf.append(model_obs)
+                    act_buf.append(action_t)
+                    val_buf.append(value_t)
+                    logp_buf.append(logp_t)
+                    rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
 
-                obs = next_obs
+                    obs = next_obs
 
-        # Example placeholder objective using rewards and value baseline.
-        returns = torch.stack(rew_buf, dim=0).mean(dim=0)
-        values = torch.stack(val_buf, dim=0).mean(dim=0)
-        loss = values.mean()
+                # Example placeholder objective using rewards and value baseline.
+                returns = torch.stack(rew_buf, dim=0).mean(dim=0)
+                values = torch.stack(val_buf, dim=0).mean(dim=0)
+                loss = values.mean()
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
-    print(
-        f"epoch={epoch + 1}/{epochs} "
-        f"updates={total_updates} "
-        f"steps_per_epoch={steps_per_epoch} "
-        f"loss={float(loss.item()):.4f}"
-    )
+                mean_reward = float(returns.mean().item())
+                mean_value = float(values.mean().item())
+                loss_value = float(loss.item())
+
+                writer.add_scalar("train/loss", loss_value, global_step)
+                writer.add_scalar("train/mean_reward", mean_reward, global_step)
+                writer.add_scalar("train/mean_value", mean_value, global_step)
+                writer.add_scalar("train/epoch", epoch, global_step)
+                writer.add_scalar("train/update", update, global_step)
+                global_step += 1
+
+            print(
+                f"epoch={epoch + 1}/{epochs} "
+                f"updates={total_updates} "
+                f"steps_per_epoch={steps_per_epoch} "
+                f"loss={float(loss.item()):.4f}"
+            )
+    finally:
+        writer.close()
 
     return policy, returns, values, loss
 
