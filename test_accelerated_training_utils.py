@@ -395,6 +395,64 @@ def test_jammer_vec_env_accepts_cached_dataloader_batches(monkeypatch):
     assert len(infos) == 2
 
 
+def test_jammer_vec_env_supports_test_loader_mode_switch(monkeypatch):
+    def fake_build(**kwargs):
+        bs = kwargs["rx_iq_batches"][0].shape[0]
+        return [{"tx_iq": torch.ones(20, dtype=torch.complex64), "tx_metadata": {"row": i}} for i in range(bs)]
+
+    monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
+
+    train_rows = [
+        {
+            "sample_name": f"train_{i}",
+            "source_dir": "tmp",
+            "whole_iq": torch.ones(64, dtype=torch.complex64),
+            "whole_meta": {"sample_rate_hz": 1_000_000.0},
+            "whole_sample_rate_hz": 1_000_000.0,
+            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 1),
+            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 2),
+            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 3),
+        }
+        for i in range(4)
+    ]
+    test_rows = [
+        {
+            "sample_name": f"test_{i}",
+            "source_dir": "tmp",
+            "whole_iq": torch.ones(64, dtype=torch.complex64),
+            "whole_meta": {"sample_rate_hz": 1_000_000.0},
+            "whole_sample_rate_hz": 1_000_000.0,
+            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 10),
+            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 11),
+            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 12),
+        }
+        for i in range(2)
+    ]
+    train_loader = torch.utils.data.DataLoader(train_rows, batch_size=2, shuffle=False, collate_fn=atu.collate_cached_iq)
+    test_loader = torch.utils.data.DataLoader(test_rows, batch_size=2, shuffle=False, collate_fn=atu.collate_cached_iq)
+
+    env = atu.JammerVecEnv(
+        samples=train_loader,
+        test_samples=test_loader,
+        model=torch.nn.Identity(),
+        jammer_sampling_freq=2e9,
+        num_envs=2,
+        max_steps=1,
+    )
+
+    train_obs = env.reset()
+    assert torch.allclose(train_obs["iq1"][0], torch.ones(32, dtype=torch.complex64) * 1)
+
+    env.set_mode("test")
+    test_obs = env.reset()
+    assert env.mode == "test"
+    assert torch.allclose(test_obs["iq1"][0], torch.ones(32, dtype=torch.complex64) * 10)
+
+    _, _, _, infos = env.step(actions=[{"seed": 5}] * 2)
+    assert all(info["mode"] == "test" for info in infos)
+    assert all(info["epoch_complete"] for info in infos)
+
+
 def test_default_reward_matches_jammer_loss_decode_term(monkeypatch):
     class FakeLinkModule:
         @staticmethod
