@@ -505,6 +505,11 @@ class JammerVecEnv:
         if num_envs <= 0:
             raise ValueError("num_envs must be positive")
 
+        try:
+            self._source_batches_per_epoch = int(len(samples))  # type: ignore[arg-type]
+        except Exception:
+            self._source_batches_per_epoch = 0
+
         self.samples = self._coerce_samples(samples)
         if not self.samples:
             raise ValueError("samples must be non-empty")
