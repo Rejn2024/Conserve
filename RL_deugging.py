@@ -6,6 +6,13 @@ import numpy as np
 import torch
 from pathlib import Path
 import os
+
+# TensorBoard versions used by torch can reference `np.bool8`, which may be
+# missing on newer NumPy builds. Provide a compatibility alias before
+# importing SummaryWriter.
+if not hasattr(np, "bool8"):
+    np.bool8 = np.bool_
+
 from torch.utils.tensorboard import SummaryWriter
 
 from accelerated_training_utils import JammerVecEnv, build_stft_observation_from_iq_batch
