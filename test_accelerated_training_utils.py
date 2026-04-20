@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -392,3 +393,26 @@ def test_jammer_vec_env_accepts_cached_dataloader_batches(monkeypatch):
     assert rewards.shape == (2,)
     assert all(dones)
     assert len(infos) == 2
+
+
+def test_default_reward_matches_jammer_loss_decode_term(monkeypatch):
+    class FakeLinkModule:
+        @staticmethod
+        def rx_command_iq(_jammed, _meta):
+            return {"message": "ok", "metric_div": 0.3}
+
+    class FakeScoreModule:
+        @staticmethod
+        def score_decode(_rx_result, _meta):
+            return torch.tensor(0.4)
+
+    monkeypatch.setitem(sys.modules, "advanced_link_skdsp_v6_robust", FakeLinkModule)
+    monkeypatch.setitem(sys.modules, "score_iq_decode", FakeScoreModule)
+
+    jam_batch = [{"tx_iq": torch.ones(4, dtype=torch.complex64)}]
+    samples = [{"whole_iq": torch.zeros(4, dtype=torch.complex64), "whole_meta": {"sample_rate_hz": 1.0}}]
+    reward = atu.JammerVecEnv._default_reward(jam_batch, samples)
+
+    # JammerLoss decode term in notebook: score + alpha * metric_div, alpha=10.
+    assert reward.shape == (1,)
+    assert torch.allclose(reward, torch.tensor([3.4], dtype=torch.float32))
