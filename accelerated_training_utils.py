@@ -494,6 +494,7 @@ class JammerVecEnv:
         self,
         *,
         samples: Iterable[Dict[str, Any]],
+        test_samples: Optional[Iterable[Dict[str, Any]]] = None,
         model: torch.nn.Module,
         jammer_sampling_freq: float,
         num_envs: int,
@@ -508,6 +509,7 @@ class JammerVecEnv:
         self.samples = self._coerce_samples(samples)
         if not self.samples:
             raise ValueError("samples must be non-empty")
+        self.test_samples = self._coerce_samples(test_samples) if test_samples is not None else []
         self.model = model
         self.jammer_sampling_freq = float(jammer_sampling_freq)
         self.num_envs = int(num_envs)
@@ -516,9 +518,11 @@ class JammerVecEnv:
         self.reward_fn = reward_fn or self._default_reward
         self.user_peak_power_fraction = user_peak_power_fraction
 
-        self._cursor = 0
+        self._mode = "train"
+        self._cursor = {"train": 0, "test": 0}
         self._step_count = 0
         self._active: List[Dict[str, Any]] = []
+        self._epoch_complete = False
 
     @staticmethod
     def _expand_cached_batch(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -570,11 +574,40 @@ class JammerVecEnv:
                 materialized.append(item)
         return materialized
 
+    def _active_pool(self) -> List[Dict[str, Any]]:
+        if self._mode == "test":
+            if not self.test_samples:
+                raise ValueError("test_samples were not provided")
+            return self.test_samples
+        return self.samples
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in ("train", "test"):
+            raise ValueError("mode must be 'train' or 'test'")
+        if mode == "test" and not self.test_samples:
+            raise ValueError("test_samples were not provided")
+        self._mode = mode
+        self._step_count = 0
+        self._active = []
+        self._epoch_complete = False
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
     def _next_samples(self) -> List[Dict[str, Any]]:
+        pool = self._active_pool()
+        mode = self._mode
+        did_wrap = False
         out: List[Dict[str, Any]] = []
         for _ in range(self.num_envs):
-            out.append(self.samples[self._cursor % len(self.samples)])
-            self._cursor += 1
+            cursor = self._cursor[mode]
+            out.append(pool[cursor % len(pool)])
+            cursor += 1
+            if cursor >= len(pool):
+                did_wrap = True
+            self._cursor[mode] = cursor
+        self._epoch_complete = did_wrap
         return out
 
     @staticmethod
@@ -672,6 +705,8 @@ class JammerVecEnv:
             {
                 "tx_metadata": jam_item.get("tx_metadata", {}),
                 "sample_name": sample.get("sample_name"),
+                "mode": self._mode,
+                "epoch_complete": bool(self._epoch_complete),
             }
             for jam_item, sample in zip(jam_batch, self._active)
         ]
