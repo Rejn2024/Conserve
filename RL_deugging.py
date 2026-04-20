@@ -170,7 +170,7 @@ ac = ActorCritic(
         in_ch = 14,
         base_ch = 24,
         max_tones = 8,
-    )
+    ).to("cuda" if torch.cuda.is_available() else "cpu")
 
 jve = JammerVecEnv(
         samples = train_loader,
