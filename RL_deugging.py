@@ -14,6 +14,7 @@ from tx_controller_tone_pulse_stft_varlen_3 import ActorCritic, TonePulseTXContr
 class PPOConfig:
     rollout_steps: int = 1#28
     updates: int = 2#00
+    epochs: int = 1
     gamma: float = 0.99
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -42,45 +43,74 @@ def sample_actions(model: ActorCritic, model_obs: Dict[str, List[torch.Tensor]])
     return actions, values, logp
 
 
-def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM):
+def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
+    """Infer how many env steps are needed to consume one full cached-loader pass."""
+    if cfg.rollout_steps > 0:
+        return int(cfg.rollout_steps)
+    # When `samples` was provided as a DataLoader, use its batch count if available.
+    if hasattr(env, "_source_batches_per_epoch") and int(env._source_batches_per_epoch) > 0:
+        return int(env._source_batches_per_epoch)
+    # Fallback: consume all flattened rows once.
+    return max(1, int(np.ceil(len(env.samples) / max(1, env.num_envs))))
+
+
+def rain_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM):
     device = cfg.device
     policy = ActorCritic(action_dim=action_dim, in_ch=14, base_ch=24, max_tones=8).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
 
     obs = env.reset()
-    for update in range(cfg.updates):
-        obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
+    steps_per_epoch = _resolve_steps_per_epoch(env, cfg)
+    total_updates = max(1, int(cfg.updates))
+    epochs = max(1, int(cfg.epochs))
 
-        for _ in range(cfg.rollout_steps):
-            model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
-            action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
+    returns = torch.zeros((env.num_envs,), dtype=torch.float32, device=device)
+    values = torch.zeros((env.num_envs,), dtype=torch.float32, device=device)
+    loss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-            # The vectorized env accepts per-env action payloads.
-            # actions = [int(a.item()) for a in action_t.detach().cpu()]
-            actions = action_t.detach().cpu().squeeze()
-            next_obs, rewards, dones, infos = env.step(actions)
+    for epoch in range(epochs):
+        for update in range(total_updates):
+            obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
-            obs_buf.append(model_obs)
-            act_buf.append(action_t)
-            val_buf.append(value_t)
-            logp_buf.append(logp_t)
-            rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
+            for _ in range(steps_per_epoch):
+                model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
+                action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
-            obs = next_obs
+                # The vectorized env accepts per-env action payloads.
+                # actions = [int(a.item()) for a in action_t.detach().cpu()]
+                actions = action_t.detach().cpu().squeeze()
+                next_obs, rewards, dones, infos = env.step(actions)
 
-        # Example placeholder objective using rewards and value baseline.
-        returns = torch.stack(rew_buf, dim=0).mean(dim=0)
-        values = torch.stack(val_buf, dim=0).mean(dim=0)
-        loss = -(returns - values).mean()
+                obs_buf.append(model_obs)
+                act_buf.append(action_t)
+                val_buf.append(value_t)
+                logp_buf.append(logp_t)
+                rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+                obs = next_obs
 
-        if (update + 1) % 10 == 0:
-            print(f"update={update + 1} loss={float(loss.item()):.4f}")
+            # Example placeholder objective using rewards and value baseline.
+            returns = torch.stack(rew_buf, dim=0).mean(dim=0)
+            values = torch.stack(val_buf, dim=0).mean(dim=0)
+            loss = -(returns - values).mean()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        print(
+            f"epoch={epoch + 1}/{epochs} "
+            f"updates={total_updates} "
+            f"steps_per_epoch={steps_per_epoch} "
+            f"loss={float(loss.item()):.4f}"
+        )
 
     return policy, returns, values, loss
+
+
+def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM):
+    """Backward-compatible alias for older notebooks/scripts."""
+    return rain_rl_loop(env=env, cfg=cfg, action_dim=action_dim)
 
 
 # --- Accelerated training loop using cached inputs + DataLoader + AMP/compile helpers ---
@@ -151,6 +181,6 @@ jve = JammerVecEnv(
 
 cfg = PPOConfig()
 
-p = train_rl_loop(jve, cfg)
+p = rain_rl_loop(jve, cfg)
 
 print(f'p : {p}')
