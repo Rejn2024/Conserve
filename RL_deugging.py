@@ -13,7 +13,7 @@ from tx_controller_tone_pulse_stft_varlen_3 import ActorCritic, TonePulseTXContr
 @dataclass
 class PPOConfig:
     rollout_steps: int = 1#28
-    updates: int = 2#00
+    updates: int = 1#00
     epochs: int = 1
     gamma: float = 0.99
     lr: float = 3e-4
@@ -54,7 +54,7 @@ def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
     return max(1, int(np.ceil(len(env.samples) / max(1, env.num_envs))))
 
 
-def rain_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM):
+def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM):
     device = cfg.device
     policy = ActorCritic(action_dim=action_dim, in_ch=14, base_ch=24, max_tones=8).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
@@ -72,31 +72,31 @@ def rain_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM
         for update in range(total_updates):
             obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
-            for _ in range(steps_per_epoch):
-                model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
-                action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
+        for _ in range(cfg.rollout_steps):
+            model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
+            action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
-                # The vectorized env accepts per-env action payloads.
-                # actions = [int(a.item()) for a in action_t.detach().cpu()]
-                actions = action_t.detach().cpu().squeeze()
-                next_obs, rewards, dones, infos = env.step(actions)
+            # The vectorized env accepts per-env action payloads.
+            # actions = [int(a.item()) for a in action_t.detach().cpu()]
+            actions = action_t.detach().cpu().squeeze()
+            next_obs, rewards, dones, infos = env.step(actions)
 
-                obs_buf.append(model_obs)
-                act_buf.append(action_t)
-                val_buf.append(value_t)
-                logp_buf.append(logp_t)
-                rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
+            obs_buf.append(model_obs)
+            act_buf.append(action_t)
+            val_buf.append(value_t)
+            logp_buf.append(logp_t)
+            rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
 
-                obs = next_obs
+            obs = next_obs
 
-            # Example placeholder objective using rewards and value baseline.
-            returns = torch.stack(rew_buf, dim=0).mean(dim=0)
-            values = torch.stack(val_buf, dim=0).mean(dim=0)
-            loss = -(returns - values).mean()
+        # Example placeholder objective using rewards and value baseline.
+        returns = torch.stack(rew_buf, dim=0).mean(dim=0)
+        values = torch.stack(val_buf, dim=0).mean(dim=0)
+        loss = values.mean()
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
         print(
             f"epoch={epoch + 1}/{epochs} "
@@ -106,11 +106,6 @@ def rain_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM
         )
 
     return policy, returns, values, loss
-
-
-def train_rl_loop(env: JammerVecEnv, cfg: PPOConfig, action_dim: int = ACTION_DIM):
-    """Backward-compatible alias for older notebooks/scripts."""
-    return rain_rl_loop(env=env, cfg=cfg, action_dim=action_dim)
 
 
 # --- Accelerated training loop using cached inputs + DataLoader + AMP/compile helpers ---
@@ -142,6 +137,8 @@ precompute_training_cache(test_path_dat, test_cache_dir, jammer_sampling_freq, s
 # 2) DataLoader path with worker prefetch + pinned memory.
 num_workers = 0 if os.name == "nt" else 4
 pin_memory = (device == "cuda")
+
+
 train_loader = create_cached_dataloader(
     train_cache_dir,
     batch_size=batch_size,
@@ -181,6 +178,6 @@ jve = JammerVecEnv(
 
 cfg = PPOConfig()
 
-p = rain_rl_loop(jve, cfg)
+p = train_rl_loop(jve, cfg)
 
 print(f'p : {p}')
