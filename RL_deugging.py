@@ -12,8 +12,8 @@ from tx_controller_tone_pulse_stft_varlen_3 import ActorCritic, TonePulseTXContr
 
 @dataclass
 class PPOConfig:
-    rollout_steps: int = 1#28
-    updates: int = 1#00
+    rollout_steps: int = 1 #28
+    updates: int = None #1#00
     epochs: int = 2
     gamma: float = 0.99
     lr: float = 3e-4
@@ -62,7 +62,6 @@ def train_rl_loop(policy: ActorCritic,
                   action_dim: int = ACTION_DIM):
 
     device = cfg.device
-
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
 
     obs = env.reset()
@@ -125,8 +124,8 @@ from accelerated_training_utils import (
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-epochs = 2
-batch_size = 2
+epochs = 10
+batch_size = 50
 jammer_sampling_freq = 2e9
 
 train_path_dat = Path("C:/Users/theon/Jamming/train_set_00/dataset")

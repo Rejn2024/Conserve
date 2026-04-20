@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
+from pyarrow.lib import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from tx_controller_tone_pulse_stft_varlen_3 import (
@@ -23,10 +24,21 @@ from tx_controller_tone_pulse_stft_varlen_3 import (
     preprocess_batched_iq_to_stft_feature,
 )
 
+import advanced_link_skdsp_v6_robust as link6
+import score_iq_decode as scorer
+
 
 def _to_complex64_tensor(x: Any) -> torch.Tensor:
     return torch.as_tensor(x, dtype=torch.complex64)
 
+def repeat_to_length_mod(arr, target_length):
+    if arr.ndim != 1:
+        raise ValueError("Input tensor must be 1D")
+    if arr.numel() == 0:
+        raise ValueError("Input tensor must not be empty")
+
+    idx = torch.arange(target_length, device=arr.device) % arr.numel()
+    return arr[idx]
 
 def precompute_training_cache(
     dataset_root: Path,
@@ -116,7 +128,9 @@ class CachedIQDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return torch.load(self.records[idx], map_location="cpu", weights_only=False)
+        return torch.load(self.records[idx],
+                          map_location="cpu",
+                          weights_only=False)
 
 
 
@@ -501,7 +515,7 @@ class JammerVecEnv:
         reward_fn: Optional[Callable[[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]], torch.Tensor]] = None,
         max_steps: int = 1,
         user_peak_power_fraction: float = 40.0,
-        device: str = "cpu",
+        device: str = "cuda",
     ):
         if num_envs <= 0:
             raise ValueError("num_envs must be positive")
@@ -615,8 +629,9 @@ class JammerVecEnv:
         self._epoch_complete = did_wrap
         return out
 
-    @staticmethod
-    def _default_reward(jam_batch: Sequence[Dict[str, Any]], samples: Sequence[Dict[str, Any]]) -> torch.Tensor:
+    def _default_reward(self,
+                        jam_batch: Sequence[Dict[str, Any]],
+                        samples: Sequence[Dict[str, Any]]) -> torch.Tensor:
         """Default reward used by PPO loops.
 
         Mirrors the decode-side objective from `JammerLoss` in
@@ -631,38 +646,27 @@ class JammerVecEnv:
         alpha = 10.0
         vals: List[torch.Tensor] = []
 
-        try:
-            import advanced_link_skdsp_v6_robust as link6
-            import score_iq_decode as scorer
-        except Exception:
-            # Preserve historical behavior when decode stack is unavailable.
-            vals = [torch.mean(torch.abs(item["tx_iq"]).float()).detach().cpu() for item in jam_batch]
-            return torch.stack(vals).to(dtype=torch.float32)
-
         for jam_item, sample in zip(jam_batch, samples):
             tx_iq = jam_item["tx_iq"]
             whole_meta = sample.get("whole_meta")
-            whole_iq = sample.get("whole_iq")
+            whole_iq: torch.Tensor = sample.get("whole_iq")
+            jam_iq_rx_resam = link6.resample_iq(tx_iq,
+                                                self.jammer_sampling_freq,
+                                                whole_meta['sample_rate_hz'])
+            jam_iq_rx_resam = repeat_to_length_mod(jam_iq_rx_resam, whole_iq.shape[0])
+            jam_iq_rx_resam_t = torch.as_tensor(jam_iq_rx_resam[:whole_iq.shape[0]],
+                                                dtype=torch.complex64,
+                                                device=self.device)
+            jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
+            rx_result = link6.rx_command_iq(jammed, whole_meta)
 
-            if whole_meta is None or whole_iq is None:
-                vals.append(torch.mean(torch.abs(tx_iq).float()).detach().cpu())
-                continue
+            score = torch.tensor(-1.0, dtype=torch.float32)
+            if rx_result.get("message") is not None:
+                score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 
-            try:
-                jammed = whole_iq + tx_iq
-                rx_result = link6.rx_command_iq(jammed, whole_meta)
+            metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
+            vals.append((score + (alpha * metric_div)).detach().cpu())
 
-                score = torch.tensor(-1.0, dtype=torch.float32)
-                if rx_result.get("message") is not None:
-                    score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
-
-                metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
-                vals.append((score + (alpha * metric_div)).detach().cpu())
-            except Exception:
-                vals.append(torch.mean(torch.abs(tx_iq).float()).detach().cpu())
-
-        if not vals:
-            return torch.empty((0,), dtype=torch.float32)
         return torch.stack(vals).to(dtype=torch.float32)
 
     @staticmethod
