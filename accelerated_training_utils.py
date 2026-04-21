@@ -665,9 +665,9 @@ class JammerVecEnv:
                 score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 
             metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
-            vals.append((score + (alpha * metric_div)).detach().cpu())
+            vals.append((score + (alpha * metric_div)))#.detach().cpu())
 
-        return torch.stack(vals).to(dtype=torch.float32)
+        return torch.stack(vals) #.to(dtype=torch.float32)
 
     @staticmethod
     def _obs_from_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -704,7 +704,7 @@ class JammerVecEnv:
             device=self.device,
         )
         rewards_t = self.reward_fn(jam_batch, self._active)
-        rewards = torch.as_tensor(rewards_t, dtype=torch.float32).cpu().numpy()
+        rewards = torch.as_tensor(rewards_t)#, dtype=torch.float32)#.cpu().numpy()
 
         self._step_count += 1
         done = self._step_count >= self.max_steps

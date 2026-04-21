@@ -15,20 +15,23 @@ if not hasattr(np, "bool8"):
 
 from torch.utils.tensorboard import SummaryWriter
 
-from accelerated_training_utils import JammerVecEnv, build_stft_observation_from_iq_batch
-from tx_controller_tone_pulse_stft_varlen_3 import ActorCritic, TonePulseTXControlNetVarLen, build_controlled_tone_pulse_batch_from_iq_batches
+from accelerated_training_utils import (JammerVecEnv,
+                                        build_stft_observation_from_iq_batch)
+from tx_controller_tone_pulse_stft_varlen_3 import (ActorCritic,
+                                                    TonePulseTXControlNetVarLen,
+                                                    build_controlled_tone_pulse_batch_from_iq_batches)
 
 @dataclass
 class PPOConfig:
-    rollout_steps: int = 1 #28
-    updates: int = None #1#00
-    epochs: int = 2
+    rollout_steps: int = 0 #28
+    updates: int = 0#1#00
+    epochs: int = 25
     gamma: float = 0.99
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    tensorboard_log_dir: str = "runs/train_rl_loop"
-    checkpoint_dir: str = "checkpoints_rl"
-    checkpoint_name: str = "best_model.pt"
+    tensorboard_log_dir: str = "runs/train_rl_loop_01"
+    checkpoint_dir: str = "checkpoints_rl_02"
+    checkpoint_name: str = "best_model_02.pt"
 
 # Discrete action space size consumed by tx_controller_tone_pulse_stft_varlen_3.ActorCritic
 ACTION_DIM = 20
@@ -82,7 +85,7 @@ def _evaluate_test_loss(policy: ActorCritic, env: JammerVecEnv, cfg: PPOConfig) 
         env.set_mode("test")
         obs = env.reset()
         rew_buf = []
-        eval_steps = max(1, int(cfg.rollout_steps))
+        eval_steps = max(1, len(env.test_samples))
         for _ in range(eval_steps):
             model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=cfg.device)
             action_t, _, _ = policy.get_action_value_logp(model_obs)
@@ -123,27 +126,27 @@ def train_rl_loop(policy: ActorCritic,
             for update in range(total_updates):
                 obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
-                for _ in range(cfg.rollout_steps):
+                for _ in range(len(env.samples)):
                     model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
                     action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
                     # The vectorized env accepts per-env action payloads.
                     # actions = [int(a.item()) for a in action_t.detach().cpu()]
-                    actions = action_t.detach().cpu().squeeze()
+                    actions = action_t.squeeze() #.detach().cpu().squeeze()
                     next_obs, rewards, dones, infos = env.step(actions)
 
                     obs_buf.append(model_obs)
                     act_buf.append(action_t)
-                    val_buf.append(value_t)
+                    # val_buf.append(value_t)
                     logp_buf.append(logp_t)
-                    rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
+                    rew_buf.append(rewards)#, dtype=torch.float32, device=device))
 
                     obs = next_obs
 
                 # Example placeholder objective using rewards and value baseline.
                 returns = torch.stack(rew_buf, dim=0).mean(dim=0)
-                values = torch.stack(val_buf, dim=0).mean(dim=0)
-                loss = values.mean()
+                # values = torch.stack(val_buf, dim=0).mean(dim=0)
+                loss = returns
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -154,10 +157,10 @@ def train_rl_loop(policy: ActorCritic,
                 loss_value = float(loss.item())
 
                 writer.add_scalar("train/loss", loss_value, global_step)
-                writer.add_scalar("train/mean_reward", mean_reward, global_step)
-                writer.add_scalar("train/mean_value", mean_value, global_step)
+                # writer.add_scalar("train/mean_reward", mean_reward, global_step)
+                # writer.add_scalar("train/mean_value", mean_value, global_step)
                 writer.add_scalar("train/epoch", epoch, global_step)
-                writer.add_scalar("train/update", update, global_step)
+                # writer.add_scalar("train/update", update, global_step)
                 global_step += 1
 
             test_loss = _evaluate_test_loss(policy, env, cfg)
@@ -201,7 +204,7 @@ from accelerated_training_utils import (
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-epochs = 10
+epochs = 250
 batch_size = 50
 jammer_sampling_freq = 2e9
 
@@ -260,6 +263,7 @@ jve = JammerVecEnv(
         device = device)
 
 cfg = PPOConfig()
+cfg.rollout_steps = jve._source_batches_per_epoch
 policy = ActorCritic(action_dim=ACTION_DIM,
                      in_ch=14,
                      base_ch=24,
