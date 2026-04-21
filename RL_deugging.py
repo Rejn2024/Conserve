@@ -126,7 +126,7 @@ def train_rl_loop(policy: ActorCritic,
             for update in range(total_updates):
                 obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
-                for _ in range(len(env.samples)):
+                for _ in range(steps_per_epoch):
                     model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
                     action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
@@ -139,14 +139,20 @@ def train_rl_loop(policy: ActorCritic,
                     act_buf.append(action_t)
                     # val_buf.append(value_t)
                     logp_buf.append(logp_t)
-                    rew_buf.append(rewards)#, dtype=torch.float32, device=device))
+                    rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
 
                     obs = next_obs
 
-                # Example placeholder objective using rewards and value baseline.
-                returns = torch.stack(rew_buf, dim=0).mean(dim=0)
-                # values = torch.stack(val_buf, dim=0).mean(dim=0)
-                loss = returns
+                # Build a simple REINFORCE-style objective so gradients flow
+                # through log-probabilities (rewards alone are not differentiable).
+                returns = torch.stack(rew_buf, dim=0)
+                logps = torch.stack(logp_buf, dim=0)
+                if logps.ndim > returns.ndim:
+                    logps = logps.squeeze(-1)
+
+                adv = returns - returns.mean()
+                adv = adv / (returns.std(unbiased=False) + 1e-8)
+                loss = -(logps * adv.detach()).mean()
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
