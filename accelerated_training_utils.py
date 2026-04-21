@@ -660,7 +660,7 @@ class JammerVecEnv:
             jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
             rx_result = link6.rx_command_iq(jammed, whole_meta)
 
-            score = torch.tensor(-1.0, dtype=torch.float32)
+            score = torch.tensor(0.0, dtype=torch.float32)
             if rx_result.get("message") is not None:
                 score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 

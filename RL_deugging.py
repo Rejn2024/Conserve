@@ -25,11 +25,11 @@ from tx_controller_tone_pulse_stft_varlen_3 import (ActorCritic,
 class PPOConfig:
     rollout_steps: int = 0 #28
     updates: int = 0#1#00
-    epochs: int = 25
+    epochs: int = 200
     gamma: float = 0.99
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    tensorboard_log_dir: str = "runs/train_rl_loop_01"
+    tensorboard_log_dir: str = "runs/train_rl_loop_02"
     checkpoint_dir: str = "checkpoints_rl_02"
     checkpoint_name: str = "best_model_02.pt"
 
@@ -71,7 +71,9 @@ def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
 
 
 @torch.no_grad()
-def _evaluate_test_loss(policy: ActorCritic, env: JammerVecEnv, cfg: PPOConfig) -> float:
+def _evaluate_test_loss(policy: ActorCritic,
+                        env: JammerVecEnv,
+                        cfg: PPOConfig) -> float:
     """Evaluate a simple validation loss on the env test split.
 
     Lower is better; defined as negative mean reward so that improving
@@ -79,7 +81,7 @@ def _evaluate_test_loss(policy: ActorCritic, env: JammerVecEnv, cfg: PPOConfig) 
     """
     if not getattr(env, "test_samples", None):
         return float("inf")
-
+    obs_buf, act_buf, logp_buf, rew_buf = [], [], [], []
     original_mode = env.mode
     try:
         env.set_mode("test")
@@ -87,13 +89,30 @@ def _evaluate_test_loss(policy: ActorCritic, env: JammerVecEnv, cfg: PPOConfig) 
         rew_buf = []
         eval_steps = max(1, len(env.test_samples))
         for _ in range(eval_steps):
-            model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=cfg.device)
-            action_t, _, _ = policy.get_action_value_logp(model_obs)
-            actions = action_t.detach().cpu().squeeze()
-            obs, rewards, _, _ = env.step(actions)
-            rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=cfg.device))
-        mean_reward = torch.stack(rew_buf, dim=0).mean()
-        return float((-mean_reward).item())
+            model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
+            action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
+
+            # The vectorized env accepts per-env action payloads.
+            # actions = [int(a.item()) for a in action_t.detach().cpu()]
+            actions = action_t.squeeze()  # .detach().cpu().squeeze()
+            next_obs, rewards, dones, infos = env.step(actions)
+
+            obs_buf.append(model_obs)
+            act_buf.append(action_t)
+            # val_buf.append(value_t)
+            logp_buf.append(logp_t)
+            rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
+
+        returns = torch.stack(rew_buf, dim=0)
+        logps = torch.stack(logp_buf, dim=0)
+        if logps.ndim > returns.ndim:
+            logps = logps.squeeze(-1)
+
+        adv = returns - returns.mean()
+        adv = adv / (returns.std(unbiased=False) + 1e-8)
+        loss = -(logps * adv.detach()).mean()
+
+        return float(loss.item())
     finally:
         env.set_mode(original_mode)
 
@@ -126,7 +145,7 @@ def train_rl_loop(policy: ActorCritic,
             for update in range(total_updates):
                 obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
-                for _ in range(steps_per_epoch):
+                for _ in range(len(env.samples)):
                     model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
                     action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
@@ -158,8 +177,8 @@ def train_rl_loop(policy: ActorCritic,
                 loss.backward()
                 optimizer.step()
 
-                mean_reward = float(returns.mean().item())
-                mean_value = float(values.mean().item())
+                # mean_reward = float(returns.mean().item())
+                # mean_value = float(values.mean().item())
                 loss_value = float(loss.item())
 
                 writer.add_scalar("train/loss", loss_value, global_step)
