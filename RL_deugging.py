@@ -1,11 +1,13 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence, Tuple
 import importlib
 import numpy as np
 import torch
 from pathlib import Path
 import os
+import advanced_link_skdsp_v4_robust as link6
+import score_iq_decode as scorer
 
 # TensorBoard versions used by torch can reference `np.bool8`, which may be
 # missing on newer NumPy builds. Provide a compatibility alias before
@@ -16,7 +18,8 @@ if not hasattr(np, "bool8"):
 from torch.utils.tensorboard import SummaryWriter
 
 from accelerated_training_utils import (JammerVecEnv,
-                                        build_stft_observation_from_iq_batch)
+                                        build_stft_observation_from_iq_batch,
+                                        jammer_controller_batch)
 from tx_controller_tone_pulse_stft_varlen_3 import (ActorCritic,
                                                     TonePulseTXControlNetVarLen,
                                                     build_controlled_tone_pulse_batch_from_iq_batches)
@@ -59,6 +62,53 @@ def sample_actions(model: ActorCritic, model_obs: Dict[str, List[torch.Tensor]])
     return actions, values, logp
 
 
+
+
+def _normalize_action_batch(actions: Any, num_envs: int) -> Sequence[Any]:
+    if num_envs == 1 and isinstance(actions, torch.Tensor) and actions.ndim >= 1:
+        return [actions]
+    if num_envs == 1 and isinstance(actions, np.ndarray) and actions.ndim >= 1:
+        return [actions]
+    return actions
+
+
+def _decode_success_count(env: JammerVecEnv,
+                          samples: Sequence[Dict[str, Any]],
+                          actions: Any) -> Tuple[int, int]:
+    action_batch = _normalize_action_batch(actions, env.num_envs)
+    if len(action_batch) != len(samples):
+        return 0, 0
+
+    jam_batch = jammer_controller_batch(
+        model=env.model,
+        samples=samples,
+        actions=action_batch,
+        jammer_sampling_freq=env.jammer_sampling_freq,
+        user_peak_power_fraction=env.user_peak_power_fraction,
+        device=env.device,
+    )
+
+    success = 0
+    total = 0
+    for jam_item, sample in zip(jam_batch, samples):
+        whole_iq = sample.get("whole_iq")
+        whole_meta = sample.get("whole_metadata")
+        if whole_iq is None or whole_meta is None:
+            continue
+
+        jammed = whole_iq.to(env.device) + jam_item["tx_iq"].to(env.device)
+        rx_result = link6.rx_command_iq(jammed, whole_meta)
+
+        score = 0.0
+        if rx_result is not None:
+            score = float(scorer.score_decode(rx_result, whole_meta))
+
+        total += 1
+        if score > 0.0:
+            success += 1
+
+    return success, total
+
 def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
     """Infer how many env steps are needed to consume one full cached-loader pass."""
     if cfg.rollout_steps > 0:
@@ -71,37 +121,38 @@ def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
 
 
 @torch.no_grad()
-def _evaluate_test_loss(policy: ActorCritic,
-                        env: JammerVecEnv,
-                        cfg: PPOConfig) -> float:
-    """Evaluate a simple validation loss on the env test split.
+def _evaluate_split_metrics(policy: ActorCritic,
+                            env: JammerVecEnv,
+                            split: str,
+                            device: str) -> Tuple[float, float]:
+    """Evaluate loss and decode success percentage for the requested split."""
+    split_samples = getattr(env, "test_samples", None) if split == "test" else getattr(env, "samples", None)
+    if not split_samples:
+        return float("inf"), 0.0
 
-    Lower is better; defined as negative mean reward so that improving
-    rewards correspond to decreasing loss.
-    """
-    if not getattr(env, "test_samples", None):
-        return float("inf")
-    obs_buf, act_buf, logp_buf, rew_buf = [], [], [], []
+    logp_buf, rew_buf = [], []
+    decode_successes = 0
+    decode_total = 0
     original_mode = env.mode
     try:
-        env.set_mode("test")
+        env.set_mode(split)
         obs = env.reset()
-        rew_buf = []
-        eval_steps = max(1, len(env.test_samples))
+        eval_steps = max(1, len(split_samples))
         for _ in range(eval_steps):
             model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
             action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
+            actions = action_t.squeeze()
 
-            # The vectorized env accepts per-env action payloads.
-            # actions = [int(a.item()) for a in action_t.detach().cpu()]
-            actions = action_t.squeeze()  # .detach().cpu().squeeze()
+            active_samples = list(env._active)
+            succ, total = _decode_success_count(env, active_samples, actions)
+            decode_successes += succ
+            decode_total += total
+
             next_obs, rewards, dones, infos = env.step(actions)
 
-            obs_buf.append(model_obs)
-            act_buf.append(action_t)
-            # val_buf.append(value_t)
             logp_buf.append(logp_t)
             rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
+            obs = next_obs
 
         returns = torch.stack(rew_buf, dim=0)
         logps = torch.stack(logp_buf, dim=0)
@@ -111,8 +162,9 @@ def _evaluate_test_loss(policy: ActorCritic,
         adv = returns - returns.mean()
         adv = adv / (returns.std(unbiased=False) + 1e-8)
         loss = -(logps * adv.detach()).mean()
+        decode_pct = (100.0 * decode_successes / decode_total) if decode_total else 0.0
 
-        return float(loss.item())
+        return float(loss.item()), float(decode_pct)
     finally:
         env.set_mode(original_mode)
 
@@ -139,9 +191,15 @@ def train_rl_loop(policy: ActorCritic,
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_checkpoint_path = checkpoint_dir / cfg.checkpoint_name
     best_test_loss = float("inf")
+    ema_beta = 0.9
+    ema_train_loss = None
+    ema_test_loss = None
 
     try:
         for epoch in range(epochs):
+            epoch_loss_values: List[float] = []
+            epoch_decode_successes = 0
+            epoch_decode_total = 0
             for update in range(total_updates):
                 obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
 
@@ -152,6 +210,11 @@ def train_rl_loop(policy: ActorCritic,
                     # The vectorized env accepts per-env action payloads.
                     # actions = [int(a.item()) for a in action_t.detach().cpu()]
                     actions = action_t.squeeze() #.detach().cpu().squeeze()
+                    active_samples = list(env._active)
+                    succ, total = _decode_success_count(env, active_samples, actions)
+                    epoch_decode_successes += succ
+                    epoch_decode_total += total
+
                     next_obs, rewards, dones, infos = env.step(actions)
 
                     obs_buf.append(model_obs)
@@ -181,6 +244,7 @@ def train_rl_loop(policy: ActorCritic,
                 # mean_value = float(values.mean().item())
                 loss_value = float(loss.item())
 
+                epoch_loss_values.append(loss_value)
                 writer.add_scalar("train/loss", loss_value, global_step)
                 # writer.add_scalar("train/mean_reward", mean_reward, global_step)
                 # writer.add_scalar("train/mean_value", mean_value, global_step)
@@ -188,8 +252,19 @@ def train_rl_loop(policy: ActorCritic,
                 # writer.add_scalar("train/update", update, global_step)
                 global_step += 1
 
-            test_loss = _evaluate_test_loss(policy, env, cfg)
+            train_loss_epoch = float(np.mean(epoch_loss_values)) if epoch_loss_values else float(loss.item())
+            train_decode_pct = (100.0 * epoch_decode_successes / epoch_decode_total) if epoch_decode_total else 0.0
+            test_loss, test_decode_pct = _evaluate_split_metrics(policy, env, "test", device)
+
+            ema_train_loss = train_loss_epoch if ema_train_loss is None else (ema_beta * ema_train_loss + (1.0 - ema_beta) * train_loss_epoch)
+            ema_test_loss = test_loss if ema_test_loss is None else (ema_beta * ema_test_loss + (1.0 - ema_beta) * test_loss)
+
+            writer.add_scalar("train/loss_epoch", train_loss_epoch, epoch)
+            writer.add_scalar("train/loss_ema", ema_train_loss, epoch)
             writer.add_scalar("test/loss", test_loss, epoch)
+            writer.add_scalar("test/loss_ema", ema_test_loss, epoch)
+            writer.add_scalar("train/decode_success_pct", train_decode_pct, epoch)
+            writer.add_scalar("test/decode_success_pct", test_decode_pct, epoch)
             if test_loss < best_test_loss:
                 best_test_loss = test_loss
                 torch.save(
@@ -209,7 +284,11 @@ def train_rl_loop(policy: ActorCritic,
                 f"updates={total_updates} "
                 f"steps_per_epoch={steps_per_epoch} "
                 f"loss={float(loss.item()):.4f} "
+                f"train_loss_ema={ema_train_loss:.4f} "
                 f"test_loss={test_loss:.4f} "
+                f"test_loss_ema={ema_test_loss:.4f} "
+                f"train_decode_pct={train_decode_pct:.2f} "
+                f"test_decode_pct={test_decode_pct:.2f} "
                 f"best_test_loss={best_test_loss:.4f}"
             )
     finally:
