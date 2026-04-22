@@ -300,21 +300,38 @@ class TonePulseTXControlNetVarLen(nn.Module):
             max_tones: Upper bound on synthesized tone count (also output width for tone amplitudes).
         """
         super().__init__()
-        self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
 
-        self.fusion = nn.Sequential(
-            nn.Linear(self.encoder.feature_dim, 160),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(160, 96),
+        # Four dedicated STFT-ResNet branches, one per output category.
+        self.env_encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
+        self.tone_encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
+        self.pulse_encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
+        self.impairment_encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
+
+        def _make_fusion(in_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(in_dim, 160),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Linear(160, 96),
+                nn.ReLU(inplace=True),
+            )
+
+        self.env_fusion = _make_fusion(self.env_encoder.feature_dim)
+        self.tone_fusion = _make_fusion(self.tone_encoder.feature_dim)
+        self.pulse_fusion = _make_fusion(self.pulse_encoder.feature_dim)
+        self.impairment_fusion = _make_fusion(self.impairment_encoder.feature_dim)
+        self.shared_fusion = nn.Sequential(
+            nn.Linear(96 * 4, 96),
             nn.ReLU(inplace=True),
         )
 
+        # Categorical/channel environment heads.
         self.noise_color_head = nn.Linear(96, len(NOISE_COLORS))
         self.fading_mode_head = nn.Linear(96, len(FADING_MODES))
         self.burst_color_head = nn.Linear(96, len(NOISE_COLORS))
 
+        # Frequency/rate/tone structure heads.
         self.sample_rate_scale_head = nn.Linear(96, 1)
         self.rf_center_delta_head = nn.Linear(96, 1)
         self.carrier_norm_head = nn.Linear(96, 1)
@@ -322,10 +339,14 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.base_tone_norm_head = nn.Linear(96, 1)
         self.tone_spacing_norm_head = nn.Linear(96, 1)
         self.tone_amp_raw_head = nn.Linear(96, max_tones)
+
+        # Pulse timing/envelope heads.
         self.pulse_on_head = nn.Linear(96, 1)
         self.pulse_off_head = nn.Linear(96, 1)
         self.pulse_count_head = nn.Linear(96, 1)
         self.start_offset_head = nn.Linear(96, 1)
+
+        # Impairments/interference heads.
         self.snr_db_head = nn.Linear(96, 1)
         self.freq_offset_head = nn.Linear(96, 1)
         self.timing_offset_head = nn.Linear(96, 1)
@@ -334,6 +355,16 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.burst_prob_head = nn.Linear(96, 1)
         self.burst_power_ratio_head = nn.Linear(96, 1)
 
+    def _encode_branch_features(
+        self,
+        encoder: VarLenSTFTEncoder,
+        fusion: nn.Sequential,
+        stft_feature_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        emb = [encoder(x) for x in stft_feature_list]
+        z_stft = torch.stack(emb, dim=0).mean(dim=0)
+        return fusion(z_stft)
+
     def encode_fused_features(self, stft_feature_list: List[torch.Tensor]) -> torch.Tensor:
         """
         Encode variable-length STFT observations into a shared latent.
@@ -341,34 +372,56 @@ class TonePulseTXControlNetVarLen(nn.Module):
         This method is used by supervised control heads in this class and by the RL ActorCritic
         wrapper so both training modes share the same representation network.
         """
-        emb = [self.encoder(x) for x in stft_feature_list]
-        z_stft = torch.stack(emb, dim=0).mean(dim=0)
-        return self.fusion(z_stft)
+        z_env, z_tone, z_pulse, z_impair = self.encode_category_features(stft_feature_list=stft_feature_list)
+        return self.shared_fusion(torch.cat([z_env, z_tone, z_pulse, z_impair], dim=-1))
+
+    def encode_category_features(self, stft_feature_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        z_env = self._encode_branch_features(
+            encoder=self.env_encoder,
+            fusion=self.env_fusion,
+            stft_feature_list=stft_feature_list,
+        )
+        z_tone = self._encode_branch_features(
+            encoder=self.tone_encoder,
+            fusion=self.tone_fusion,
+            stft_feature_list=stft_feature_list,
+        )
+        z_pulse = self._encode_branch_features(
+            encoder=self.pulse_encoder,
+            fusion=self.pulse_fusion,
+            stft_feature_list=stft_feature_list,
+        )
+        z_impair = self._encode_branch_features(
+            encoder=self.impairment_encoder,
+            fusion=self.impairment_fusion,
+            stft_feature_list=stft_feature_list,
+        )
+        return z_env, z_tone, z_pulse, z_impair
 
     def forward(self, stft_feature_list: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
-        z = self.encode_fused_features(stft_feature_list=stft_feature_list)
+        z_env, z_tone, z_pulse, z_impair = self.encode_category_features(stft_feature_list=stft_feature_list)
         r = {
-            "noise_color_logits": self.noise_color_head(z),
-            "fading_mode_logits": self.fading_mode_head(z),
-            "burst_color_logits": self.burst_color_head(z),
-            "sample_rate_scale": 0.5 + 2.0 * torch.sigmoid(self.sample_rate_scale_head(z)),
-            "rf_center_delta_hz": 500_000.0 * torch.tanh(self.rf_center_delta_head(z)),
-            "carrier_hz_norm": 0.45 * torch.tanh(self.carrier_norm_head(z)),
-            "num_tones_cont": 1.0 + (self.max_tones - 1.0) * torch.sigmoid(self.num_tones_head(z)),
-            "base_tone_norm": 0.45 * torch.tanh(self.base_tone_norm_head(z)),
-            "tone_spacing_norm": 0.20 * torch.sigmoid(self.tone_spacing_norm_head(z)),
-            "tone_amp_raw": self.tone_amp_raw_head(z),
-            "pulse_on_samples": 128.0 + 8192.0 * torch.sigmoid(self.pulse_on_head(z)),
-            "pulse_off_samples": 0.0 + 8192.0 * torch.sigmoid(self.pulse_off_head(z)),
-            "pulse_count": 1.0 + 32.0 * torch.sigmoid(self.pulse_count_head(z)),
-            "start_offset": 0.0 + 4096.0 * torch.sigmoid(self.start_offset_head(z)),
-            "snr_db": 50.0 * torch.sigmoid(self.snr_db_head(z)),
-            "freq_offset": 0.005 * torch.tanh(self.freq_offset_head(z)),
-            "timing_offset": 1.0 + 0.002 * torch.tanh(self.timing_offset_head(z)),
-            "fading_block_len_norm": torch.sigmoid(self.fading_block_head(z)),
-            "rician_k_db": 20.0 * torch.sigmoid(self.rician_k_db_head(z)),
-            "burst_probability": 1e-2 * torch.sigmoid(self.burst_prob_head(z)),
-            "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z)),
+            "noise_color_logits": self.noise_color_head(z_env),
+            "fading_mode_logits": self.fading_mode_head(z_env),
+            "burst_color_logits": self.burst_color_head(z_env),
+            "sample_rate_scale": 0.5 + 2.0 * torch.sigmoid(self.sample_rate_scale_head(z_tone)),
+            "rf_center_delta_hz": 500_000.0 * torch.tanh(self.rf_center_delta_head(z_tone)),
+            "carrier_hz_norm": 0.45 * torch.tanh(self.carrier_norm_head(z_tone)),
+            "num_tones_cont": 1.0 + (self.max_tones - 1.0) * torch.sigmoid(self.num_tones_head(z_tone)),
+            "base_tone_norm": 0.45 * torch.tanh(self.base_tone_norm_head(z_tone)),
+            "tone_spacing_norm": 0.20 * torch.sigmoid(self.tone_spacing_norm_head(z_tone)),
+            "tone_amp_raw": self.tone_amp_raw_head(z_tone),
+            "pulse_on_samples": 128.0 + 8192.0 * torch.sigmoid(self.pulse_on_head(z_pulse)),
+            "pulse_off_samples": 0.0 + 8192.0 * torch.sigmoid(self.pulse_off_head(z_pulse)),
+            "pulse_count": 1.0 + 32.0 * torch.sigmoid(self.pulse_count_head(z_pulse)),
+            "start_offset": 0.0 + 4096.0 * torch.sigmoid(self.start_offset_head(z_pulse)),
+            "snr_db": 50.0 * torch.sigmoid(self.snr_db_head(z_impair)),
+            "freq_offset": 0.005 * torch.tanh(self.freq_offset_head(z_impair)),
+            "timing_offset": 1.0 + 0.002 * torch.tanh(self.timing_offset_head(z_impair)),
+            "fading_block_len_norm": torch.sigmoid(self.fading_block_head(z_impair)),
+            "rician_k_db": 20.0 * torch.sigmoid(self.rician_k_db_head(z_impair)),
+            "burst_probability": 1e-2 * torch.sigmoid(self.burst_prob_head(z_impair)),
+            "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z_impair)),
         }
 
         return r
