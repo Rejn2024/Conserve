@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from pathlib import Path
 import os
-import advanced_link_skdsp_v4_robust as link6
+import advanced_link_skdsp_v6_robust as link6
 import score_iq_decode as scorer
 
 # TensorBoard versions used by torch can reference `np.bool8`, which may be
@@ -32,9 +32,9 @@ class PPOConfig:
     gamma: float = 0.99
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    tensorboard_log_dir: str = "runs/train_rl_loop_04"
-    checkpoint_dir: str = "checkpoints_rl_04"
-    checkpoint_name: str = "best_model_04.pt"
+    tensorboard_log_dir: str = "runs/train_rl_loop_07"
+    checkpoint_dir: str = "checkpoints_rl_07"
+    checkpoint_name: str = "best_model_07.pt"
 
 # Discrete action space size consumed by tx_controller_tone_pulse_stft_varlen_3.ActorCritic
 ACTION_DIM = 20
@@ -143,12 +143,10 @@ def _evaluate_split_metrics(policy: ActorCritic,
             action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
             actions = action_t.squeeze()
 
-            active_samples = list(env._active)
-            succ, total = _decode_success_count(env, active_samples, actions)
-            decode_successes += succ
+            # active_samples = list(env._active)
+            next_obs, rewards, dones, infos, success, total = env.step(actions)
+            decode_successes += success
             decode_total += total
-
-            next_obs, rewards, dones, infos = env.step(actions)
 
             logp_buf.append(logp_t)
             rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
@@ -210,12 +208,11 @@ def train_rl_loop(policy: ActorCritic,
                     # The vectorized env accepts per-env action payloads.
                     # actions = [int(a.item()) for a in action_t.detach().cpu()]
                     actions = action_t.squeeze() #.detach().cpu().squeeze()
-                    active_samples = list(env._active)
-                    succ, total = _decode_success_count(env, active_samples, actions)
-                    epoch_decode_successes += succ
-                    epoch_decode_total += total
+                    # active_samples = list(env._active)
 
-                    next_obs, rewards, dones, infos = env.step(actions)
+                    next_obs, rewards, dones, infos, success, total = env.step(actions)
+                    epoch_decode_successes += success
+                    epoch_decode_total += total
 
                     obs_buf.append(model_obs)
                     act_buf.append(action_t)
@@ -245,11 +242,11 @@ def train_rl_loop(policy: ActorCritic,
                 loss_value = float(loss.item())
 
                 epoch_loss_values.append(loss_value)
-                writer.add_scalar("train/loss", loss_value, global_step)
-                # writer.add_scalar("train/mean_reward", mean_reward, global_step)
-                # writer.add_scalar("train/mean_value", mean_value, global_step)
-                writer.add_scalar("train/epoch", epoch, global_step)
-                # writer.add_scalar("train/update", update, global_step)
+                # writer.add_scalar("train/loss", loss_value, global_step)
+                # # writer.add_scalar("train/mean_reward", mean_reward, global_step)
+                # # writer.add_scalar("train/mean_value", mean_value, global_step)
+                # writer.add_scalar("train/epoch", epoch, global_step)
+                # # writer.add_scalar("train/update", update, global_step)
                 global_step += 1
 
             train_loss_epoch = float(np.mean(epoch_loss_values)) if epoch_loss_values else float(loss.item())
@@ -261,7 +258,7 @@ def train_rl_loop(policy: ActorCritic,
 
             writer.add_scalar("train/loss_epoch", train_loss_epoch, epoch)
             writer.add_scalar("train/loss_ema", ema_train_loss, epoch)
-            writer.add_scalar("test/loss", test_loss, epoch)
+            writer.add_scalar("test/loss_epoch", test_loss, epoch)
             writer.add_scalar("test/loss_ema", ema_test_loss, epoch)
             writer.add_scalar("train/decode_success_pct", train_decode_pct, epoch)
             writer.add_scalar("test/decode_success_pct", test_decode_pct, epoch)
@@ -362,7 +359,7 @@ jve = JammerVecEnv(
         jammer_sampling_freq = float(jammer_sampling_freq),
         num_envs = 1,
         reward_fn = None,
-        user_peak_power_fraction= 40.0,
+        user_peak_power_fraction= 1.0,
         max_steps = 1,
         device = device)
 

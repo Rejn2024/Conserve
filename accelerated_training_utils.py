@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -631,7 +631,7 @@ class JammerVecEnv:
 
     def _default_reward(self,
                         jam_batch: Sequence[Dict[str, Any]],
-                        samples: Sequence[Dict[str, Any]]) -> torch.Tensor:
+                        samples: Sequence[Dict[str, Any]]) -> Tuple[torch.Tensor, int, int]:
         """Default reward used by PPO loops.
 
         Mirrors the decode-side objective from `JammerLoss` in
@@ -645,6 +645,9 @@ class JammerVecEnv:
 
         alpha = 10.0
         vals: List[torch.Tensor] = []
+
+        success = 0
+        total = 0
 
         for jam_item, sample in zip(jam_batch, samples):
             tx_iq = jam_item["tx_iq"]
@@ -661,13 +664,21 @@ class JammerVecEnv:
             rx_result = link6.rx_command_iq(jammed, whole_meta)
 
             score = torch.tensor(0.0, dtype=torch.float32)
+            total += 1
+
             if rx_result.get("message") is not None:
                 score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 
-            metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
-            vals.append((score + (alpha * metric_div)))#.detach().cpu())
+                if score > 0.0:
+                    success += 1
 
-        return torch.stack(vals) #.to(dtype=torch.float32)
+                metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
+                score = score + (alpha * metric_div)
+
+
+            vals.append(score)#.detach().cpu())
+
+        return torch.stack(vals), success, total #.to(dtype=torch.float32)
 
     @staticmethod
     def _obs_from_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -703,7 +714,7 @@ class JammerVecEnv:
             user_peak_power_fraction = self.user_peak_power_fraction,
             device=self.device,
         )
-        rewards_t = self.reward_fn(jam_batch, self._active)
+        rewards_t, success, total = self.reward_fn(jam_batch, self._active)
         rewards = torch.as_tensor(rewards_t)#, dtype=torch.float32)#.cpu().numpy()
 
         self._step_count += 1
@@ -727,7 +738,7 @@ class JammerVecEnv:
         else:
             next_obs = self._obs_from_samples(self._active)
 
-        return next_obs, rewards, dones, infos
+        return next_obs, rewards, dones, infos, success, total
 
 
 def run_epoch_cached(
