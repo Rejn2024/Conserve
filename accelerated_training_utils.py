@@ -643,7 +643,7 @@ class JammerVecEnv:
         cheap energy proxy for that row.
         """
 
-        alpha = 10.0
+        # alpha = 10.0
         vals: List[torch.Tensor] = []
 
         success = 0
@@ -672,8 +672,8 @@ class JammerVecEnv:
                 if score > 0.0:
                     success += 1
 
-                metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
-                score = score + (alpha * metric_div)
+                # metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
+                # score = score + (alpha * metric_div)
 
 
             vals.append(score)#.detach().cpu())

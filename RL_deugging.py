@@ -32,9 +32,9 @@ class PPOConfig:
     gamma: float = 0.99
     lr: float = 3e-4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    tensorboard_log_dir: str = "runs/train_rl_loop_07"
-    checkpoint_dir: str = "checkpoints_rl_07"
-    checkpoint_name: str = "best_model_07.pt"
+    tensorboard_log_dir: str = "runs/train_rl_loop_08"
+    checkpoint_dir: str = "checkpoints_rl_08"
+    checkpoint_name: str = "best_model_08.pt"
 
 # Discrete action space size consumed by tx_controller_tone_pulse_stft_varlen_3.ActorCritic
 ACTION_DIM = 20
