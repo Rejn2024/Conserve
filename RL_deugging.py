@@ -27,15 +27,15 @@ from tx_controller_tone_pulse_stft_varlen_3 import (ActorCritic,
 @dataclass
 class PPOConfig:
     rollout_steps: int = 0 #28
-    updates: int = 0#1#00
+    updates: int = 6#1#00
     epochs: int = 50
     gamma: float = 0.99
     lr: float = 3e-4
     value_coef: float = 0.5
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    tensorboard_log_dir: str = "runs/train_rl_loop_09"
-    checkpoint_dir: str = "checkpoints_rl_09"
-    checkpoint_name: str = "best_model_09.pt"
+    tensorboard_log_dir: str = "runs/train_rl_loop_10"
+    checkpoint_dir: str = "checkpoints_rl_10"
+    checkpoint_name: str = "best_model_10.pt"
 
 
 # Discrete action space size consumed by tx_controller_tone_pulse_stft_varlen_3.ActorCritic
