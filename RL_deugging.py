@@ -208,9 +208,11 @@ def train_rl_loop(policy: ActorCritic,
             epoch_decode_successes = 0
             epoch_decode_total = 0
             for update in range(total_updates):
-                obs_buf, act_buf, val_buf, logp_buf, rew_buf = [], [], [], [], []
+                val_buf, logp_buf, rew_buf = [], [], []
 
-                for _ in range(len(env.samples)):
+                # Use the resolved per-epoch step count so DataLoader-backed sources
+                # iterate by cached-batch count instead of flattened sample count.
+                for _ in range(steps_per_epoch):
                     model_obs = obs_to_model_obs(obs, env.jammer_sampling_freq, device=device)
                     action_t, value_t, logp_t = policy.get_action_value_logp(model_obs)
 
@@ -223,8 +225,6 @@ def train_rl_loop(policy: ActorCritic,
                     epoch_decode_successes += success
                     epoch_decode_total += total
 
-                    obs_buf.append(model_obs)
-                    act_buf.append(action_t)
                     val_buf.append(value_t)
                     logp_buf.append(logp_t)
                     rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
