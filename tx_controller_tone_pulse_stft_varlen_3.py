@@ -455,7 +455,8 @@ class ActorCritic(nn.Module):
             raise ValueError("action_dim must be positive")
 
         self._action_std_floor = 1e-4
-        self.log_std = nn.Parameter(torch.full((self.action_dim,), math.log(max(action_std_init, self._action_std_floor))))
+        self._init_log_std = math.log(max(action_std_init, self._action_std_floor))
+        self.log_std_head = nn.Linear(96, self.action_dim)
         self.value_head = nn.Linear(96, 1)
 
     def _encode(self, stft_feature_list: List[torch.Tensor]) -> torch.Tensor:
@@ -497,12 +498,20 @@ class ActorCritic(nn.Module):
             )
         return action_mean
 
-    def forward(self, stft_feature_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        action_mean = self._continuous_action_mean(stft_feature_list=stft_feature_list)
-        value = self.value_head(self._encode(stft_feature_list=stft_feature_list)).squeeze(-1)
-        return action_mean, value
+    def _log_std_from_features(self, fused_features: torch.Tensor) -> torch.Tensor:
+        # Keep per-action std positive and numerically stable while allowing
+        # input-conditioned exploration from STFT features.
+        raw = self.log_std_head(fused_features)
+        return self._init_log_std + torch.tanh(raw)
 
-    def forward_observation(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, stft_feature_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action_mean = self._continuous_action_mean(stft_feature_list=stft_feature_list)
+        fused = self._encode(stft_feature_list=stft_feature_list)
+        value = self.value_head(fused).squeeze(-1)
+        log_std = self._log_std_from_features(fused)
+        return action_mean, value, log_std
+
+    def forward_observation(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Convenience wrapper for notebook-style observations.
 
@@ -513,9 +522,8 @@ class ActorCritic(nn.Module):
             stft_feature_list=observation["stft_feature_list"],
         )
 
-    def _action_distribution(self, action_mean: torch.Tensor) -> torch.distributions.Normal:
-        std = torch.exp(self.log_std).clamp_min(self._action_std_floor)
-        std = std.view(1, -1).expand_as(action_mean)
+    def _action_distribution(self, action_mean: torch.Tensor, log_std: torch.Tensor) -> torch.distributions.Normal:
+        std = torch.exp(log_std).clamp_min(self._action_std_floor)
         return torch.distributions.Normal(loc=action_mean, scale=std)
 
     def act(
@@ -523,8 +531,8 @@ class ActorCritic(nn.Module):
         stft_feature_list: List[torch.Tensor],
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, value = self.forward(stft_feature_list=stft_feature_list)
-        dist = self._action_distribution(action_mean=action_mean)
+        action_mean, value, log_std = self.forward(stft_feature_list=stft_feature_list)
+        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
         action = action_mean if deterministic else dist.rsample()
         log_prob = dist.log_prob(action).sum(dim=-1)
         return action, log_prob, value
@@ -534,8 +542,8 @@ class ActorCritic(nn.Module):
         stft_feature_list: List[torch.Tensor],
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, value = self.forward(stft_feature_list=stft_feature_list)
-        dist = self._action_distribution(action_mean=action_mean)
+        action_mean, value, log_std = self.forward(stft_feature_list=stft_feature_list)
+        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
         log_prob = dist.log_prob(actions).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
         return log_prob, entropy, value
@@ -559,8 +567,8 @@ class ActorCritic(nn.Module):
         Returns:
             Tuple of (action, value, log_prob) with action shaped [B, action_dim].
         """
-        action_mean, value = self.forward_observation(observation)
-        dist = self._action_distribution(action_mean=action_mean)
+        action_mean, value, log_std = self.forward_observation(observation)
+        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
         if action is None:
             action = action_mean if deterministic else dist.rsample()
         log_prob = dist.log_prob(action).sum(dim=-1)
