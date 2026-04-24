@@ -31,6 +31,7 @@ class PPOConfig:
     epochs: int = 50
     gamma: float = 0.99
     lr: float = 3e-4
+    value_coef: float = 0.5
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     tensorboard_log_dir: str = "runs/train_rl_loop_09"
     checkpoint_dir: str = "checkpoints_rl_09"
@@ -125,13 +126,14 @@ def _resolve_steps_per_epoch(env: JammerVecEnv, cfg: PPOConfig) -> int:
 def _evaluate_split_metrics(policy: ActorCritic,
                             env: JammerVecEnv,
                             split: str,
-                            device: str) -> Tuple[float, float]:
+                            device: str,
+                            value_coef: float = 0.5) -> Tuple[float, float]:
     """Evaluate loss and decode success percentage for the requested split."""
     split_samples = getattr(env, "test_samples", None) if split == "test" else getattr(env, "samples", None)
     if not split_samples:
         return float("inf"), 0.0
 
-    logp_buf, rew_buf = [], []
+    logp_buf, rew_buf, val_buf = [], [], []
     decode_successes = 0
     decode_total = 0
     original_mode = env.mode
@@ -150,17 +152,23 @@ def _evaluate_split_metrics(policy: ActorCritic,
             decode_total += total
 
             logp_buf.append(logp_t)
+            val_buf.append(value_t)
             rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
             obs = next_obs
 
         returns = torch.stack(rew_buf, dim=0)
+        values = torch.stack(val_buf, dim=0)
         logps = torch.stack(logp_buf, dim=0)
         if logps.ndim > returns.ndim:
             logps = logps.squeeze(-1)
+        if values.ndim > returns.ndim:
+            values = values.squeeze(-1)
 
-        adv = returns - returns.mean()
+        adv = returns - values.detach()
         adv = adv / (returns.std(unbiased=False) + 1e-8)
-        loss = -(logps * adv.detach()).mean()
+        policy_loss = -(logps * adv.detach()).mean()
+        critic_loss = torch.nn.functional.mse_loss(values, returns)
+        loss = policy_loss + value_coef * critic_loss
         decode_pct = (100.0 * decode_successes / decode_total) if decode_total else 0.0
 
         return float(loss.item()), float(decode_pct)
@@ -217,22 +225,25 @@ def train_rl_loop(policy: ActorCritic,
 
                     obs_buf.append(model_obs)
                     act_buf.append(action_t)
-                    # val_buf.append(value_t)
+                    val_buf.append(value_t)
                     logp_buf.append(logp_t)
                     rew_buf.append(torch.as_tensor(rewards, dtype=torch.float32, device=device))
 
                     obs = next_obs
 
-                # Build a simple REINFORCE-style objective so gradients flow
-                # through log-probabilities (rewards alone are not differentiable).
                 returns = torch.stack(rew_buf, dim=0)
+                values = torch.stack(val_buf, dim=0)
                 logps = torch.stack(logp_buf, dim=0)
                 if logps.ndim > returns.ndim:
                     logps = logps.squeeze(-1)
+                if values.ndim > returns.ndim:
+                    values = values.squeeze(-1)
 
-                adv = returns - returns.mean()
+                adv = returns - values.detach()
                 adv = adv / (returns.std(unbiased=False) + 1e-8)
-                loss = -(logps * adv.detach()).mean()
+                policy_loss = -(logps * adv.detach()).mean()
+                critic_loss = torch.nn.functional.mse_loss(values, returns)
+                loss = policy_loss + cfg.value_coef * critic_loss
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -252,7 +263,7 @@ def train_rl_loop(policy: ActorCritic,
 
             train_loss_epoch = float(np.mean(epoch_loss_values)) if epoch_loss_values else float(loss.item())
             train_decode_pct = (100.0 * epoch_decode_successes / epoch_decode_total) if epoch_decode_total else 0.0
-            test_loss, test_decode_pct = _evaluate_split_metrics(policy, env, "test", device)
+            test_loss, test_decode_pct = _evaluate_split_metrics(policy, env, "test", device, cfg.value_coef)
 
             ema_train_loss = train_loss_epoch if ema_train_loss is None else (ema_beta * ema_train_loss + (1.0 - ema_beta) * train_loss_epoch)
             ema_test_loss = test_loss if ema_test_loss is None else (ema_beta * ema_test_loss + (1.0 - ema_beta) * test_loss)
