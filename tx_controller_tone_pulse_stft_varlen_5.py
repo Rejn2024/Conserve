@@ -410,9 +410,22 @@ class ActorCritic(nn.Module):
         return action_mean, value, log_std
 
     def forward_observation(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        scalar_side = observation.get("scalar_side")
+        if scalar_side is None:
+            stft_list = observation["stft_feature_list"]
+            if not stft_list:
+                raise ValueError("observation['stft_feature_list'] must contain at least one tensor")
+            ref = stft_list[0]
+            n_scalar_features = self.backbone.scalar_proj[0].in_features
+            scalar_side = torch.zeros(
+                ref.shape[0],
+                n_scalar_features,
+                dtype=ref.dtype,
+                device=ref.device,
+            )
         return self.forward(
             stft_feature_list=observation["stft_feature_list"],
-            scalar_side=observation["scalar_side"],
+            scalar_side=scalar_side,
         )
 
     def _action_distribution(self, action_mean: torch.Tensor, log_std: torch.Tensor) -> torch.distributions.Normal:
