@@ -427,7 +427,7 @@ def jammer_controller(
         intake_sample_rate_hz=jammer_sampling_freq,
         desired_output_iq_len=desired_output_iq_len,
         user_peak_power_fraction=user_peak_power_fraction,
-        action_overrides=[action_overrides if action_overrides else None],
+        # action_overrides=[action_overrides if action_overrides else None],
         seed=seed,
         device=device,
     )
@@ -495,7 +495,7 @@ def jammer_controller_batch(
         intake_sample_rate_hz=jammer_sampling_freq,
         desired_output_iq_len=desired_output_iq_len,
         user_peak_power_fraction=user_peak_power_fraction,
-        action_overrides=action_overrides,
+        # action_overrides=action_overrides,
         seed=seed,
         device=device,
     )
