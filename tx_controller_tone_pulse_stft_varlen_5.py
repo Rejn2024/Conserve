@@ -6,8 +6,9 @@ with variable-length IQ inputs.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -312,6 +313,148 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "burst_probability": 1e-2 * torch.sigmoid(self.burst_prob_head(z)),
             "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z)),
         }
+
+
+class ActorCritic(nn.Module):
+    """
+    RL-friendly Actor-Critic model that reuses the TonePulseTXControlNetVarLen shared network.
+
+    The backbone is exactly the variable-length STFT encoder + scalar fusion stack used by
+    TonePulseTXControlNetVarLen. The actor/critic heads expose the typical interfaces used by
+    policy-gradient / PPO style loops in RL notebooks.
+    """
+
+    def __init__(
+        self,
+        action_dim: Optional[int] = None,
+        in_ch: int = 4,
+        base_ch: int = 24,
+        n_scalar_features: int = 6,
+        max_tones: int = 8,
+        action_std_init: float = 0.25,
+    ):
+        super().__init__()
+        self.backbone = TonePulseTXControlNetVarLen(
+            in_ch=in_ch,
+            base_ch=base_ch,
+            n_scalar_features=n_scalar_features,
+            max_tones=max_tones,
+        )
+        self.max_tones = max_tones
+        self.action_dim = int(action_dim) if action_dim is not None else (9 + 3 * int(max_tones))
+        if self.action_dim <= 0:
+            raise ValueError("action_dim must be positive")
+
+        self._action_std_floor = 1e-4
+        self._init_log_std = math.log(max(action_std_init, self._action_std_floor))
+        self.log_std_head = nn.Linear(96, self.action_dim)
+        self.value_head = nn.Linear(96, 1)
+
+    def _encode(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+    ) -> torch.Tensor:
+        emb = [self.backbone.encoder(x) for x in stft_feature_list]
+        z_stft = torch.stack(emb, dim=0).mean(dim=0)
+        z = torch.cat([z_stft, self.backbone.scalar_proj(scalar_side)], dim=-1)
+        return self.backbone.fusion(z)
+
+    def _continuous_action_mean(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+    ) -> torch.Tensor:
+        y = self.backbone(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+
+        def _expected_index(logits: torch.Tensor) -> torch.Tensor:
+            probs = torch.softmax(logits, dim=-1)
+            idx = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype)
+            return (probs * idx).sum(dim=-1, keepdim=True)
+
+        pieces = [
+            _expected_index(y["noise_color_logits"]),
+            _expected_index(y["fading_mode_logits"]),
+            y["rf_center_delta_hz"],
+            y["carrier_hz_norm"],
+            y["num_tones_cont"],
+            y["tone_freq_mean_norms"],
+            y["tone_freq_std_norms"],
+            y["tone_power_logits"],
+            y["pulse_on_samples"],
+            y["pulse_off_samples"],
+            y["pulse_count"],
+            y["start_offset"],
+        ]
+        action_mean = torch.cat(pieces, dim=-1)
+        if action_mean.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Action mean width {action_mean.shape[-1]} does not match action_dim {self.action_dim}. "
+                "Set action_dim to 9 + 3*max_tones (default) or a matching custom width."
+            )
+        return action_mean
+
+    def _log_std_from_features(self, fused_features: torch.Tensor) -> torch.Tensor:
+        raw = self.log_std_head(fused_features)
+        return self._init_log_std + torch.tanh(raw)
+
+    def forward(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action_mean = self._continuous_action_mean(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        fused = self._encode(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        value = self.value_head(fused).squeeze(-1)
+        log_std = self._log_std_from_features(fused)
+        return action_mean, value, log_std
+
+    def forward_observation(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.forward(
+            stft_feature_list=observation["stft_feature_list"],
+            scalar_side=observation["scalar_side"],
+        )
+
+    def _action_distribution(self, action_mean: torch.Tensor, log_std: torch.Tensor) -> torch.distributions.Normal:
+        std = torch.exp(log_std).clamp_min(self._action_std_floor)
+        return torch.distributions.Normal(loc=action_mean, scale=std)
+
+    def act(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action_mean, value, log_std = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
+        action = action_mean if deterministic else dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        return action, log_prob, value
+
+    def evaluate_actions(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action_mean, value, log_std = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
+        log_prob = dist.log_prob(actions).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+        return log_prob, entropy, value
+
+    def get_action_value_logp(
+        self,
+        observation: Dict[str, torch.Tensor],
+        action: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action_mean, value, log_std = self.forward_observation(observation)
+        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
+        if action is None:
+            action = action_mean if deterministic else dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        return action, value, log_prob
 
 
 def _nearest_block_len(x_norm: float) -> int:
