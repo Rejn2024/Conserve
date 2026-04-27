@@ -43,6 +43,31 @@ def robust_mad_scale(x: Union[torch.Tensor, List[complex]], eps: float = 1e-12) 
     return (xt / sigma).to(dtype=torch.complex64)
 
 
+def _torch_unwrap(x: torch.Tensor, dim: int = -1, period: float = 2 * torch.pi) -> torch.Tensor:
+    """Compatibility shim for torch versions without torch.unwrap."""
+    if hasattr(torch, "unwrap"):
+        return torch.unwrap(x, dim=dim)  # type: ignore[attr-defined]
+
+    if x.numel() == 0:
+        return x
+
+    dd = torch.diff(x, dim=dim)
+    half_period = period / 2
+    ddmod = torch.remainder(dd + half_period, period) - half_period
+    boundary = (ddmod == -half_period) & (dd > 0)
+    ddmod = torch.where(boundary, torch.full_like(ddmod, half_period), ddmod)
+    ph_correct = ddmod - dd
+    ph_correct = torch.where(torch.abs(dd) < half_period, torch.zeros_like(ph_correct), ph_correct)
+
+    csum = torch.cumsum(ph_correct, dim=dim)
+    head = torch.index_select(
+        x,
+        dim=dim,
+        index=torch.tensor([0], device=x.device),
+    )
+    return torch.cat([head, x.narrow(dim, 1, x.shape[dim] - 1) + csum], dim=dim)
+
+
 
 
 def _as_batch_complex_tensor(iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]) -> torch.Tensor:
@@ -134,10 +159,35 @@ def preprocess_iq_to_stft_feature(
 
     mag = torch.log1p(torch.abs(Z)).to(dtype=torch.float32)
     phase = torch.angle(Z).to(dtype=torch.float32)
+    real = Z.real.to(dtype=torch.float32)
+    imag = Z.imag.to(dtype=torch.float32)
     power = (torch.abs(Z) ** 2).to(dtype=torch.float32)
+    power_log = torch.log1p(power)
     denom = torch.sum(power, dim=0, keepdim=True) + 1e-12
     centroid = torch.sum(f[:, None] * power, dim=0, keepdim=True) / denom
     centroid_plane = centroid.repeat(mag.shape[0], 1).to(dtype=torch.float32)
+    spread = torch.sqrt(torch.sum(((f[:, None] - centroid) ** 2) * power, dim=0, keepdim=True) / denom + 1e-12)
+    spread_plane = (spread / max(sample_rate_hz, 1.0)).repeat(mag.shape[0], 1).to(dtype=torch.float32)
+
+    # Spectral flatness per frame: geometric mean / arithmetic mean over frequency.
+    power_pos = torch.clamp(power, min=1e-12)
+    log_geom = torch.mean(torch.log(power_pos), dim=0, keepdim=True)
+    geom = torch.exp(log_geom)
+    arith = torch.mean(power_pos, dim=0, keepdim=True) + 1e-12
+    flatness = (geom / arith).to(dtype=torch.float32)
+    flatness_plane = flatness.repeat(mag.shape[0], 1)
+
+    # Frame power normalized by average frame power to capture temporal power dynamics.
+    frame_power = torch.mean(power, dim=0, keepdim=True)
+    frame_power_norm = (frame_power / (torch.mean(frame_power) + 1e-12)).to(dtype=torch.float32)
+    frame_power_plane = frame_power_norm.repeat(mag.shape[0], 1)
+
+    # Delta features (temporal and frequency derivatives).
+    delta_t_mag = torch.diff(mag, dim=1, prepend=mag[:, :1])
+    delta_f_mag = torch.diff(mag, dim=0, prepend=mag[:1, :])
+    delta_t_power = torch.diff(power_log, dim=1, prepend=power_log[:, :1])
+    phase_unwrapped_t = _torch_unwrap(phase, dim=1)
+    delta_t_phase = torch.diff(phase_unwrapped_t, dim=1, prepend=phase_unwrapped_t[:, :1])
 
     feat = torch.stack(
         [
@@ -145,6 +195,16 @@ def preprocess_iq_to_stft_feature(
             phase,
             centroid_plane / max(sample_rate_hz, 1.0),
             torch.full_like(mag, torch.log10(torch.tensor(max(sample_rate_hz, 1.0), device=mag.device)) / 10.0),
+            real,
+            imag,
+            power_log,
+            delta_t_mag,
+            delta_f_mag,
+            delta_t_phase,
+            delta_t_power,
+            spread_plane,
+            flatness_plane,
+            frame_power_plane,
         ],
         dim=0,
     )
@@ -209,7 +269,7 @@ class ResidualBlock2D(nn.Module):
 class VarLenSTFTEncoder(nn.Module):
     """Encodes one variable-size [B,C,F,T] STFT map into [B,D]."""
 
-    def __init__(self, in_ch: int = 4, base_ch: int = 24):
+    def __init__(self, in_ch: int = 14, base_ch: int = 24):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, base_ch, 5, stride=2, padding=2, bias=False),
@@ -233,7 +293,7 @@ class VarLenSTFTEncoder(nn.Module):
 class TonePulseTXControlNetVarLen(nn.Module):
     """Shared STFT encoder over a variable-length list of IQ windows."""
 
-    def __init__(self, in_ch: int = 4, base_ch: int = 24, n_scalar_features: int = 6, max_tones: int = 8):
+    def __init__(self, in_ch: int = 14, base_ch: int = 24, n_scalar_features: int = 6, max_tones: int = 8):
         """
         Args:
             in_ch: Number of channels per STFT input map [B, C, F, T].
@@ -327,7 +387,7 @@ class ActorCritic(nn.Module):
     def __init__(
         self,
         action_dim: Optional[int] = None,
-        in_ch: int = 4,
+        in_ch: int = 14,
         base_ch: int = 24,
         n_scalar_features: int = 6,
         max_tones: int = 8,
