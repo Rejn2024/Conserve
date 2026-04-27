@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import advanced_link_skdsp_v6_robust as txflex
+import advanced_link_skdsp_v7_robust as txflex
 
 
 NOISE_COLORS = ["white", "pink", "brown", "blue", "violet"]
