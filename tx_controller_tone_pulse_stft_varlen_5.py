@@ -360,6 +360,9 @@ class TonePulseTXControlNetVarLen(nn.Module):
                 [0.20 * torch.sigmoid(h(z)) for h in self.tone_freq_std_norm_heads],
                 dim=1,
             ),
+            # Keep a raw per-tone amplitude control (varlen_4 style).
+            # `tone_power_logits` is retained as a compatibility alias for existing RL wiring.
+            "tone_amp_raw": torch.cat([h(z) for h in self.tone_power_raw_heads], dim=1),
             "tone_power_logits": torch.cat([h(z) for h in self.tone_power_raw_heads], dim=1),
             "pulse_on_samples": 128.0 + 8192.0 * torch.sigmoid(self.pulse_on_head(z)),
             "pulse_off_samples": 0.0 + 8192.0 * torch.sigmoid(self.pulse_off_head(z)),
@@ -573,9 +576,9 @@ def decode_tone_pulse_config(
         for mu_f in tone_freq_means_hz
     ]
 
-    tone_power_logits = model_out["tone_power_logits"].detach().reshape(-1)[:num_tones]
-    tone_power_weights = torch.softmax(tone_power_logits, dim=0)
-    tone_amplitudes = (0.95 * torch.sqrt(tone_power_weights + 1e-12)).to(dtype=torch.float64).tolist()
+    tone_amp_raw = model_out.get("tone_amp_raw", model_out["tone_power_logits"]).detach().reshape(-1)[:num_tones]
+    # Match varlen_4 mapping: independent per-tone amplitudes in ~[0.05, 1.0].
+    tone_amplitudes = (0.05 + 0.95 * torch.sigmoid(tone_amp_raw)).to(dtype=torch.float64).tolist()
 
     peak_power = None if user_peak_power_fraction is None else float(user_peak_power_fraction) * float(rx_input_power)
 
