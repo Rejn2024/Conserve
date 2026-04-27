@@ -19,7 +19,7 @@ import torch
 from pyarrow.lib import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from tx_controller_tone_pulse_stft_varlen_4 import (
+from tx_controller_tone_pulse_stft_varlen_5 import (
     build_controlled_tone_pulse_batch_from_iq_batches,
     preprocess_batched_iq_to_stft_feature,
 )
@@ -664,13 +664,13 @@ class JammerVecEnv:
             jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
             rx_result = link6.rx_command_iq(jammed, whole_meta)
 
-            score = torch.tensor(0.0, dtype=torch.float32)
+            score = torch.tensor(1.0, dtype=torch.float32)
             total += 1
 
             if rx_result.get("message") is not None:
                 score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 
-                if score > 0.0:
+                if score < 1.0:
                     success += 1
 
                 # metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
