@@ -16,15 +16,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import numpy as np
 import torch
-from pyarrow.lib import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from tx_controller_tone_pulse_stft_varlen_5 import (
+from tx_controller_tone_pulse_stft_varlen_7 import (
     build_controlled_tone_pulse_batch_from_iq_batches,
     preprocess_batched_iq_to_stft_feature,
 )
 
-import advanced_link_skdsp_v6_robust as link6
+import advanced_link_skdsp_v7_robust as link7
 import score_iq_decode as scorer
 
 
@@ -59,9 +58,9 @@ def precompute_training_cache(
     """
 
     if resample_fn is None:
-        import advanced_link_skdsp_v6_robust as link6
+        import advanced_link_skdsp_v7_robust as link7
 
-        resample = link6.resample_iq
+        resample = link7.resample_iq
     else:
         resample = resample_fn
     dataset_root = Path(dataset_root)
@@ -270,9 +269,9 @@ def compute_batch_scores(
     """
 
     if resample_fn is None:
-        import advanced_link_skdsp_v6_robust as link6
+        import advanced_link_skdsp_v6_robust as link7
 
-        resample = link6.resample_iq
+        resample = link7.resample_iq
     else:
         resample = resample_fn
     scores: List[torch.Tensor] = []
@@ -654,7 +653,7 @@ class JammerVecEnv:
             tx_iq = jam_item["tx_iq"]
             whole_meta = sample.get("whole_meta")
             whole_iq: torch.Tensor = sample.get("whole_iq")
-            jam_iq_rx_resam = link6.resample_iq(tx_iq,
+            jam_iq_rx_resam = link7.resample_iq(tx_iq,
                                                 self.jammer_sampling_freq,
                                                 whole_meta['sample_rate_hz'])
             jam_iq_rx_resam = repeat_to_length_mod(jam_iq_rx_resam, whole_iq.shape[0])
@@ -662,7 +661,7 @@ class JammerVecEnv:
                                                 dtype=torch.complex64,
                                                 device=self.device)
             jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
-            rx_result = link6.rx_command_iq(jammed, whole_meta)
+            rx_result = link7.rx_command_iq(jammed, whole_meta)
 
             score = torch.tensor(1.0, dtype=torch.float32)
             total += 1
