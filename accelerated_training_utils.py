@@ -12,21 +12,33 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from pyarrow.lib import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from tx_controller_tone_pulse_stft_varlen_3 import (
+from tx_controller_tone_pulse_stft_varlen_5 import (
     build_controlled_tone_pulse_batch_from_iq_batches,
     preprocess_batched_iq_to_stft_feature,
 )
+
+import advanced_link_skdsp_v6_robust as link6
+import score_iq_decode as scorer
 
 
 def _to_complex64_tensor(x: Any) -> torch.Tensor:
     return torch.as_tensor(x, dtype=torch.complex64)
 
+def repeat_to_length_mod(arr, target_length):
+    if arr.ndim != 1:
+        raise ValueError("Input tensor must be 1D")
+    if arr.numel() == 0:
+        raise ValueError("Input tensor must not be empty")
+
+    idx = torch.arange(target_length, device=arr.device) % arr.numel()
+    return arr[idx]
 
 def precompute_training_cache(
     dataset_root: Path,
@@ -116,7 +128,9 @@ class CachedIQDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return torch.load(self.records[idx], map_location="cpu", weights_only=False)
+        return torch.load(self.records[idx],
+                          map_location="cpu",
+                          weights_only=False)
 
 
 
@@ -306,8 +320,17 @@ def _normalize_action(action: Any) -> Dict[str, Any]:
     """Normalize PPO action payloads into controller kwargs.
 
     Supported forms:
-    - dict with optional keys: desired_output_iq_len, user_peak_power_fraction, seed
-    - sequence/tensor of up to 3 items in the same order as above
+    - dict with optional keys:
+        desired_output_iq_len, user_peak_power_fraction, seed,
+        noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
+        num_tones, base_f, spacing, amp_raw, pulse_on_samples,
+        pulse_off_samples, pulse_count, start_offset_samples
+    - sequence/tensor:
+        * up to 3 items mapped to desired_output_iq_len, user_peak_power_fraction, seed
+        * > 3 items interpreted as continuous control action vector in this order:
+          noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
+          num_tones, base_f, spacing, [amp_raw...], pulse_on_samples,
+          pulse_off_samples, pulse_count, start_offset_samples
     - scalar/tensor scalar interpreted as user_peak_power_fraction
     """
 
@@ -320,6 +343,27 @@ def _normalize_action(action: Any) -> Dict[str, Any]:
         action = action.detach().cpu().reshape(-1).tolist()
 
     if isinstance(action, (list, tuple)):
+        if len(action) > 3:
+            vec = [float(x) for x in action]
+            if len(vec) < 12:
+                raise ValueError("continuous action vector must contain at least 12 values")
+            amp_width = len(vec) - 12
+            return {
+                "noise_color": vec[0],
+                "fading_mode": vec[1],
+                "burst_color": vec[2],
+                "rf_center_hz": vec[3],
+                "carrier_hz": vec[4],
+                "num_tones": vec[5],
+                "base_f": vec[6],
+                "spacing": vec[7],
+                "amp_raw": vec[8 : 8 + amp_width],
+                "pulse_on_samples": vec[8 + amp_width],
+                "pulse_off_samples": vec[9 + amp_width],
+                "pulse_count": vec[10 + amp_width],
+                "start_offset_samples": vec[11 + amp_width],
+            }
+
         out: Dict[str, Any] = {}
         if len(action) >= 1:
             out["desired_output_iq_len"] = action[0]
@@ -353,6 +397,26 @@ def jammer_controller(
     user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
 
+    action_overrides = {
+        k: action_cfg[k]
+        for k in (
+            "noise_color",
+            "fading_mode",
+            "burst_color",
+            "rf_center_hz",
+            "carrier_hz",
+            "num_tones",
+            "base_f",
+            "spacing",
+            "amp_raw",
+            "pulse_on_samples",
+            "pulse_off_samples",
+            "pulse_count",
+            "start_offset_samples",
+        )
+        if k in action_cfg
+    }
+
     jam_batch = build_controlled_tone_pulse_batch_from_iq_batches(
         model=model,
         rx_iq_batches=[
@@ -363,6 +427,7 @@ def jammer_controller(
         intake_sample_rate_hz=jammer_sampling_freq,
         desired_output_iq_len=desired_output_iq_len,
         user_peak_power_fraction=user_peak_power_fraction,
+        # action_overrides=[action_overrides if action_overrides else None],
         seed=seed,
         device=device,
     )
@@ -396,6 +461,29 @@ def jammer_controller_batch(
     desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
     # user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
+    action_overrides: List[Optional[Dict[str, Any]]] = []
+    for action in actions:
+        cfg_i = _normalize_action(action)
+        ov_i = {
+            k: cfg_i[k]
+            for k in (
+                "noise_color",
+                "fading_mode",
+                "burst_color",
+                "rf_center_hz",
+                "carrier_hz",
+                "num_tones",
+                "base_f",
+                "spacing",
+                "amp_raw",
+                "pulse_on_samples",
+                "pulse_off_samples",
+                "pulse_count",
+                "start_offset_samples",
+            )
+            if k in cfg_i
+        }
+        action_overrides.append(ov_i if ov_i else None)
 
     iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
     iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
@@ -407,6 +495,7 @@ def jammer_controller_batch(
         intake_sample_rate_hz=jammer_sampling_freq,
         desired_output_iq_len=desired_output_iq_len,
         user_peak_power_fraction=user_peak_power_fraction,
+        # action_overrides=action_overrides,
         seed=seed,
         device=device,
     )
@@ -419,20 +508,27 @@ class JammerVecEnv:
         self,
         *,
         samples: Iterable[Dict[str, Any]],
+        test_samples: Optional[Iterable[Dict[str, Any]]] = None,
         model: torch.nn.Module,
         jammer_sampling_freq: float,
         num_envs: int,
         reward_fn: Optional[Callable[[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]], torch.Tensor]] = None,
         max_steps: int = 1,
         user_peak_power_fraction: float = 40.0,
-        device: str = "cpu",
+        device: str = "cuda",
     ):
         if num_envs <= 0:
             raise ValueError("num_envs must be positive")
 
+        try:
+            self._source_batches_per_epoch = int(len(samples))  # type: ignore[arg-type]
+        except Exception:
+            self._source_batches_per_epoch = 0
+
         self.samples = self._coerce_samples(samples)
         if not self.samples:
             raise ValueError("samples must be non-empty")
+        self.test_samples = self._coerce_samples(test_samples) if test_samples is not None else []
         self.model = model
         self.jammer_sampling_freq = float(jammer_sampling_freq)
         self.num_envs = int(num_envs)
@@ -441,9 +537,11 @@ class JammerVecEnv:
         self.reward_fn = reward_fn or self._default_reward
         self.user_peak_power_fraction = user_peak_power_fraction
 
-        self._cursor = 0
+        self._mode = "train"
+        self._cursor = {"train": 0, "test": 0}
         self._step_count = 0
         self._active: List[Dict[str, Any]] = []
+        self._epoch_complete = False
 
     @staticmethod
     def _expand_cached_batch(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -495,18 +593,93 @@ class JammerVecEnv:
                 materialized.append(item)
         return materialized
 
+    def _active_pool(self) -> List[Dict[str, Any]]:
+        if self._mode == "test":
+            if not self.test_samples:
+                raise ValueError("test_samples were not provided")
+            return self.test_samples
+        return self.samples
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in ("train", "test"):
+            raise ValueError("mode must be 'train' or 'test'")
+        if mode == "test" and not self.test_samples:
+            raise ValueError("test_samples were not provided")
+        self._mode = mode
+        self._step_count = 0
+        self._active = []
+        self._epoch_complete = False
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
     def _next_samples(self) -> List[Dict[str, Any]]:
+        pool = self._active_pool()
+        mode = self._mode
+        did_wrap = False
         out: List[Dict[str, Any]] = []
         for _ in range(self.num_envs):
-            out.append(self.samples[self._cursor % len(self.samples)])
-            self._cursor += 1
+            cursor = self._cursor[mode]
+            out.append(pool[cursor % len(pool)])
+            cursor += 1
+            if cursor >= len(pool):
+                did_wrap = True
+            self._cursor[mode] = cursor
+        self._epoch_complete = did_wrap
         return out
 
-    @staticmethod
-    def _default_reward(jam_batch: Sequence[Dict[str, Any]], _samples: Sequence[Dict[str, Any]]) -> torch.Tensor:
-        # Cheap proxy objective for PPO warm-starts: maximize jammer energy.
-        vals = [torch.mean(torch.abs(item["tx_iq"]).float()).detach().cpu() for item in jam_batch]
-        return torch.stack(vals).to(dtype=torch.float32)
+    def _default_reward(self,
+                        jam_batch: Sequence[Dict[str, Any]],
+                        samples: Sequence[Dict[str, Any]],
+                        alpha: float = 1.0) -> Tuple[torch.Tensor, int, int]:
+        """Default reward used by PPO loops.
+
+        Mirrors the decode-side objective from `JammerLoss` in
+        `generating_sample_transmissions.ipynb`:
+            reward = score_decode(rx_result, whole_meta) + alpha * metric_div
+        with `alpha=10`.
+
+        If decode/score inputs are unavailable for a row, this falls back to a
+        cheap energy proxy for that row.
+        """
+
+        # alpha = 10.0
+        vals: List[torch.Tensor] = []
+
+        success = 0
+        total = 0
+
+        for jam_item, sample in zip(jam_batch, samples):
+            tx_iq = jam_item["tx_iq"]
+            whole_meta = sample.get("whole_meta")
+            whole_iq: torch.Tensor = sample.get("whole_iq")
+            jam_iq_rx_resam = link6.resample_iq(tx_iq,
+                                                self.jammer_sampling_freq,
+                                                whole_meta['sample_rate_hz'])
+            jam_iq_rx_resam = repeat_to_length_mod(jam_iq_rx_resam, whole_iq.shape[0])
+            jam_iq_rx_resam_t = torch.as_tensor(jam_iq_rx_resam[:whole_iq.shape[0]],
+                                                dtype=torch.complex64,
+                                                device=self.device)
+            jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
+            rx_result = link6.rx_command_iq(jammed, whole_meta)
+
+            score = torch.tensor(1.0, dtype=torch.float32)
+            total += 1
+
+            if rx_result.get("message") is not None:
+                score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
+
+                if score < 1.0:
+                    success += 1
+
+                # metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
+                # score = score + (alpha * metric_div)
+
+
+            vals.append(score)#.detach().cpu())
+
+        return torch.stack(vals), success, total #.to(dtype=torch.float32)
 
     @staticmethod
     def _obs_from_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -542,8 +715,8 @@ class JammerVecEnv:
             user_peak_power_fraction = self.user_peak_power_fraction,
             device=self.device,
         )
-        rewards_t = self.reward_fn(jam_batch, self._active)
-        rewards = torch.as_tensor(rewards_t, dtype=torch.float32).cpu().numpy()
+        rewards_t, success, total = self.reward_fn(jam_batch, self._active)
+        rewards = torch.as_tensor(rewards_t)#, dtype=torch.float32)#.cpu().numpy()
 
         self._step_count += 1
         done = self._step_count >= self.max_steps
@@ -553,6 +726,8 @@ class JammerVecEnv:
             {
                 "tx_metadata": jam_item.get("tx_metadata", {}),
                 "sample_name": sample.get("sample_name"),
+                "mode": self._mode,
+                "epoch_complete": bool(self._epoch_complete),
             }
             for jam_item, sample in zip(jam_batch, self._active)
         ]
@@ -564,7 +739,7 @@ class JammerVecEnv:
         else:
             next_obs = self._obs_from_samples(self._active)
 
-        return next_obs, rewards, dones, infos
+        return next_obs, rewards, dones, infos, success, total
 
 
 def run_epoch_cached(

@@ -123,7 +123,7 @@ def score_from_strings(expected: str, decoded: Optional[str]) -> float:
 
 def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
     if rx_result is None:
-        return 0.0
+        return 1.0
 
     payload_source = metadata.get("payload_source")
     payload_desc = metadata.get("payload_desc", {})
@@ -139,13 +139,13 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
             preview = payload_desc.get("message_preview")
             decoded_message = rx_result.get("message")
             if decoded_message is None:
-                return 0.0
+                return 1.0
             if preview is not None and not decoded_message.startswith(preview):
-                return 0.0
+                return 1.0
             expected_len = payload_desc.get("message_length")
             if expected_len is not None and len(decoded_message) != expected_len:
-                return 0.0
-            return 1.0
+                return 1.0
+            return 0.0
 
         return score_from_strings(expected_message, rx_result.get("message"))
 
@@ -160,27 +160,27 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
             random_seed = payload_desc.get("random_seed")
 
         if random_bits is None or random_seed is None:
-            return 0.0
+            return 1.0
 
         expected_payload = reconstruct_expected_random_payload(int(random_bits), int(random_seed))
         expected_bitstring = bytes_to_bitstring(expected_payload, n_bits=int(random_bits))
 
         decoded_payload = rx_result.get("payload_bytes")
         if decoded_payload is None:
-            return 0.0
+            return 1.0
 
         decoded_bitstring = bytes_to_bitstring(decoded_payload, n_bits=int(random_bits))
         if decoded_bitstring == expected_bitstring:
-            return 1.0
+            return 0.0
 
         dist = levenshtein_distance(expected_bitstring, decoded_bitstring)
         if dist <= 0:
-            return 1.0
-        return 1.0 / 1 + float(dist)
+            return 0.0
+        return 1.0 # / 1 + float(dist)
 
     # Unknown mode fallback
     if rx_result.get("payload_len", 0) <= 0:
-        return 0.0
+        return 1.0
     return 0.0
 
 

@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import advanced_link_skdsp_v6_robust as txflex
+import advanced_link_skdsp_v7_robust as txflex
 
 
 NOISE_COLORS = ["white", "pink", "brown", "blue", "violet"]
@@ -329,7 +329,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
         # Categorical/channel environment heads.
         self.noise_color_head = nn.Linear(96, len(NOISE_COLORS))
         self.fading_mode_head = nn.Linear(96, len(FADING_MODES))
-        self.burst_color_head = nn.Linear(96, len(NOISE_COLORS))
 
         # Frequency/rate/tone structure heads.
         self.sample_rate_scale_head = nn.Linear(96, 1)
@@ -352,8 +351,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.timing_offset_head = nn.Linear(96, 1)
         self.fading_block_head = nn.Linear(96, 1)
         self.rician_k_db_head = nn.Linear(96, 1)
-        self.burst_prob_head = nn.Linear(96, 1)
-        self.burst_power_ratio_head = nn.Linear(96, 1)
 
     def _encode_branch_features(
         self,
@@ -403,7 +400,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
         r = {
             "noise_color_logits": self.noise_color_head(z_env),
             "fading_mode_logits": self.fading_mode_head(z_env),
-            "burst_color_logits": self.burst_color_head(z_env),
             "sample_rate_scale": 0.5 + 2.0 * torch.sigmoid(self.sample_rate_scale_head(z_tone)),
             "rf_center_delta_hz": 500_000.0 * torch.tanh(self.rf_center_delta_head(z_tone)),
             "carrier_hz_norm": 0.45 * torch.tanh(self.carrier_norm_head(z_tone)),
@@ -420,8 +416,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "timing_offset": 1.0 + 0.002 * torch.tanh(self.timing_offset_head(z_impair)),
             "fading_block_len_norm": torch.sigmoid(self.fading_block_head(z_impair)),
             "rician_k_db": 20.0 * torch.sigmoid(self.rician_k_db_head(z_impair)),
-            "burst_probability": 1e-2 * torch.sigmoid(self.burst_prob_head(z_impair)),
-            "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z_impair)),
         }
 
         return r
@@ -450,7 +444,7 @@ class ActorCritic(nn.Module):
             max_tones=max_tones,
         )
         self.max_tones = max_tones
-        self.action_dim = int(action_dim) if action_dim is not None else (12 + int(max_tones))
+        self.action_dim = int(action_dim) if action_dim is not None else (11 + int(max_tones))
         if self.action_dim <= 0:
             raise ValueError("action_dim must be positive")
 
@@ -478,7 +472,6 @@ class ActorCritic(nn.Module):
         pieces = [
             _expected_index(y["noise_color_logits"]),
             _expected_index(y["fading_mode_logits"]),
-            _expected_index(y["burst_color_logits"]),
             y["rf_center_delta_hz"],
             y["carrier_hz_norm"],
             y["num_tones_cont"],
@@ -494,7 +487,7 @@ class ActorCritic(nn.Module):
         if action_mean.shape[-1] != self.action_dim:
             raise ValueError(
                 f"Action mean width {action_mean.shape[-1]} does not match action_dim {self.action_dim}. "
-                "Set action_dim to 12 + max_tones (default) or a matching custom width."
+                "Set action_dim to 11 + max_tones (default) or a matching custom width."
             )
         return action_mean
 
@@ -599,7 +592,7 @@ def decode_tone_pulse_config(
 
     noise_color = NOISE_COLORS[int(torch.argmax(model_out["noise_color_logits"], dim=-1).item())]
     fading_mode = FADING_MODES[int(torch.argmax(model_out["fading_mode_logits"], dim=-1).item())]
-    burst_color = NOISE_COLORS[int(torch.argmax(model_out["burst_color_logits"], dim=-1).item())]
+    burst_color = NOISE_COLORS[0]
 
     sample_rate_hz = float(intake_sample_rate_hz * _safe_scalar("sample_rate_scale", 1.0))
     rf_center_hz = float(rf_center_est_hz + _safe_scalar("rf_center_delta_hz", 0.0))
@@ -630,9 +623,6 @@ def decode_tone_pulse_config(
         fading_idx = max(0, min(fading_idx, len(FADING_MODES) - 1))
         fading_mode = FADING_MODES[fading_idx]
 
-        burst_idx = int(round(_override_scalar("burst_color", NOISE_COLORS.index(burst_color))))
-        burst_idx = max(0, min(burst_idx, len(NOISE_COLORS) - 1))
-        burst_color = NOISE_COLORS[burst_idx]
 
         rf_center_hz = _override_scalar("rf_center_hz", rf_center_hz)
         carrier_hz = _override_scalar("carrier_hz", carrier_hz)
@@ -704,10 +694,10 @@ def decode_tone_pulse_config(
         fading_mode=fading_mode,
         fading_block_len=_nearest_block_len(_safe_scalar("fading_block_len_norm", 0.0)),
         rician_k_db=_safe_scalar("rician_k_db", 0.0),
-        burst_probability=_safe_scalar("burst_probability", 0.0),
+        burst_probability=0.0,
         burst_len_min=16,
         burst_len_max=64,
-        burst_power_ratio_db=_safe_scalar("burst_power_ratio_db", 0.0),
+        burst_power_ratio_db=0.0,
         burst_color=burst_color,
         peak_power=peak_power,
         seed=seed,
