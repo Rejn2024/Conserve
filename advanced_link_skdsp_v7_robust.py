@@ -1046,7 +1046,8 @@ def build_tone_pulse_iq_object(
     num_tones: int = 1,
     tone_frequencies_hz: Optional[List[float]] = None,
     tone_amplitudes: Optional[List[float]] = None,
-    tone_initial_phases_rad: Optional[List[float]] = None,
+    tone_initial_phases_rad: Optional[Union[float, List[float]]] = None,
+    tone_phase_offset_rad: float = 0.0,
     pulse_on_samples: int = 4096,
     pulse_off_samples: int = 0,
     pulse_count: int = 1,
@@ -1097,6 +1098,11 @@ def build_tone_pulse_iq_object(
     rng = np.random.default_rng(seed)
     if tone_initial_phases_rad is None:
         tone_initial_phases_rad = rng.uniform(0.0, 2.0 * np.pi, size=num_tones).tolist()
+    elif isinstance(tone_initial_phases_rad, (int, float)):
+        tone_initial_phases_rad = [float(tone_initial_phases_rad)] * num_tones
+    else:
+        tone_initial_phases_rad = [float(ph) for ph in tone_initial_phases_rad]
+
     if len(tone_initial_phases_rad) != num_tones:
         raise ValueError("len(tone_initial_phases_rad) must equal num_tones")
 
@@ -1119,7 +1125,7 @@ def build_tone_pulse_iq_object(
     for a, f_hz, ph in zip(tone_amplitudes, tone_frequencies_hz, tone_initial_phases_rad):
         if a == 0.0:
             continue
-        phase = 2.0 * torch.pi * f_hz * n / sample_rate_hz + ph
+        phase = 2.0 * torch.pi * f_hz * n / sample_rate_hz + ph + tone_phase_offset_rad
         iq = iq + a * torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
     iq = (iq * gate).to(dtype=torch.complex64)
 
@@ -1155,6 +1161,7 @@ def build_tone_pulse_iq_object(
         "tone_frequencies_hz": [float(x) for x in tone_frequencies_hz],
         "tone_amplitudes": [float(x) for x in tone_amplitudes],
         "tone_initial_phases_rad": [float(x) for x in tone_initial_phases_rad],
+        "tone_phase_offset_rad": float(tone_phase_offset_rad),
         "pulse_on_samples": pulse_on_samples,
         "pulse_off_samples": pulse_off_samples,
         "pulse_count": pulse_count,
