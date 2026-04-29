@@ -1129,7 +1129,7 @@ def build_tone_pulse_iq_object(
         iq = iq + a * torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
     iq = (iq * gate).to(dtype=torch.complex64)
 
-    iq = _scale_iq_to_peak_power(iq, peak_power)
+    # iq = _scale_iq_to_peak_power(iq, peak_power)
     iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
     iq = impair_iq(
         iq=iq,
@@ -1148,6 +1148,7 @@ def build_tone_pulse_iq_object(
         burst_color=burst_color,
         seed=seed,
     )
+    iq = _scale_iq_to_peak_power(iq, peak_power)
 
     metadata = {
         "payload_source": "tone_pulse",
