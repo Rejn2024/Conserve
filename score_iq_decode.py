@@ -176,7 +176,7 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
         dist = levenshtein_distance(expected_bitstring, decoded_bitstring)
         if dist <= 0:
             return 0.0
-        return 1.0 # / 1 + float(dist)
+        return float(dist)  / (1 + float(dist))
 
     # Unknown mode fallback
     if rx_result.get("payload_len", 0) <= 0:
