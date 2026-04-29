@@ -112,13 +112,13 @@ def decode_iq(iq_raw_path: Path, metadata: dict) -> Optional[dict]:
 
 def score_from_strings(expected: str, decoded: Optional[str]) -> float:
     if decoded is None:
-        return 0.0
-    if decoded == expected:
         return 1.0
+    if decoded == expected:
+        return 0.0
     dist = levenshtein_distance(expected, decoded)
     if dist <= 0:
-        return 1.0
-    return 1.0 / 1.0 + float(dist)
+        return 0.0
+    return float(dist) / (1.0 + float(dist))
 
 
 def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
