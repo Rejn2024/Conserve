@@ -373,7 +373,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
                 dim=1,
             ),
             "tone_freq_std_norms": torch.cat(
-                [0.20 * torch.sigmoid(h(z)) for h in self.tone_freq_std_norm_heads],
+                [0.33 * torch.sigmoid(h(z)) for h in self.tone_freq_std_norm_heads],
                 dim=1,
             ),
             # Keep a raw per-tone amplitude control (varlen_4 style).
