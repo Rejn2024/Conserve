@@ -463,3 +463,30 @@ def test_generate_dataset_main(tmp_path: Path):
     assert whole_meta["decode_verified"] is True
     assert whole_meta["actual_num_samples"] == len(whole_iq)
     assert len(whole_iq) >= 10000
+
+def test_generate_dataset_start_index(monkeypatch, tmp_path):
+    def fake_build_decodable_sample(**kwargs):
+        iq = np.zeros(6000, dtype=np.complex64)
+        return iq, {"actual_num_samples": len(iq)}
+
+    def fake_cut_random_sections(**kwargs):
+        return {
+            "sections": np.zeros((1, 5), dtype=np.complex64),
+            "starts": [0],
+        }
+
+    monkeypatch.setattr(genmod, "build_decodable_sample", fake_build_decodable_sample)
+    monkeypatch.setattr(genmod, "cut_random_sections", fake_cut_random_sections)
+
+    produced = genmod.generate_dataset(
+        output_root=tmp_path,
+        num_outputs=2,
+        min_total_samples=100,
+        max_total_samples=200,
+        section_len=1,
+        num_sections=1,
+        start_index=499,
+    )
+
+    assert [p.name for p in produced] == ["sample_000500", "sample_000501"]
+
