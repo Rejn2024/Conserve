@@ -364,6 +364,7 @@ def generate_dataset(
     seed: int = 1,
     random_payload_probability: float = 0.5,
     max_attempts_per_sample: int = 100,
+    start_index: int = -1,
 ) -> List[Path]:
     rng = random.Random(seed)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -371,10 +372,11 @@ def generate_dataset(
     produced_dirs: List[Path] = []
 
     for i in range(num_outputs):
+        sample_index = start_index + i + 1
         requested_target_num_samples = rng.randint(min_total_samples, max_total_samples)
 
         whole_iq, whole_meta = build_decodable_sample(
-            dataset_index=i,
+            dataset_index=sample_index,
             target_num_samples=requested_target_num_samples,
             rng=rng,
             random_payload_probability=random_payload_probability,
@@ -385,12 +387,12 @@ def generate_dataset(
             iq=whole_iq,
             num_sections=num_sections,
             section_len=section_len,
-            seed=seed + 10_000 + i,
+            seed=seed + 10_000 + sample_index,
         )
 
-        sample_dir = output_root / f"sample_{i:06d}"
+        sample_dir = output_root / f"sample_{sample_index:06d}"
         sections_meta = {
-            "dataset_index": i,
+            "dataset_index": sample_index,
             "section_len": section_len,
             "num_sections": num_sections,
             "starts": cuts["starts"],
@@ -420,6 +422,7 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--random-payload-probability", type=float, default=0.5)
     parser.add_argument("--max-attempts-per-sample", type=int, default=100)
+    parser.add_argument("--start-index", type=int, default=-1)
     return parser
 
 
@@ -437,6 +440,7 @@ def main(argv=None):
         seed=args.seed,
         random_payload_probability=args.random_payload_probability,
         max_attempts_per_sample=args.max_attempts_per_sample,
+        start_index=args.start_index,
     )
 
     print(f"Generated {len(dirs)} verified-decodable sample directories under {args.output_root}")
