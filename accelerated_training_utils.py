@@ -451,38 +451,30 @@ def jammer_controller_batch(
     The first action's scalar controls are applied batch-wide.
     """
 
-    if len(samples) != len(actions):
+    if torch.is_tensor(actions):
+        if actions.ndim == 1:
+            actions_len = 1
+            first_action = actions
+        else:
+            actions_len = int(actions.shape[0])
+            first_action = actions[0]
+    else:
+        actions_len = len(actions)
+        first_action = actions[0] if actions_len else None
+
+    if len(samples) != actions_len:
         raise ValueError("samples and actions must have the same length")
     if not samples:
         return []
 
-    action_cfg = _normalize_action(actions[0])
+    # Only the first action currently controls batch-wide scalar generation
+    # settings; per-row action_overrides are not wired into the controlled batch
+    # builder below.  Avoid normalizing every row so callers can pass a batched
+    # tensor without an up-front Python list/CPU conversion in the env step.
+    action_cfg = _normalize_action(first_action)
     desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
     # user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
-    action_overrides: List[Optional[Dict[str, Any]]] = []
-    for action in actions:
-        cfg_i = _normalize_action(action)
-        ov_i = {
-            k: cfg_i[k]
-            for k in (
-                "noise_color",
-                "fading_mode",
-                "burst_color",
-                "rf_center_hz",
-                "carrier_hz",
-                "num_tones",
-                "base_f",
-                "spacing",
-                "amp_raw",
-                "pulse_on_samples",
-                "pulse_off_samples",
-                "pulse_count",
-                "start_offset_samples",
-            )
-            if k in cfg_i
-        }
-        action_overrides.append(ov_i if ov_i else None)
 
     iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
     iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
@@ -810,14 +802,22 @@ class JammerVecEnv:
 
     def step(self, actions: Sequence[Any]):
         # Convenience for single-env training loops: if a single action vector
-        # (e.g. shape [action_dim]) is provided, wrap it into a batch.
-        if self.num_envs == 1 and isinstance(actions, torch.Tensor) and actions.ndim >= 1:
-            actions = [actions]
-        elif self.num_envs == 1 and isinstance(actions, np.ndarray) and actions.ndim >= 1:
-            actions = [actions]
+        # (e.g. shape [action_dim]) is provided, wrap it into a batch.  Batched
+        # tensors/arrays are accepted directly to avoid an eager per-row CPU list
+        # conversion in high-throughput training loops.
+        if isinstance(actions, torch.Tensor):
+            action_count = 1 if actions.ndim == 1 else int(actions.shape[0])
+            if self.num_envs == 1 and actions.ndim == 1:
+                actions = actions.unsqueeze(0)
+        elif isinstance(actions, np.ndarray):
+            action_count = 1 if actions.ndim == 1 else int(actions.shape[0])
+            if self.num_envs == 1 and actions.ndim == 1:
+                actions = actions.reshape(1, -1)
+        else:
+            action_count = len(actions)
 
-        if len(actions) != self.num_envs:
-            raise ValueError(f"actions is of length {len(actions)} but must contain {self.num_envs} entries")
+        if action_count != self.num_envs:
+            raise ValueError(f"actions is of length {action_count} but must contain {self.num_envs} entries")
         if not self._active:
             self._active = self._next_samples()
 
