@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -500,6 +500,110 @@ def jammer_controller_batch(
     )
 
 
+class _SamplePool:
+    """Eager-or-lazy sample source used by JammerVecEnv.
+
+    DataLoader inputs can contain many cached IQ tensors.  Keeping them lazy avoids
+    loading the full cache into RAM when constructing the vectorized environment.
+    """
+
+    def __init__(
+        self,
+        samples: Iterable[Dict[str, Any]],
+        *,
+        lazy: bool,
+        expand_batch_fn: Callable[[Dict[str, Any]], List[Dict[str, Any]]],
+    ) -> None:
+        self.lazy = bool(lazy)
+        self._expand_batch_fn = expand_batch_fn
+        self._iterable: Optional[Iterable[Dict[str, Any]]] = samples if lazy else None
+        self._iterator: Optional[Iterator[Dict[str, Any]]] = None
+        self._buffer: List[Dict[str, Any]] = []
+        self._batches_seen = 0
+        try:
+            self._known_batches = int(len(samples))  # type: ignore[arg-type]
+        except Exception:
+            self._known_batches = 0
+
+        if self.lazy:
+            self.items: List[Dict[str, Any]] = []
+        else:
+            self.items = []
+            for item in samples:
+                self.items.extend(self._expand_item(item))
+            if not self.items:
+                raise ValueError("samples must be non-empty")
+
+    def __len__(self) -> int:
+        if self.lazy:
+            return self._known_batches
+        return len(self.items)
+
+    def _expand_item(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            raise TypeError("samples must contain dict entries or cached batch dicts")
+        if "iq1" not in item or "iq2" not in item or "iq3" not in item:
+            raise ValueError("each sample/batch dict must include iq1, iq2, iq3")
+
+        iq1 = item["iq1"]
+        if torch.is_tensor(iq1) and iq1.ndim == 2:
+            return self._expand_batch_fn(item)
+        return [item]
+
+    def _next_iter_item(self) -> Tuple[Dict[str, Any], bool]:
+        if self._iterable is None:
+            raise RuntimeError("lazy sample pool has no iterable")
+
+        if self._iterator is None:
+            self._iterator = iter(self._iterable)
+
+        did_wrap = False
+        while True:
+            try:
+                item = next(self._iterator)
+                self._batches_seen += 1
+                if self._known_batches and self._batches_seen >= self._known_batches:
+                    did_wrap = True
+                    self._batches_seen = 0
+                return item, did_wrap
+            except StopIteration:
+                self._iterator = iter(self._iterable)
+                did_wrap = True
+                self._batches_seen = 0
+                try:
+                    item = next(self._iterator)
+                    self._batches_seen += 1
+                    if self._known_batches and self._batches_seen >= self._known_batches:
+                        self._batches_seen = 0
+                    return item, did_wrap
+                except StopIteration as exc:
+                    raise ValueError("samples must be non-empty") from exc
+
+    def next_samples(self, count: int, cursor: int) -> Tuple[List[Dict[str, Any]], int, bool]:
+        if count <= 0:
+            return [], cursor, False
+
+        if not self.lazy:
+            did_wrap = False
+            out: List[Dict[str, Any]] = []
+            for _ in range(count):
+                out.append(self.items[cursor % len(self.items)])
+                cursor += 1
+                if cursor >= len(self.items):
+                    did_wrap = True
+            return out, cursor, did_wrap
+
+        did_wrap = False
+        while len(self._buffer) < count:
+            item, wrapped = self._next_iter_item()
+            did_wrap = did_wrap or wrapped
+            self._buffer.extend(self._expand_item(item))
+
+        out = self._buffer[:count]
+        del self._buffer[:count]
+        return out, cursor, did_wrap
+
+
 class JammerVecEnv:
     """Vectorized jammer environment with batched controller calls for PPO rollouts."""
 
@@ -515,6 +619,7 @@ class JammerVecEnv:
         max_steps: int = 1,
         user_peak_power_fraction: float = 40.0,
         device: str = "cuda",
+        track_env_grad: bool = False,
     ):
         if num_envs <= 0:
             raise ValueError("num_envs must be positive")
@@ -524,10 +629,16 @@ class JammerVecEnv:
         except Exception:
             self._source_batches_per_epoch = 0
 
-        self.samples = self._coerce_samples(samples)
-        if not self.samples:
+        self._train_pool = self._build_sample_pool(samples)
+        if not self._train_pool.lazy and not self._train_pool.items:
             raise ValueError("samples must be non-empty")
-        self.test_samples = self._coerce_samples(test_samples) if test_samples is not None else []
+        self._test_pool = self._build_sample_pool(test_samples) if test_samples is not None else None
+
+        # Backwards-compatible aliases for callers that inspect eager sample lists.
+        # Lazy DataLoader-backed environments keep these empty to avoid materializing
+        # the complete dataset in memory.
+        self.samples = self._train_pool.items
+        self.test_samples = self._test_pool.items if self._test_pool is not None else []
         self.model = model
         self.jammer_sampling_freq = float(jammer_sampling_freq)
         self.num_envs = int(num_envs)
@@ -535,6 +646,7 @@ class JammerVecEnv:
         self.device = device
         self.reward_fn = reward_fn or self._default_reward
         self.user_peak_power_fraction = user_peak_power_fraction
+        self.track_env_grad = bool(track_env_grad)
 
         self._mode = "train"
         self._cursor = {"train": 0, "test": 0}
@@ -578,31 +690,41 @@ class JammerVecEnv:
 
     @classmethod
     def _coerce_samples(cls, samples: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        materialized: List[Dict[str, Any]] = []
-        for item in samples:
-            if not isinstance(item, dict):
-                raise TypeError("samples must contain dict entries or cached batch dicts")
-            if "iq1" not in item or "iq2" not in item or "iq3" not in item:
-                raise ValueError("each sample/batch dict must include iq1, iq2, iq3")
+        """Materialize samples for legacy callers that pass in-memory collections."""
 
-            iq1 = item["iq1"]
-            if torch.is_tensor(iq1) and iq1.ndim == 2:
-                materialized.extend(cls._expand_cached_batch(item))
-            else:
-                materialized.append(item)
-        return materialized
+        return _SamplePool(
+            samples,
+            lazy=False,
+            expand_batch_fn=cls._expand_cached_batch,
+        ).items
 
-    def _active_pool(self) -> List[Dict[str, Any]]:
+    @classmethod
+    def _build_sample_pool(cls, samples: Optional[Iterable[Dict[str, Any]]]) -> _SamplePool:
+        if samples is None:
+            raise ValueError("samples must be non-empty")
+
+        # DataLoader inputs are the common high-memory path: iterating them here
+        # loads every cached tensor into RAM.  Keep them lazy and only retain the
+        # active rollout rows plus any partially consumed batch.  Non-sequence
+        # iterables are also kept lazy so generators are not accidentally drained.
+        lazy = isinstance(samples, DataLoader) or not isinstance(samples, (list, tuple))
+        return _SamplePool(
+            samples,
+            lazy=lazy,
+            expand_batch_fn=cls._expand_cached_batch,
+        )
+
+    def _active_pool(self) -> _SamplePool:
         if self._mode == "test":
-            if not self.test_samples:
+            if self._test_pool is None:
                 raise ValueError("test_samples were not provided")
-            return self.test_samples
-        return self.samples
+            return self._test_pool
+        return self._train_pool
 
     def set_mode(self, mode: str) -> None:
         if mode not in ("train", "test"):
             raise ValueError("mode must be 'train' or 'test'")
-        if mode == "test" and not self.test_samples:
+        if mode == "test" and self._test_pool is None:
             raise ValueError("test_samples were not provided")
         self._mode = mode
         self._step_count = 0
@@ -616,15 +738,8 @@ class JammerVecEnv:
     def _next_samples(self) -> List[Dict[str, Any]]:
         pool = self._active_pool()
         mode = self._mode
-        did_wrap = False
-        out: List[Dict[str, Any]] = []
-        for _ in range(self.num_envs):
-            cursor = self._cursor[mode]
-            out.append(pool[cursor % len(pool)])
-            cursor += 1
-            if cursor >= len(pool):
-                did_wrap = True
-            self._cursor[mode] = cursor
+        out, cursor, did_wrap = pool.next_samples(self.num_envs, self._cursor[mode])
+        self._cursor[mode] = cursor
         self._epoch_complete = did_wrap
         return out
 
@@ -706,16 +821,20 @@ class JammerVecEnv:
         if not self._active:
             self._active = self._next_samples()
 
-        jam_batch = jammer_controller_batch(
-            model=self.model,
-            samples=self._active,
-            actions=actions,
-            jammer_sampling_freq=self.jammer_sampling_freq,
-            user_peak_power_fraction = self.user_peak_power_fraction,
-            device=self.device,
-        )
-        rewards_t, success, total = self.reward_fn(jam_batch, self._active)
+        with torch.set_grad_enabled(self.track_env_grad):
+            jam_batch = jammer_controller_batch(
+                model=self.model,
+                samples=self._active,
+                actions=actions,
+                jammer_sampling_freq=self.jammer_sampling_freq,
+                user_peak_power_fraction = self.user_peak_power_fraction,
+                device=self.device,
+            )
+            rewards_t, success, total = self.reward_fn(jam_batch, self._active)
+
         rewards = torch.as_tensor(rewards_t)#, dtype=torch.float32)#.cpu().numpy()
+        if not self.track_env_grad:
+            rewards = rewards.detach()
 
         self._step_count += 1
         done = self._step_count >= self.max_steps
