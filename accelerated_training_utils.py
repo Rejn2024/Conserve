@@ -11,6 +11,7 @@ Implements four performance-focused capabilities:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -39,6 +40,16 @@ def repeat_to_length_mod(arr, target_length):
     idx = torch.arange(target_length, device=arr.device) % arr.numel()
     return arr[idx]
 
+
+def _sample_numeric_suffix(name: str) -> Optional[int]:
+    """Return the trailing numeric suffix from a sample file/directory name."""
+
+    match = re.search(r"(\d+)(?:\.[^.]+)?$", name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def precompute_training_cache(
     dataset_root: Path,
     cache_root: Path,
@@ -46,6 +57,7 @@ def precompute_training_cache(
     *,
     section_len: int = 1024,
     overwrite: bool = False,
+    max_numeric_suffix: Optional[int] = None,
     resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
 ) -> List[Path]:
     """Precompute deterministic sample tensors once and save to cache files.
@@ -55,6 +67,17 @@ def precompute_training_cache(
     - whole_sample_rate_hz (float)
     - iq1/iq2/iq3 resampled to jammer_sampling_freq and cropped to section_len
     - metadata + source path for debugging/auditability
+
+    Args:
+        dataset_root: Directory containing ``sample_<number>`` sample directories.
+        cache_root: Directory where ``.pt`` cache records and the manifest are written.
+        jammer_sampling_freq: Target sample rate for the cached section tensors.
+        section_len: Number of resampled IQ values to keep from each section.
+        overwrite: Rebuild existing cache records when True.
+        max_numeric_suffix: Optional inclusive upper limit for the trailing numeric
+            suffix of sample directory names. For example, ``100`` processes
+            ``sample_000100`` and lower while skipping ``sample_000101``.
+        resample_fn: Optional dependency injection hook for custom resampling.
     """
 
     if resample_fn is None:
@@ -70,6 +93,16 @@ def precompute_training_cache(
     import load_tx_iq_data as loadmod
 
     sample_dirs = loadmod.list_sample_dirs(dataset_root)
+    if max_numeric_suffix is not None:
+        if max_numeric_suffix < 0:
+            raise ValueError("max_numeric_suffix must be non-negative")
+        sample_dirs = [
+            sdir
+            for sdir in sample_dirs
+            if (suffix := _sample_numeric_suffix(sdir.name)) is not None
+            and suffix <= max_numeric_suffix
+        ]
+
     produced: List[Path] = []
 
     for sdir in sample_dirs:
@@ -105,6 +138,7 @@ def precompute_training_cache(
         "cache_root": str(cache_root),
         "jammer_sampling_freq": float(jammer_sampling_freq),
         "section_len": int(section_len),
+        "max_numeric_suffix": max_numeric_suffix,
         "num_samples": len(produced),
         "files": [str(p.name) for p in produced],
     }

@@ -72,6 +72,52 @@ def test_precompute_and_dataloader(tmp_path: Path):
     assert len(batch["whole_iq_list"]) == 2
 
 
+def test_precompute_training_cache_limits_numeric_suffix(tmp_path: Path):
+    pytest.importorskip("numpy")
+    data_root = tmp_path / "dataset"
+    cache_root = tmp_path / "cache"
+    data_root.mkdir()
+
+    for idx in range(4):
+        _write_sample(data_root, idx)
+
+    def identity_resample(x, _fs_in, _fs_out):
+        return x
+
+    produced = atu.precompute_training_cache(
+        dataset_root=data_root,
+        cache_root=cache_root,
+        jammer_sampling_freq=2e9,
+        section_len=1024,
+        max_numeric_suffix=1,
+        resample_fn=identity_resample,
+    )
+
+    assert [path.name for path in produced] == ["sample_000000.pt", "sample_000001.pt"]
+    assert not (cache_root / "sample_000002.pt").exists()
+
+    with open(cache_root / "manifest.json", "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    assert manifest["max_numeric_suffix"] == 1
+    assert manifest["num_samples"] == 2
+
+
+def test_precompute_training_cache_rejects_negative_numeric_suffix(tmp_path: Path):
+    data_root = tmp_path / "dataset"
+    cache_root = tmp_path / "cache"
+    data_root.mkdir()
+
+    with pytest.raises(ValueError, match="max_numeric_suffix must be non-negative"):
+        atu.precompute_training_cache(
+            dataset_root=data_root,
+            cache_root=cache_root,
+            jammer_sampling_freq=2e9,
+            max_numeric_suffix=-1,
+            resample_fn=lambda x, _fs_in, _fs_out: x,
+        )
+
+
 def test_run_epoch_cached_eval_path(tmp_path: Path, monkeypatch):
     cache_root = tmp_path / "cache"
     cache_root.mkdir(parents=True, exist_ok=True)
