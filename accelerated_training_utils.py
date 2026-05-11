@@ -10,6 +10,7 @@ Implements four performance-focused capabilities:
 
 from __future__ import annotations
 
+import io
 import json
 import re
 from pathlib import Path
@@ -49,6 +50,122 @@ def _sample_numeric_suffix(name: str) -> Optional[int]:
         return None
     return int(match.group(1))
 
+
+
+
+def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
+    """Split an ``s3://bucket/prefix`` URI into bucket and normalized prefix."""
+
+    if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
+        raise ValueError("s3_uri must be a string beginning with 's3://'")
+    without_scheme = s3_uri[5:]
+    bucket, sep, prefix = without_scheme.partition("/")
+    if not bucket:
+        raise ValueError("s3_uri must include a bucket name")
+    return bucket, prefix.strip("/")
+
+
+def _s3_join(prefix: str, name: str) -> str:
+    return f"{prefix.rstrip('/')}/{name}" if prefix else name
+
+
+def _get_s3_client(s3_client: Optional[Any] = None) -> Any:
+    if s3_client is not None:
+        return s3_client
+    try:
+        import boto3
+    except ImportError as exc:
+        raise ImportError(
+            "boto3 is required for S3 cache helpers. Install it in the AWS "
+            "JupyterLab environment with `pip install boto3`."
+        ) from exc
+    return boto3.client("s3")
+
+
+def _s3_object_exists(client: Any, bucket: str, key: str) -> bool:
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as exc:
+        response = getattr(exc, "response", {}) or {}
+        code = str(response.get("Error", {}).get("Code", ""))
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+            return False
+        raise
+
+
+def _s3_list_cache_records(client: Any, bucket: str, prefix: str) -> List[str]:
+    records: List[str] = []
+    list_prefix = _s3_join(prefix, "sample_") if prefix else "sample_"
+
+    if hasattr(client, "get_paginator"):
+        paginator = client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=bucket, Prefix=list_prefix)
+    else:
+        pages = []
+        token: Optional[str] = None
+        while True:
+            kwargs: Dict[str, Any] = {"Bucket": bucket, "Prefix": list_prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            page = client.list_objects_v2(**kwargs)
+            pages.append(page)
+            if not page.get("IsTruncated"):
+                break
+            token = page.get("NextContinuationToken")
+
+    for page in pages:
+        for item in page.get("Contents", []):
+            key = item.get("Key", "")
+            if key.endswith(".pt") and Path(key).name.startswith("sample_"):
+                records.append(key)
+    return sorted(records)
+
+
+def _build_training_cache_record(
+    sdir: Path,
+    jammer_sampling_freq: float,
+    section_len: int,
+    resample: Callable[[Any, float, float], Any],
+) -> Dict[str, Any]:
+    import load_tx_iq_data as loadmod
+
+    whole = loadmod.load_whole_iq(sdir)
+    sections = loadmod.load_sections(sdir)
+    sample_rate_hz = float(whole["meta"]["sample_rate_hz"])
+
+    iq1 = resample(sections["sections"][0], sample_rate_hz, jammer_sampling_freq)[:section_len]
+    iq2 = resample(sections["sections"][1], sample_rate_hz, jammer_sampling_freq)[:section_len]
+    iq3 = resample(sections["sections"][2], sample_rate_hz, jammer_sampling_freq)[:section_len]
+
+    return {
+        "sample_name": sdir.name,
+        "source_dir": str(sdir),
+        "whole_iq": _to_complex64_tensor(whole["iq"]),
+        "whole_meta": whole["meta"],
+        "whole_sample_rate_hz": sample_rate_hz,
+        "jammer_sampling_freq": float(jammer_sampling_freq),
+        "iq1": _to_complex64_tensor(iq1),
+        "iq2": _to_complex64_tensor(iq2),
+        "iq3": _to_complex64_tensor(iq3),
+    }
+
+
+def _resolve_sample_dirs(dataset_root: Path, max_numeric_suffix: Optional[int]) -> List[Path]:
+    import load_tx_iq_data as loadmod
+
+    sample_dirs = loadmod.list_sample_dirs(dataset_root)
+    if max_numeric_suffix is not None:
+        if max_numeric_suffix < 0:
+            raise ValueError("max_numeric_suffix must be non-negative")
+        sample_dirs = [
+            sdir
+            for sdir in sample_dirs
+            if (suffix := _sample_numeric_suffix(sdir.name)) is not None
+            and suffix <= max_numeric_suffix
+        ]
+    return sample_dirs
 
 def precompute_training_cache(
     dataset_root: Path,
@@ -90,18 +207,7 @@ def precompute_training_cache(
     cache_root = Path(cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    import load_tx_iq_data as loadmod
-
-    sample_dirs = loadmod.list_sample_dirs(dataset_root)
-    if max_numeric_suffix is not None:
-        if max_numeric_suffix < 0:
-            raise ValueError("max_numeric_suffix must be non-negative")
-        sample_dirs = [
-            sdir
-            for sdir in sample_dirs
-            if (suffix := _sample_numeric_suffix(sdir.name)) is not None
-            and suffix <= max_numeric_suffix
-        ]
+    sample_dirs = _resolve_sample_dirs(dataset_root, max_numeric_suffix)
 
     produced: List[Path] = []
 
@@ -111,25 +217,12 @@ def precompute_training_cache(
             produced.append(out_path)
             continue
 
-        whole = loadmod.load_whole_iq(sdir)
-        sections = loadmod.load_sections(sdir)
-        sample_rate_hz = float(whole["meta"]["sample_rate_hz"])
-
-        iq1 = resample(sections["sections"][0], sample_rate_hz, jammer_sampling_freq)[:section_len]
-        iq2 = resample(sections["sections"][1], sample_rate_hz, jammer_sampling_freq)[:section_len]
-        iq3 = resample(sections["sections"][2], sample_rate_hz, jammer_sampling_freq)[:section_len]
-
-        record = {
-            "sample_name": sdir.name,
-            "source_dir": str(sdir),
-            "whole_iq": _to_complex64_tensor(whole["iq"]),
-            "whole_meta": whole["meta"],
-            "whole_sample_rate_hz": sample_rate_hz,
-            "jammer_sampling_freq": float(jammer_sampling_freq),
-            "iq1": _to_complex64_tensor(iq1),
-            "iq2": _to_complex64_tensor(iq2),
-            "iq3": _to_complex64_tensor(iq3),
-        }
+        record = _build_training_cache_record(
+            sdir=sdir,
+            jammer_sampling_freq=jammer_sampling_freq,
+            section_len=section_len,
+            resample=resample,
+        )
         torch.save(record, out_path)
         produced.append(out_path)
 
@@ -144,6 +237,80 @@ def precompute_training_cache(
     }
     with open(cache_root / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+
+    return produced
+
+
+def precompute_training_cache_s3(
+    dataset_root: Path,
+    cache_s3_uri: str,
+    jammer_sampling_freq: float,
+    *,
+    section_len: int = 1024,
+    overwrite: bool = False,
+    max_numeric_suffix: Optional[int] = None,
+    resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
+    s3_client: Optional[Any] = None,
+) -> List[str]:
+    """Precompute deterministic sample tensors and upload cache records to S3.
+
+    ``cache_s3_uri`` is supplied by the caller and must be an ``s3://bucket/prefix``
+    location.  The helper writes one ``sample_*.pt`` object per sample plus a
+    ``manifest.json`` object under that prefix.  It is intended for AWS-hosted
+    notebook workflows where cache generation happens on a JupyterLab instance
+    and the resulting records should persist in S3.
+    """
+
+    if resample_fn is None:
+        import advanced_link_skdsp_v7_robust as link7
+
+        resample = link7.resample_iq
+    else:
+        resample = resample_fn
+
+    dataset_root = Path(dataset_root)
+    bucket, prefix = _parse_s3_uri(cache_s3_uri)
+    client = _get_s3_client(s3_client)
+    sample_dirs = _resolve_sample_dirs(dataset_root, max_numeric_suffix)
+
+    produced: List[str] = []
+
+    for sdir in sample_dirs:
+        key = _s3_join(prefix, f"{sdir.name}.pt")
+        if not overwrite and _s3_object_exists(client, bucket, key):
+            produced.append(f"s3://{bucket}/{key}")
+            continue
+
+        record = _build_training_cache_record(
+            sdir=sdir,
+            jammer_sampling_freq=jammer_sampling_freq,
+            section_len=section_len,
+            resample=resample,
+        )
+        buffer = io.BytesIO()
+        torch.save(record, buffer)
+        buffer.seek(0)
+        client.upload_fileobj(buffer, bucket, key)
+        produced.append(f"s3://{bucket}/{key}")
+
+    manifest = {
+        "dataset_root": str(dataset_root),
+        "cache_root": cache_s3_uri.rstrip("/"),
+        "cache_s3_uri": cache_s3_uri.rstrip("/"),
+        "jammer_sampling_freq": float(jammer_sampling_freq),
+        "section_len": int(section_len),
+        "max_numeric_suffix": max_numeric_suffix,
+        "num_samples": len(produced),
+        "files": [Path(uri).name for uri in produced],
+        "s3_uris": produced,
+    }
+    body = json.dumps(manifest, indent=2).encode("utf-8")
+    client.put_object(
+        Bucket=bucket,
+        Key=_s3_join(prefix, "manifest.json"),
+        Body=body,
+        ContentType="application/json",
+    )
 
     return produced
 
@@ -186,6 +353,42 @@ def collate_cached_iq(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+class CachedIQDatasetS3(Dataset):
+    """Dataset that reads per-sample cached ``.pt`` records from S3."""
+
+    def __init__(self, cache_s3_uri: str, *, s3_client: Optional[Any] = None):
+        self.cache_s3_uri = cache_s3_uri.rstrip("/")
+        self.bucket, self.prefix = _parse_s3_uri(cache_s3_uri)
+        self._s3_client = s3_client
+        client = _get_s3_client(s3_client)
+        self.records = _s3_list_cache_records(client, self.bucket, self.prefix)
+        if not self.records:
+            raise ValueError(f"No cache records found in {self.cache_s3_uri}")
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = dict(self.__dict__)
+        # boto3 clients are not pickle-friendly; each DataLoader worker should
+        # create its own client lazily after fork/spawn.
+        state["_s3_client"] = None
+        return state
+
+    @property
+    def s3_client(self) -> Any:
+        if self._s3_client is None:
+            self._s3_client = _get_s3_client()
+        return self._s3_client
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        key = self.records[idx]
+        buffer = io.BytesIO()
+        self.s3_client.download_fileobj(self.bucket, key, buffer)
+        buffer.seek(0)
+        return torch.load(buffer, map_location="cpu", weights_only=False)
+
+
 def create_cached_dataloader(
     cache_root: Path,
     *,
@@ -197,6 +400,42 @@ def create_cached_dataloader(
     persistent_workers: bool = True,
 ) -> DataLoader:
     ds = CachedIQDataset(cache_root)
+    kwargs: Dict[str, Any] = {
+        "dataset": ds,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "collate_fn": collate_cached_iq,
+    }
+
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["persistent_workers"] = persistent_workers
+
+    return DataLoader(**kwargs)
+
+
+def create_cached_dataloader_s3(
+    cache_s3_uri: str,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
+    s3_client: Optional[Any] = None,
+) -> DataLoader:
+    """Create a DataLoader over S3-backed cached IQ records.
+
+    The returned batches use the same ``collate_cached_iq`` structure as
+    ``create_cached_dataloader`` (``iq1``, ``iq2``, ``iq3``, ``whole_iq_list``,
+    metadata lists, etc.), so it can be passed directly to ``JammerVecEnv`` and
+    the ``train_rl_batched`` workflow in ``RL_Jamming_test_02.ipynb``.
+    """
+
+    ds = CachedIQDatasetS3(cache_s3_uri, s3_client=s3_client)
     kwargs: Dict[str, Any] = {
         "dataset": ds,
         "batch_size": batch_size,

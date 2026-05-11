@@ -520,3 +520,116 @@ def test_default_reward_matches_jammer_loss_decode_term(monkeypatch):
     # JammerLoss decode term in notebook: score + alpha * metric_div, alpha=10.
     assert reward.shape == (1,)
     assert torch.allclose(reward, torch.tensor([3.4], dtype=torch.float32))
+
+
+class _FakeS3Client:
+    def __init__(self):
+        self.objects = {}
+
+    def head_object(self, *, Bucket, Key):
+        if (Bucket, Key) not in self.objects:
+            exc = RuntimeError("not found")
+            exc.response = {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}}
+            raise exc
+        return {"ContentLength": len(self.objects[(Bucket, Key)])}
+
+    def upload_fileobj(self, fileobj, Bucket, Key):
+        self.objects[(Bucket, Key)] = fileobj.read()
+
+    def put_object(self, *, Bucket, Key, Body, **_kwargs):
+        self.objects[(Bucket, Key)] = Body
+
+    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+        contents = [
+            {"Key": key}
+            for (bucket, key), _body in self.objects.items()
+            if bucket == Bucket and key.startswith(Prefix)
+        ]
+        return {"Contents": sorted(contents, key=lambda x: x["Key"]), "IsTruncated": False}
+
+    def download_fileobj(self, Bucket, Key, fileobj):
+        fileobj.write(self.objects[(Bucket, Key)])
+
+
+def test_precompute_training_cache_s3_and_dataloader_s3(tmp_path: Path):
+    pytest.importorskip("numpy")
+    data_root = tmp_path / "dataset"
+    data_root.mkdir()
+    _write_sample(data_root, 0)
+    _write_sample(data_root, 1)
+    s3 = _FakeS3Client()
+
+    produced = atu.precompute_training_cache_s3(
+        dataset_root=data_root,
+        cache_s3_uri="s3://example-bucket/cache/train",
+        jammer_sampling_freq=2e9,
+        section_len=1024,
+        resample_fn=lambda x, _fs_in, _fs_out: x,
+        s3_client=s3,
+    )
+
+    assert produced == [
+        "s3://example-bucket/cache/train/sample_000000.pt",
+        "s3://example-bucket/cache/train/sample_000001.pt",
+    ]
+    manifest = json.loads(s3.objects[("example-bucket", "cache/train/manifest.json")].decode("utf-8"))
+    assert manifest["cache_s3_uri"] == "s3://example-bucket/cache/train"
+    assert manifest["num_samples"] == 2
+
+    loader = atu.create_cached_dataloader_s3(
+        "s3://example-bucket/cache/train",
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        s3_client=s3,
+    )
+    batch = next(iter(loader))
+    assert batch["sample_names"] == ["sample_000000", "sample_000001"]
+    assert batch["iq1"].shape == (2, 1024)
+    assert batch["iq2"].shape == (2, 1024)
+    assert batch["iq3"].shape == (2, 1024)
+    assert len(batch["whole_iq_list"]) == 2
+
+
+def test_precompute_training_cache_s3_reuses_existing_objects(tmp_path: Path):
+    pytest.importorskip("numpy")
+    data_root = tmp_path / "dataset"
+    data_root.mkdir()
+    _write_sample(data_root, 0)
+    s3 = _FakeS3Client()
+
+    first = atu.precompute_training_cache_s3(
+        dataset_root=data_root,
+        cache_s3_uri="s3://example-bucket/cache",
+        jammer_sampling_freq=2e9,
+        section_len=1024,
+        resample_fn=lambda x, _fs_in, _fs_out: x,
+        s3_client=s3,
+    )
+    original_body = s3.objects[("example-bucket", "cache/sample_000000.pt")]
+
+    second = atu.precompute_training_cache_s3(
+        dataset_root=data_root,
+        cache_s3_uri="s3://example-bucket/cache",
+        jammer_sampling_freq=2e9,
+        section_len=256,
+        overwrite=False,
+        resample_fn=lambda x, _fs_in, _fs_out: x,
+        s3_client=s3,
+    )
+
+    assert second == first
+    assert s3.objects[("example-bucket", "cache/sample_000000.pt")] == original_body
+
+
+def test_create_cached_dataloader_s3_rejects_empty_prefix():
+    with pytest.raises(ValueError, match="No cache records found"):
+        atu.create_cached_dataloader_s3(
+            "s3://example-bucket/empty",
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            s3_client=_FakeS3Client(),
+        )
