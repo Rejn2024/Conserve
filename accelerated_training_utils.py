@@ -10,9 +10,11 @@ Implements four performance-focused capabilities:
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -39,6 +41,37 @@ def repeat_to_length_mod(arr, target_length):
 
     idx = torch.arange(target_length, device=arr.device) % arr.numel()
     return arr[idx]
+
+
+def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
+    """Parse an s3://bucket/prefix URI into bucket and normalized prefix."""
+
+    parsed = urlparse(str(s3_uri))
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Expected an S3 URI like s3://bucket/prefix, got {s3_uri!r}")
+    return parsed.netloc, parsed.path.lstrip("/").rstrip("/")
+
+
+def _join_s3_key(prefix: str, name: str) -> str:
+    """Join an S3 prefix and object name without introducing leading slashes."""
+
+    return f"{prefix}/{name}" if prefix else name
+
+
+def _get_boto3_client(s3_client: Optional[Any] = None) -> Any:
+    """Return a boto3 S3 client, importing boto3 only for S3-specific paths."""
+
+    if s3_client is not None:
+        return s3_client
+    try:
+        import boto3
+    except ImportError as exc:
+        raise ImportError(
+            "boto3 is required for S3 cache helpers. Install it with `pip install boto3` "
+            "in your AWS JupyterLab environment."
+        ) from exc
+    return boto3.client("s3")
+
 
 def precompute_training_cache(
     dataset_root: Path,
@@ -115,6 +148,104 @@ def precompute_training_cache(
     return produced
 
 
+def precompute_training_cache_s3(
+    dataset_root: Path,
+    s3_cache_root: str,
+    jammer_sampling_freq: float,
+    *,
+    section_len: int = 1024,
+    overwrite: bool = False,
+    resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
+    s3_client: Optional[Any] = None,
+) -> List[str]:
+    """Precompute deterministic sample tensors and upload the cache to S3.
+
+    Parameters are equivalent to :func:`precompute_training_cache`, except
+    ``s3_cache_root`` is an S3 URI such as ``s3://my-bucket/cache/train``.
+    The function writes one ``sample_*.pt`` object per source sample plus a
+    ``manifest.json`` object under that prefix. AWS credentials and region are
+    resolved by boto3, which works naturally in AWS-hosted JupyterLab/SageMaker
+    environments that have an attached IAM role.
+    """
+
+    s3 = _get_boto3_client(s3_client)
+    bucket, prefix = _parse_s3_uri(s3_cache_root)
+
+    if resample_fn is None:
+        import advanced_link_skdsp_v6_robust as link6
+
+        resample = link6.resample_iq
+    else:
+        resample = resample_fn
+
+    dataset_root = Path(dataset_root)
+
+    import load_tx_iq_data as loadmod
+
+    sample_dirs = loadmod.list_sample_dirs(dataset_root)
+    produced: List[str] = []
+
+    for sdir in sample_dirs:
+        object_name = f"{sdir.name}.pt"
+        object_key = _join_s3_key(prefix, object_name)
+        object_uri = f"s3://{bucket}/{object_key}"
+
+        if not overwrite:
+            try:
+                s3.head_object(Bucket=bucket, Key=object_key)
+                produced.append(object_uri)
+                continue
+            except Exception as exc:
+                error_code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+                if error_code not in {"404", "NoSuchKey", "NotFound"}:
+                    # Some clients surface missing keys as generic exceptions
+                    # without a structured code; otherwise preserve real S3 errors.
+                    if "404" not in str(exc) and "not found" not in str(exc).lower():
+                        raise
+
+        whole = loadmod.load_whole_iq(sdir)
+        sections = loadmod.load_sections(sdir)
+        sample_rate_hz = float(whole["meta"]["sample_rate_hz"])
+
+        iq1 = resample(sections["sections"][0], sample_rate_hz, jammer_sampling_freq)[:section_len]
+        iq2 = resample(sections["sections"][1], sample_rate_hz, jammer_sampling_freq)[:section_len]
+        iq3 = resample(sections["sections"][2], sample_rate_hz, jammer_sampling_freq)[:section_len]
+
+        record = {
+            "sample_name": sdir.name,
+            "source_dir": str(sdir),
+            "whole_iq": _to_complex64_tensor(whole["iq"]),
+            "whole_meta": whole["meta"],
+            "whole_sample_rate_hz": sample_rate_hz,
+            "jammer_sampling_freq": float(jammer_sampling_freq),
+            "iq1": _to_complex64_tensor(iq1),
+            "iq2": _to_complex64_tensor(iq2),
+            "iq3": _to_complex64_tensor(iq3),
+        }
+        buffer = io.BytesIO()
+        torch.save(record, buffer)
+        buffer.seek(0)
+        s3.put_object(Bucket=bucket, Key=object_key, Body=buffer.getvalue())
+        produced.append(object_uri)
+
+    manifest = {
+        "dataset_root": str(dataset_root),
+        "cache_root": s3_cache_root.rstrip("/"),
+        "jammer_sampling_freq": float(jammer_sampling_freq),
+        "section_len": int(section_len),
+        "num_samples": len(produced),
+        "files": [uri.rsplit("/", 1)[-1] for uri in produced],
+    }
+    s3.put_object(
+        Bucket=bucket,
+        Key=_join_s3_key(prefix, "manifest.json"),
+        Body=json.dumps(manifest, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    return produced
+
+
 class CachedIQDataset(Dataset):
     """Dataset that reads per-sample cached .pt records."""
 
@@ -153,6 +284,59 @@ def collate_cached_iq(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+class CachedIQS3Dataset(Dataset):
+    """Dataset that reads per-sample cached .pt records directly from S3."""
+
+    def __init__(self, s3_cache_root: str, *, s3_client: Optional[Any] = None):
+        self.s3_cache_root = str(s3_cache_root).rstrip("/")
+        self.bucket, self.prefix = _parse_s3_uri(self.s3_cache_root)
+        self._s3_client = s3_client
+        self._external_s3_client = s3_client is not None
+        self.records = self._list_records()
+        if not self._external_s3_client:
+            self._s3_client = None
+        if not self.records:
+            raise ValueError(f"No S3 cache records found in {self.s3_cache_root}")
+
+    def _client(self) -> Any:
+        # DataLoader workers receive a pickled copy of the dataset; create the
+        # boto3 client lazily in each worker rather than sharing one process-wide.
+        if self._s3_client is None:
+            self._s3_client = _get_boto3_client()
+        return self._s3_client
+
+    def _list_records(self) -> List[str]:
+        s3 = self._client()
+        list_prefix = f"{self.prefix}/" if self.prefix else ""
+        records: List[str] = []
+        continuation_token: Optional[str] = None
+
+        while True:
+            kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Prefix": list_prefix}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = s3.list_objects_v2(**kwargs)
+            for obj in response.get("Contents", []):
+                key = obj.get("Key", "")
+                name = key.rsplit("/", 1)[-1]
+                if name.startswith("sample_") and name.endswith(".pt"):
+                    records.append(key)
+
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+
+        return sorted(records)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        response = self._client().get_object(Bucket=self.bucket, Key=self.records[idx])
+        body = response["Body"].read()
+        return torch.load(io.BytesIO(body), map_location="cpu", weights_only=False)
+
+
 def create_cached_dataloader(
     cache_root: Path,
     *,
@@ -164,6 +348,42 @@ def create_cached_dataloader(
     persistent_workers: bool = True,
 ) -> DataLoader:
     ds = CachedIQDataset(cache_root)
+    kwargs: Dict[str, Any] = {
+        "dataset": ds,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "collate_fn": collate_cached_iq,
+    }
+
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["persistent_workers"] = persistent_workers
+
+    return DataLoader(**kwargs)
+
+
+def create_cached_dataloader_s3(
+    s3_cache_root: str,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
+    s3_client: Optional[Any] = None,
+) -> DataLoader:
+    """Create a DataLoader over cached IQ records stored in S3.
+
+    The returned batches use the same ``collate_cached_iq`` output schema as
+    ``create_cached_dataloader`` (``whole_iq_list``, ``whole_meta_list``,
+    ``whole_sr_list``, ``iq1``, ``iq2``, ``iq3``, etc.), so existing batched
+    training loops such as ``train_rl_batched`` can consume it without changes.
+    """
+
+    ds = CachedIQS3Dataset(s3_cache_root, s3_client=s3_client)
     kwargs: Dict[str, Any] = {
         "dataset": ds,
         "batch_size": batch_size,
