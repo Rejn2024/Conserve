@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from pathlib import Path
 import os
+import logging
 import advanced_link_skdsp_v6_robust as link6
 import score_iq_decode as scorer
 
@@ -23,6 +24,9 @@ from accelerated_training_utils import (JammerVecEnv,
 from tx_controller_tone_pulse_stft_varlen_3 import (ActorCritic,
                                                     TonePulseTXControlNetVarLen,
                                                     build_controlled_tone_pulse_batch_from_iq_batches)
+
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class PPOConfig:
@@ -201,6 +205,8 @@ def train_rl_loop(policy: ActorCritic,
     ema_beta = 0.9
     ema_train_loss = None
     ema_test_loss = None
+    ema_train_decode_pct = None
+    ema_test_decode_pct = None
 
     try:
         for epoch in range(epochs):
@@ -267,13 +273,17 @@ def train_rl_loop(policy: ActorCritic,
 
             ema_train_loss = train_loss_epoch if ema_train_loss is None else (ema_beta * ema_train_loss + (1.0 - ema_beta) * train_loss_epoch)
             ema_test_loss = test_loss if ema_test_loss is None else (ema_beta * ema_test_loss + (1.0 - ema_beta) * test_loss)
+            ema_train_decode_pct = train_decode_pct if ema_train_decode_pct is None else (ema_beta * ema_train_decode_pct + (1.0 - ema_beta) * train_decode_pct)
+            ema_test_decode_pct = test_decode_pct if ema_test_decode_pct is None else (ema_beta * ema_test_decode_pct + (1.0 - ema_beta) * test_decode_pct)
 
             writer.add_scalar("train/loss_epoch", train_loss_epoch, epoch)
             writer.add_scalar("train/loss_ema", ema_train_loss, epoch)
             writer.add_scalar("test/loss_epoch", test_loss, epoch)
             writer.add_scalar("test/loss_ema", ema_test_loss, epoch)
             writer.add_scalar("train/decode_success_pct", train_decode_pct, epoch)
+            writer.add_scalar("train/decode_success_pct_ema", ema_train_decode_pct, epoch)
             writer.add_scalar("test/decode_success_pct", test_decode_pct, epoch)
+            writer.add_scalar("test/decode_success_pct_ema", ema_test_decode_pct, epoch)
             if test_loss < best_test_loss:
                 best_test_loss = test_loss
                 torch.save(
@@ -288,7 +298,7 @@ def train_rl_loop(policy: ActorCritic,
                 )
                 print(f"Saved improved checkpoint at epoch={epoch + 1} test_loss={test_loss:.6f} -> {best_checkpoint_path}")
 
-            print(
+            log_message = (
                 f"epoch={epoch + 1}/{epochs} "
                 f"updates={total_updates} "
                 f"steps_per_epoch={steps_per_epoch} "
@@ -297,9 +307,13 @@ def train_rl_loop(policy: ActorCritic,
                 f"test_loss={test_loss:.4f} "
                 f"test_loss_ema={ema_test_loss:.4f} "
                 f"train_decode_pct={train_decode_pct:.2f} "
+                f"train_decode_pct_ema={ema_train_decode_pct:.2f} "
                 f"test_decode_pct={test_decode_pct:.2f} "
+                f"test_decode_pct_ema={ema_test_decode_pct:.2f} "
                 f"best_test_loss={best_test_loss:.4f}"
             )
+            logger.info(log_message)
+            print(log_message)
     finally:
         writer.close()
 
