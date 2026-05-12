@@ -2,21 +2,14 @@
 """
 score_iq_decode.py
 
-Load an IQ file and metadata, attempt decode with advanced_link_skdsp_v4_robust,
-and output a score:
+Load an IQ file and metadata, attempt decode with advanced_link_skdsp_v7_robust,
+and output an error score:
 
-- 0.0 if decode fails or raises an error
-- 1.0 if decode matches the original message/bit string perfectly
-- 1 / Levenshtein_distance if decode succeeds but does not match perfectly
+- Pre-FEC coded BER from payload soft decisions after pilot removal/deinterleaving.
+- Plus post-FEC payload+CRC BER after FEC decode and descrambling, before CRC rejection.
+- Plus 1.0 when the expected decoded payload/message is missing.
 
-Matching logic
---------------
-Message mode:
-- compare decoded UTF-8 message with original message
-
-Random-bits mode:
-- reconstruct original random bit string from metadata
-- compare against decoded payload converted to bit string and truncated to original length
+Lower scores are better; a clean decode with no bit errors scores 0.0.
 """
 
 from __future__ import annotations
@@ -62,26 +55,6 @@ def bytes_to_bitstring(data: bytes, n_bits: Optional[int] = None) -> str:
     return s
 
 
-def levenshtein_distance(a: str, b: str) -> int:
-    if a == b:
-        return 0
-    if len(a) == 0:
-        return len(b)
-    if len(b) == 0:
-        return len(a)
-
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        curr = [i]
-        for j, cb in enumerate(b, start=1):
-            ins = curr[j - 1] + 1
-            dele = prev[j] + 1
-            sub = prev[j - 1] + (0 if ca == cb else 1)
-            curr.append(min(ins, dele, sub))
-        prev = curr
-    return prev[-1]
-
-
 def decode_iq(iq_raw_path: Path, metadata: dict) -> Optional[dict]:
     rx_args = [
         "rx",
@@ -110,78 +83,95 @@ def decode_iq(iq_raw_path: Path, metadata: dict) -> Optional[dict]:
         return None
 
 
-def score_from_strings(expected: str, decoded: Optional[str]) -> float:
-    if decoded is None:
-        return 1.0
-    if decoded == expected:
-        return 0.0
-    dist = levenshtein_distance(expected, decoded)
-    if dist <= 0:
-        return 0.0
-    return float(dist) / (1.0 + float(dist))
-
-
-def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
-    if rx_result is None:
-        return 1.0
-
+def expected_payload_crc_bytes(metadata: dict) -> Optional[bytes]:
     payload_source = metadata.get("payload_source")
     payload_desc = metadata.get("payload_desc", {})
 
-    # Message mode
     if payload_source == "message" or payload_desc.get("mode") == "message":
-        expected_message = metadata.get("message")
+        message = metadata.get("message")
+        if message is None:
+            message = payload_desc.get("message")
+        if message is None:
+            return None
+        return link.build_payload_bytes_from_message(message)
 
-        if expected_message is None:
-            expected_message = payload_desc.get("message")
-
-        if expected_message is None:
-            preview = payload_desc.get("message_preview")
-            decoded_message = rx_result.get("message")
-            if decoded_message is None:
-                return 1.0
-            if preview is not None and not decoded_message.startswith(preview):
-                return 1.0
-            expected_len = payload_desc.get("message_length")
-            if expected_len is not None and len(decoded_message) != expected_len:
-                return 1.0
-            return 0.0
-
-        return score_from_strings(expected_message, rx_result.get("message"))
-
-    # Random-bit mode
-    if (isinstance(payload_source, str) and payload_source.startswith("random_bits:")) or payload_desc.get("mode") == "random_bits":
+    if (
+        isinstance(payload_source, str)
+        and payload_source.startswith("random_bits:")
+    ) or payload_desc.get("mode") == "random_bits":
         random_bits = metadata.get("random_bits")
         random_seed = metadata.get("random_seed")
-
         if random_bits is None:
             random_bits = payload_desc.get("random_bits")
         if random_seed is None:
             random_seed = payload_desc.get("random_seed")
-
         if random_bits is None or random_seed is None:
-            return 1.0
+            return None
+        return link.build_payload_bytes_from_random_bits(int(random_bits), int(random_seed))
 
-        expected_payload = reconstruct_expected_random_payload(int(random_bits), int(random_seed))
-        expected_bitstring = bytes_to_bitstring(expected_payload, n_bits=int(random_bits))
+    return None
 
-        decoded_payload = rx_result.get("payload_bytes")
-        if decoded_payload is None:
-            return 1.0
 
-        decoded_bitstring = bytes_to_bitstring(decoded_payload, n_bits=int(random_bits))
-        if decoded_bitstring == expected_bitstring:
-            return 0.0
+def bit_error_rate(rx_bits, tx_bits) -> float:
+    if rx_bits is None or tx_bits is None:
+        return 0.0
+    tx = np.asarray(tx_bits, dtype=np.int8)
+    rx = np.asarray(rx_bits, dtype=np.int8)
+    if tx.size == 0:
+        return 0.0
+    n = min(rx.size, tx.size)
+    errors = int(np.count_nonzero(rx[:n] != tx[:n]))
+    errors += max(0, int(tx.size) - int(rx.size))
+    return float(errors) / float(tx.size)
 
-        dist = levenshtein_distance(expected_bitstring, decoded_bitstring)
-        if dist <= 0:
-            return 0.0
-        return float(dist)  / (1 + float(dist))
 
-    # Unknown mode fallback
-    if rx_result.get("payload_len", 0) <= 0:
-        return 1.0
-    return 0.0
+def expected_coded_bits(payload_crc_bytes: bytes, fec_mode: str) -> list[int]:
+    payload_plain_bits = link.bytes_to_bits_msb(payload_crc_bytes)
+    payload_scrambled = link.scramble_bits(payload_plain_bits, seed=0x5D)
+    return link.FECCodec(fec_mode).encode_bits(payload_scrambled)
+
+
+def decoded_payload_missing(rx_result: Optional[dict], metadata: dict) -> bool:
+    if rx_result is None:
+        return True
+
+    payload_source = metadata.get("payload_source")
+    payload_desc = metadata.get("payload_desc", {})
+    if payload_source == "message" or payload_desc.get("mode") == "message":
+        return rx_result.get("message") is None
+
+    if (
+        isinstance(payload_source, str)
+        and payload_source.startswith("random_bits:")
+    ) or payload_desc.get("mode") == "random_bits":
+        return rx_result.get("payload_bytes") is None
+
+    return rx_result.get("payload_bytes") is None and rx_result.get("message") is None
+
+
+def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
+    expected_payload_crc = expected_payload_crc_bytes(metadata)
+    missing_penalty = 1.0 if decoded_payload_missing(rx_result, metadata) else 0.0
+
+    if rx_result is None or expected_payload_crc is None:
+        return missing_penalty
+
+    diagnostics = rx_result.get("decode_diagnostics") or {}
+    fec_mode = str(metadata.get("fec", "none"))
+
+    tx_payload_crc_bits = link.bytes_to_bits_msb(expected_payload_crc)
+    tx_coded_bits = expected_coded_bits(expected_payload_crc, fec_mode)
+
+    pre_fec_coded_ber = bit_error_rate(
+        diagnostics.get("rx_coded_bits_hard"),
+        tx_coded_bits,
+    )
+    post_fec_payload_crc_ber = bit_error_rate(
+        diagnostics.get("rx_fec_decoded_bits"),
+        tx_payload_crc_bits,
+    )
+
+    return pre_fec_coded_ber + post_fec_payload_crc_ber + missing_penalty
 
 
 def build_parser():

@@ -4,15 +4,13 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pytest
-
-import advanced_link_skdsp_v4_robust as link
+import advanced_link_skdsp_v7_robust as link
 import generate_tx_iq_dataset as genmod
 import score_iq_decode as scorer
 
 
 TEST_MESSAGE = (
-    "This is a message-mode payload used for testing score_iq_decode with the v4 robust link. "
+    "This is a message-mode payload used for testing score_iq_decode with the v7 robust link. "
     "It should decode correctly in clean conditions."
 )
 
@@ -53,45 +51,62 @@ def test_bytes_to_bitstring():
     assert scorer.bytes_to_bitstring(data, n_bits=12) == "101010101111"
 
 
-def test_levenshtein_distance():
-    assert scorer.levenshtein_distance("abc", "abc") == 0
-    assert scorer.levenshtein_distance("abc", "ab") == 1
-    assert scorer.levenshtein_distance("abc", "axc") == 1
-    assert scorer.levenshtein_distance("", "abc") == 3
-
-
-def test_score_from_strings():
-    assert scorer.score_from_strings("abc", "abc") == 1.0
-    assert scorer.score_from_strings("abc", None) == 0.0
-    assert scorer.score_from_strings("abc", "abx") == 1.0
-    assert scorer.score_from_strings("abcd", "wxyz") == pytest.approx(0.25)
+def make_diagnostic_result(
+    payload_crc: bytes,
+    fec: str,
+    *,
+    message: str | None = None,
+    flip_pre: bool = False,
+    flip_post: bool = False,
+):
+    coded_bits = scorer.expected_coded_bits(payload_crc, fec)
+    payload_crc_bits = link.bytes_to_bits_msb(payload_crc)
+    if flip_pre:
+        coded_bits = coded_bits[:]
+        coded_bits[0] ^= 1
+    if flip_post:
+        payload_crc_bits = payload_crc_bits[:]
+        payload_crc_bits[0] ^= 1
+    return {
+        "message": message,
+        "payload_bytes": payload_crc[:-4],
+        "payload_len": len(payload_crc) - 4,
+        "decode_diagnostics": {
+            "rx_coded_bits_hard": coded_bits,
+            "rx_fec_decoded_bits": payload_crc_bits,
+        },
+    }
 
 
 def test_score_decode_message_success():
-    rx_result = {
-        "message": "hello world",
-        "payload_len": 11,
-    }
+    payload_crc = link.build_payload_bytes_from_message("hello world")
+    rx_result = make_diagnostic_result(payload_crc, "none", message="hello world")
     metadata = {
         "payload_source": "message",
         "message": "hello world",
+        "fec": "none",
     }
 
-    assert scorer.score_decode(rx_result, metadata) == 1.0
+    assert scorer.score_decode(rx_result, metadata) == 0.0
 
 
-def test_score_decode_message_partial():
-    rx_result = {
-        "message": "hedlo wolxd",
-        "payload_len": 11,
-    }
+def test_score_decode_message_bit_errors():
+    payload_crc = link.build_payload_bytes_from_message("hello world")
+    rx_result = make_diagnostic_result(
+        payload_crc,
+        "none",
+        message="hello world",
+        flip_pre=True,
+        flip_post=True,
+    )
     metadata = {
         "payload_source": "message",
         "message": "hello world",
+        "fec": "none",
     }
 
     score = scorer.score_decode(rx_result, metadata)
-    assert 0.0 < score < 1.0
+    assert score > 0.0
 
 
 def test_score_decode_message_failure_none():
@@ -99,40 +114,34 @@ def test_score_decode_message_failure_none():
         "payload_source": "message",
         "message": "hello world",
     }
-    assert scorer.score_decode(None, metadata) == 0.0
+    assert scorer.score_decode(None, metadata) == 1.0
 
 
 def test_score_decode_random_bits_success():
     n_bits = 511
     seed = 5
-    expected_payload = scorer.reconstruct_expected_random_payload(n_bits, seed)
-
-    rx_result = {
-        "message": None,
-        "payload_bytes": expected_payload,
-        "payload_len": len(expected_payload),
-    }
+    payload_crc = link.build_payload_bytes_from_random_bits(n_bits, seed)
+    rx_result = make_diagnostic_result(payload_crc, "none", message=None)
     metadata = {
         "payload_source": f"random_bits:{n_bits}",
         "random_bits": n_bits,
         "random_seed": seed,
     }
 
-    assert scorer.score_decode(rx_result, metadata) == 1.0
+    assert scorer.score_decode(rx_result, metadata) == 0.0
 
 
 def test_score_decode_random_bits_partial():
     n_bits = 16
     seed = 5
-    expected_payload = scorer.reconstruct_expected_random_payload(n_bits, seed)
-    wrong = bytearray(expected_payload)
-    wrong[0] ^= 0b00000011
-
-    rx_result = {
-        "message": None,
-        "payload_bytes": bytes(wrong),
-        "payload_len": len(wrong),
-    }
+    payload_crc = link.build_payload_bytes_from_random_bits(n_bits, seed)
+    rx_result = make_diagnostic_result(
+        payload_crc,
+        "none",
+        message=None,
+        flip_pre=True,
+        flip_post=True,
+    )
     metadata = {
         "payload_source": f"random_bits:{n_bits}",
         "random_bits": n_bits,
@@ -140,7 +149,7 @@ def test_score_decode_random_bits_partial():
     }
 
     score = scorer.score_decode(rx_result, metadata)
-    assert 0.0 < score < 1.0
+    assert score > 0.0
 
 
 def test_write_temp_raw_iq():
@@ -174,7 +183,7 @@ def test_end_to_end_main_message_mode(tmp_path: Path):
         seed=1,
     )
 
-    np.save(iq_path, result.iq)
+    np.save(iq_path, link._as_numpy_complex64(result.iq))
 
     meta = dict(result.metadata)
     meta["message"] = TEST_MESSAGE
@@ -182,7 +191,7 @@ def test_end_to_end_main_message_mode(tmp_path: Path):
         json.dump(meta, f, indent=2)
 
     score = scorer.main(["--iq", str(iq_path), "--metadata", str(meta_path)])
-    assert score == 1.0
+    assert score == 0.0
 
 
 def test_end_to_end_main_random_bits_mode(tmp_path: Path):
@@ -208,13 +217,13 @@ def test_end_to_end_main_random_bits_mode(tmp_path: Path):
         seed=1,
     )
 
-    np.save(iq_path, result.iq)
+    np.save(iq_path, link._as_numpy_complex64(result.iq))
 
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(result.metadata, f, indent=2)
 
     score = scorer.main(["--iq", str(iq_path), "--metadata", str(meta_path)])
-    assert score == 1.0
+    assert score == 0.0
 
 
 def test_end_to_end_generated_dataset_message(tmp_path: Path):
@@ -235,7 +244,7 @@ def test_end_to_end_generated_dataset_message(tmp_path: Path):
     meta_path = sample_dir / "whole_meta.json"
 
     score = scorer.main(["--iq", str(iq_path), "--metadata", str(meta_path)])
-    assert 0.0 <= score <= 1.0
+    assert 0.0 <= score <= 3.0
 
 
 def test_end_to_end_generated_dataset_random(tmp_path: Path):
@@ -256,4 +265,4 @@ def test_end_to_end_generated_dataset_random(tmp_path: Path):
     meta_path = sample_dir / "whole_meta.json"
 
     score = scorer.main(["--iq", str(iq_path), "--metadata", str(meta_path)])
-    assert 0.0 <= score <= 1.0
+    assert 0.0 <= score <= 3.0

@@ -1516,7 +1516,7 @@ def _quick_header_screen(
     return choose_valid_header_from_copies(soft_bits[hdr_start:hdr_end])
 
 
-def try_decode_from_symbols(
+def try_decode_from_symbols_diagnostics(
     symbols: Union[np.ndarray, torch.Tensor],
     fec_mode: str,
     interleave: bool,
@@ -1524,12 +1524,28 @@ def try_decode_from_symbols(
     symbol_rate_hz: float,
     eq_taps: int,
     known_payload_len: Optional[int] = None,
-) -> Optional[bytes]:
+) -> dict:
+    diagnostics = {
+        "payload": None,
+        "payload_len": None,
+        "crc_ok": False,
+        "failed_stage": None,
+        "payload_soft": None,
+        "rx_coded_bits_hard": None,
+        "rx_fec_decoded_bits_scrambled": None,
+        "rx_fec_decoded_bits": None,
+        "decoded_bytes_before_crc": None,
+    }
+
+    def fail(stage: str) -> dict:
+        diagnostics["failed_stage"] = stage
+        return diagnostics
+
     symbols_t = _as_complex_tensor(symbols).to(dtype=torch.complex64)
     access_syms = bpsk_map(ACCESS_BITS).to(device=symbols_t.device, dtype=torch.complex64)
 
     if symbols_t.numel() < access_syms.numel() + HEADER_COPIES * HEADER_PROT_BITS_LEN:
-        return None
+        return fail("too_few_symbols_for_access_and_header")
 
     residual_cfo_hz = estimate_residual_cfo_from_preamble(symbols_t[:PREAMBLE_BITS_LEN], symbol_rate_hz)
     symbols_t = apply_symbol_rate_cfo(symbols_t, residual_cfo_hz, symbol_rate_hz)
@@ -1537,7 +1553,7 @@ def try_decode_from_symbols(
     train_start = PREAMBLE_BITS_LEN + SYNC_BITS_LEN
     train_end = train_start + TRAINING_LEN_BITS
     if symbols_t.numel() < train_end:
-        return None
+        return fail("too_few_symbols_for_training")
 
     rx_train = symbols_t[train_start:train_end]
     tx_train = access_syms[train_start:train_end]
@@ -1554,11 +1570,12 @@ def try_decode_from_symbols(
     hdr_start = ACCESS_BITS_LEN
     hdr_end = hdr_start + HEADER_COPIES * HEADER_PROT_BITS_LEN
     if hdr_end > soft_bits.numel():
-        return None
+        return fail("too_few_symbols_for_header")
 
     payload_len = known_payload_len if known_payload_len is not None else choose_valid_header_from_copies(soft_bits[hdr_start:hdr_end])
     if payload_len is None:
-        return None
+        return fail("header_decode_failed")
+    diagnostics["payload_len"] = int(payload_len)
 
     payload_plain_bits = (payload_len + 4) * 8
     fec = FECCodec(fec_mode)
@@ -1570,7 +1587,7 @@ def try_decode_from_symbols(
     data_start = hdr_end
     data_end = data_start + payload_with_pilots_bits
     if data_end > soft_bits.numel():
-        return None
+        return fail("too_few_symbols_for_payload")
 
     eq_symbols = apply_pilot_phase_tracking(
         eq_symbols,
@@ -1591,15 +1608,49 @@ def try_decode_from_symbols(
     if interleave:
         payload_soft = block_deinterleave_soft(payload_soft, rows=interleave_rows)
 
-    decoded_bits = fec.decode_soft(payload_soft)
-    if len(decoded_bits) < payload_plain_bits:
-        return None
+    diagnostics["payload_soft"] = payload_soft
+    diagnostics["rx_coded_bits_hard"] = (payload_soft > 0).astype(np.int8).tolist()
 
-    decoded_bits = decoded_bits[:payload_plain_bits]
+    decoded_bits_scrambled = fec.decode_soft(payload_soft)
+    diagnostics["rx_fec_decoded_bits_scrambled"] = decoded_bits_scrambled[:]
+    if len(decoded_bits_scrambled) < payload_plain_bits:
+        return fail("fec_decode_too_short")
+
+    decoded_bits = decoded_bits_scrambled[:payload_plain_bits]
     decoded_bits = descramble_bits(decoded_bits, seed=0x5D)
+    diagnostics["rx_fec_decoded_bits"] = decoded_bits[:]
     decoded_bytes = bits_to_bytes_msb(decoded_bits)
+    diagnostics["decoded_bytes_before_crc"] = decoded_bytes
 
-    return parse_payload_bytes(decoded_bytes, payload_len)
+    payload = parse_payload_bytes(decoded_bytes, payload_len)
+    diagnostics["payload"] = payload
+    diagnostics["crc_ok"] = payload is not None
+    if payload is None:
+        return fail("crc_failed")
+
+    diagnostics["failed_stage"] = None
+    return diagnostics
+
+
+def try_decode_from_symbols(
+    symbols: Union[np.ndarray, torch.Tensor],
+    fec_mode: str,
+    interleave: bool,
+    interleave_rows: int,
+    symbol_rate_hz: float,
+    eq_taps: int,
+    known_payload_len: Optional[int] = None,
+) -> Optional[bytes]:
+    diagnostics = try_decode_from_symbols_diagnostics(
+        symbols=symbols,
+        fec_mode=fec_mode,
+        interleave=interleave,
+        interleave_rows=interleave_rows,
+        symbol_rate_hz=symbol_rate_hz,
+        eq_taps=eq_taps,
+        known_payload_len=known_payload_len,
+    )
+    return diagnostics.get("payload") if diagnostics.get("crc_ok") else None
 
 
 def try_decode_over_sample_deltas(
@@ -1664,6 +1715,104 @@ def try_decode_over_sample_deltas(
 
 
 
+def _diagnostic_rank(diagnostics: Optional[dict]) -> int:
+    if not diagnostics:
+        return -1
+    if diagnostics.get("crc_ok"):
+        return 100
+    if diagnostics.get("rx_fec_decoded_bits") is not None:
+        return 80
+    if diagnostics.get("rx_fec_decoded_bits_scrambled") is not None:
+        return 70
+    if diagnostics.get("payload_soft") is not None:
+        return 60
+    if diagnostics.get("payload_len") is not None:
+        return 50
+    if diagnostics.get("failed_stage") == "header_decode_failed":
+        return 20
+    return 0
+
+
+def try_decode_over_sample_deltas_diagnostics(
+    mf: Union[np.ndarray, torch.Tensor],
+    start_index_samples: int,
+    sps: int,
+    span: int,
+    sample_phase_search: int,
+    fec_mode: str,
+    interleave: bool,
+    interleave_rows: int,
+    symbol_rate_hz: float,
+    eq_taps: int,
+) -> Tuple[Optional[bytes], Optional[int], Optional[dict]]:
+
+    deltas = [0]
+    for k in range(1, sample_phase_search + 1):
+        deltas.extend([k, -k])
+
+    screened = []
+    fallback = []
+    for d in deltas:
+        symbols = extract_symbols_from_start(
+            mf=mf,
+            start_index_samples=start_index_samples,
+            sps=sps,
+            span=span,
+            sample_delta=d,
+        )
+        hdr_len = _quick_header_screen(symbols, symbol_rate_hz=symbol_rate_hz)
+        if hdr_len is not None:
+            screened.append((d, hdr_len, symbols))
+        else:
+            fallback.append((d, symbols))
+
+    best_payload = None
+    best_delta = None
+    best_diag = None
+
+    def consider(d: int, diagnostics: dict) -> bool:
+        nonlocal best_payload, best_delta, best_diag
+        payload = diagnostics.get("payload") if diagnostics.get("crc_ok") else None
+        if payload is not None:
+            best_payload = payload
+            best_delta = d
+            best_diag = diagnostics
+            return True
+        if _diagnostic_rank(diagnostics) > _diagnostic_rank(best_diag):
+            best_payload = None
+            best_delta = d
+            best_diag = diagnostics
+        return False
+
+    for d, hdr_len, symbols in screened:
+        diagnostics = try_decode_from_symbols_diagnostics(
+            symbols=symbols,
+            fec_mode=fec_mode,
+            interleave=interleave,
+            interleave_rows=interleave_rows,
+            symbol_rate_hz=symbol_rate_hz,
+            eq_taps=eq_taps,
+            known_payload_len=hdr_len,
+        )
+        if consider(d, diagnostics):
+            return best_payload, best_delta, best_diag
+
+    for d, symbols in fallback:
+        diagnostics = try_decode_from_symbols_diagnostics(
+            symbols=symbols,
+            fec_mode=fec_mode,
+            interleave=interleave,
+            interleave_rows=interleave_rows,
+            symbol_rate_hz=symbol_rate_hz,
+            eq_taps=eq_taps,
+        )
+        if consider(d, diagnostics):
+            return best_payload, best_delta, best_diag
+
+    return best_payload, best_delta, best_diag
+
+
+
 
 def rx_command(args):
     iq = _as_complex_tensor(load_iq(args.input))
@@ -1719,7 +1868,7 @@ def rx_command(args):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=args.beta, span=args.span)
 
-    payload, sample_offset_used = try_decode_over_sample_deltas(
+    payload, sample_offset_used, decode_diagnostics = try_decode_over_sample_deltas_diagnostics(
         mf=mf,
         start_index_samples=coarse_start,
         sps=sps,
@@ -1732,25 +1881,24 @@ def rx_command(args):
         eq_taps=args.eq_taps,
     )
 
-    if payload is None:
-        raise RuntimeError("No valid packet found after acquisition, header decode, FEC decode, and CRC")
-
     try:
-        message_text = payload.decode("utf-8")
+        message_text = payload.decode("utf-8") if payload is not None else None
     except UnicodeDecodeError:
         message_text = None
 
     result = {
         "payload_bytes": payload,
-        "payload_len": len(payload),
+        "payload_len": len(payload) if payload is not None else 0,
         "message": message_text,
         "sample_offset_used": sample_offset_used,
         "coarse_cfo_hz": coarse_cfo_hz,
         "coarse_metric": coarse_metric,
-        "metric_div": metric_div
+        "metric_div": metric_div,
+        "decode_diagnostics": decode_diagnostics,
+        "crc_ok": bool(decode_diagnostics.get("crc_ok")) if decode_diagnostics is not None else False,
     }
 
-    if args.output_file:
+    if args.output_file and payload is not None:
         mode = "w" if message_text is not None else "wb"
         with open(args.output_file, mode) as f:
             if message_text is not None:
@@ -1832,7 +1980,7 @@ def rx_command_iq(iq, meta):
     iq = apply_carrier_frequency(iq, carrier_hz=-coarse_cfo_hz, sample_rate_hz=dsp_sample_rate_hz)
     mf = matched_filter(iq, sps=sps, beta=beta, span=span)
 
-    payload, sample_offset_used = try_decode_over_sample_deltas(
+    payload, sample_offset_used, decode_diagnostics = try_decode_over_sample_deltas_diagnostics(
         mf=mf,
         start_index_samples=coarse_start,
         sps=sps,
@@ -1845,17 +1993,11 @@ def rx_command_iq(iq, meta):
         eq_taps=eq_taps,
     )
 
-    paylen = 0
-    if payload is None:
+    paylen = len(payload) if payload is not None else 0
+    try:
+        message_text = payload.decode("utf-8") if payload is not None else None
+    except UnicodeDecodeError:
         message_text = None
-    else:
-        paylen = len(payload)
-
-    if not isinstance(payload, type(None)):
-        try:
-            message_text = payload.decode("utf-8")
-        except UnicodeDecodeError:
-            message_text = None
 
     result = {
         "payload_bytes": payload,
@@ -1864,7 +2006,9 @@ def rx_command_iq(iq, meta):
         "sample_offset_used": sample_offset_used,
         "coarse_cfo_hz": coarse_cfo_hz,
         "coarse_metric": coarse_metric,
-        "metric_div": metric_div
+        "metric_div": metric_div,
+        "decode_diagnostics": decode_diagnostics,
+        "crc_ok": bool(decode_diagnostics.get("crc_ok")) if decode_diagnostics is not None else False,
     }
 
 
