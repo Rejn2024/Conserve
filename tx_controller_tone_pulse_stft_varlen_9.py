@@ -592,6 +592,56 @@ class ActorCritic(nn.Module):
         return action, value, log_prob
 
 
+
+def _finite_scalar_value(
+    value: Union[torch.Tensor, float, int],
+    default: float,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    """Return a finite Python float, falling back when RL/model output is NaN/Inf."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            out = float(default)
+        else:
+            out = float(value.detach().reshape(-1)[0].item())
+    else:
+        out = float(value)
+    if not math.isfinite(out):
+        out = float(default)
+    if min_value is not None:
+        out = max(float(min_value), out)
+    if max_value is not None:
+        out = min(float(max_value), out)
+    return out
+
+
+def _finite_model_scalar(
+    model_out: Dict[str, torch.Tensor],
+    key: str,
+    default: float,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    return _finite_scalar_value(model_out[key], default=default, min_value=min_value, max_value=max_value)
+
+
+def _finite_vector(
+    value: torch.Tensor,
+    *,
+    default: float = 0.0,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Sanitize vector model outputs before converting them to Python config values."""
+    y = value.detach().reshape(-1).to(dtype=dtype)
+    y = torch.nan_to_num(y, nan=float(default), posinf=float(default), neginf=float(default))
+    if min_value is not None or max_value is not None:
+        y = torch.clamp(y, min=min_value, max=max_value)
+    return y
+
+
 def _nearest_block_len(x_norm: float) -> int:
     choices = torch.tensor([128, 256, 512, 1024, 2048, 4096], dtype=torch.int64)
     idx = int(round(x_norm * (len(choices) - 1)))
@@ -706,15 +756,35 @@ def decode_tone_pulse_config(
     fading_mode = FADING_MODES[int(torch.argmax(model_out["fading_mode_logits"], dim=-1).item())]
     burst_color = NOISE_COLORS[int(torch.argmax(model_out["burst_color_logits"], dim=-1).item())]
 
-    sample_rate_hz = float(intake_sample_rate_hz * model_out["sample_rate_scale"].item())
-    rf_center_hz = float(rf_center_est_hz + model_out["rf_center_delta_hz"].item())
-    carrier_hz = float(model_out["carrier_hz_norm"].item()) * sample_rate_hz
+    sample_rate_scale = _finite_model_scalar(
+        model_out, "sample_rate_scale", default=1.0, min_value=0.1, max_value=10.0
+    )
+    rf_center_delta_hz = _finite_model_scalar(model_out, "rf_center_delta_hz", default=0.0)
+    carrier_hz_norm = _finite_model_scalar(
+        model_out, "carrier_hz_norm", default=0.0, min_value=-0.49, max_value=0.49
+    )
+    sample_rate_hz = float(max(1.0, intake_sample_rate_hz * sample_rate_scale))
+    rf_center_hz = float(rf_center_est_hz + rf_center_delta_hz)
+    carrier_hz = float(carrier_hz_norm) * sample_rate_hz
 
-    num_tones = int(round(float(model_out["num_tones_cont"].item())))
+    num_tones_cont = _finite_model_scalar(
+        model_out, "num_tones_cont", default=1.0, min_value=1.0, max_value=float(max_tones)
+    )
+    num_tones = int(round(num_tones_cont))
     num_tones = max(1, min(num_tones, max_tones))
 
-    tone_freq_mean_norms = model_out["tone_freq_mean_norms"].detach().reshape(-1)[:num_tones]
-    tone_freq_std_norms = model_out["tone_freq_std_norms"].detach().reshape(-1)[:num_tones]
+    tone_freq_mean_norms = _finite_vector(
+        model_out["tone_freq_mean_norms"],
+        default=0.0,
+        min_value=-0.49,
+        max_value=0.49,
+    )[:num_tones]
+    tone_freq_std_norms = _finite_vector(
+        model_out["tone_freq_std_norms"],
+        default=0.0,
+        min_value=0.0,
+        max_value=0.5,
+    )[:num_tones]
     tone_freq_means_hz = tone_freq_mean_norms * sample_rate_hz
     tone_frequency_std_hz = (tone_freq_std_norms * sample_rate_hz).to(dtype=torch.float64).tolist()
     tone_frequencies_hz = [
@@ -728,11 +798,11 @@ def decode_tone_pulse_config(
         for mu_f in tone_freq_means_hz
     ]
 
-    tone_amp_raw = model_out.get("tone_amp_raw", model_out["tone_power_logits"]).detach().reshape(-1)[:num_tones]
+    tone_amp_raw = _finite_vector(model_out.get("tone_amp_raw", model_out["tone_power_logits"]), default=0.0)[:num_tones]
     # Match varlen_4 mapping: independent per-tone amplitudes in ~[0.05, 1.0].
     tone_amplitudes = (0.05 + 0.95 * torch.sigmoid(tone_amp_raw)).to(dtype=torch.float64).tolist()
-    tone_phase_rel = model_out["tone_phase_rel_rad"].detach().reshape(-1)[:num_tones].to(dtype=torch.float64)
-    tone_phase_offset_rad = float(model_out["tone_phase_offset_rad"].item())
+    tone_phase_rel = _finite_vector(model_out["tone_phase_rel_rad"], default=0.0, dtype=torch.float64)[:num_tones]
+    tone_phase_offset_rad = _finite_model_scalar(model_out, "tone_phase_offset_rad", default=0.0)
     tone_initial_phases_rad = torch.zeros(num_tones, dtype=torch.float64)
     if num_tones > 1:
         tone_initial_phases_rad[1:] = torch.cumsum(tone_phase_rel[1:], dim=0)
@@ -740,13 +810,25 @@ def decode_tone_pulse_config(
 
     peak_power = None if user_peak_power_fraction is None else float(user_peak_power_fraction) * float(rx_input_power)
 
-    pulse_on_samples = int(round(float(model_out["pulse_on_samples"].item())))
-    pulse_off_samples = int(round(float(model_out["pulse_off_samples"].item())))
-    pulse_count = int(round(float(model_out["pulse_count"].item())))
-    start_offset_samples = int(round(float(model_out["start_offset"].item())))
+    pulse_on_samples = int(
+        round(_finite_model_scalar(model_out, "pulse_on_samples", default=128.0, min_value=1.0))
+    )
+    pulse_off_samples = int(
+        round(_finite_model_scalar(model_out, "pulse_off_samples", default=0.0, min_value=0.0))
+    )
+    pulse_count = int(
+        round(
+            _finite_model_scalar(
+                model_out, "pulse_count", default=1.0, min_value=1.0, max_value=float(max_pulses)
+            )
+        )
+    )
+    start_offset_samples = int(
+        round(_finite_model_scalar(model_out, "start_offset", default=0.0, min_value=0.0))
+    )
     pulse_count = max(1, min(pulse_count, max_pulses))
-    pulse_phase_rel = model_out["pulse_phase_rel_rad"].detach().reshape(-1)[:pulse_count].to(dtype=torch.float64)
-    pulse_phase_offset_rad = float(model_out["pulse_phase_offset_rad"].item())
+    pulse_phase_rel = _finite_vector(model_out["pulse_phase_rel_rad"], default=0.0, dtype=torch.float64)[:pulse_count]
+    pulse_phase_offset_rad = _finite_model_scalar(model_out, "pulse_phase_offset_rad", default=0.0)
     pulse_phase_rotations_rad = torch.zeros(pulse_count, dtype=torch.float64)
     pulse_phase_rotations_rad[0] = pulse_phase_offset_rad
     if pulse_count > 1:
@@ -770,7 +852,7 @@ def decode_tone_pulse_config(
         tone_pulse_off_samples.append(int(off_k))
         tone_pulse_count.append(int(count_k))
         tone_start_offset_samples.append(int(start_k))
-        rel_k = model_out["pulse_phase_rel_rad"].detach().reshape(-1)[:count_k].to(dtype=torch.float64)
+        rel_k = _finite_vector(model_out["pulse_phase_rel_rad"], default=0.0, dtype=torch.float64)[:count_k]
         phase_list_k = torch.zeros(count_k, dtype=torch.float64)
         phase_list_k[0] = tone_phase_offset_rad + pulse_phase_offset_rad + float(tone_initial_phases_rad[k])
         if count_k > 1:
@@ -803,17 +885,21 @@ def decode_tone_pulse_config(
         tone_pulse_count=tone_pulse_count,
         tone_start_offset_samples=tone_start_offset_samples,
         tone_pulse_phase_rotations_rad=tone_pulse_phase_rotations_rad,
-        snr_db=float(model_out["snr_db"].item()),
+        snr_db=_finite_model_scalar(model_out, "snr_db", default=30.0, min_value=0.0, max_value=100.0),
         noise_color=noise_color,
-        freq_offset=float(model_out["freq_offset"].item()),
-        timing_offset=float(model_out["timing_offset"].item()),
+        freq_offset=_finite_model_scalar(model_out, "freq_offset", default=0.0, min_value=-1.0, max_value=1.0),
+        timing_offset=_finite_model_scalar(model_out, "timing_offset", default=1.0, min_value=0.0),
         fading_mode=fading_mode,
-        fading_block_len=_nearest_block_len(float(model_out["fading_block_len_norm"].item())),
-        rician_k_db=float(model_out["rician_k_db"].item()),
-        burst_probability=float(model_out["burst_probability"].item()),
+        fading_block_len=_nearest_block_len(
+            _finite_model_scalar(
+                model_out, "fading_block_len_norm", default=0.0, min_value=0.0, max_value=1.0
+            )
+        ),
+        rician_k_db=_finite_model_scalar(model_out, "rician_k_db", default=0.0, min_value=0.0),
+        burst_probability=_finite_model_scalar(model_out, "burst_probability", default=0.0, min_value=0.0, max_value=1.0),
         burst_len_min=16,
         burst_len_max=64,
-        burst_power_ratio_db=float(model_out["burst_power_ratio_db"].item()),
+        burst_power_ratio_db=_finite_model_scalar(model_out, "burst_power_ratio_db", default=0.0, min_value=0.0),
         burst_color=burst_color,
         peak_power=peak_power,
         seed=seed,
