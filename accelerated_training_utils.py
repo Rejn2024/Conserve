@@ -558,7 +558,7 @@ def compute_batch_scores(
         jam_iq_rx_resam = resample(jam_item["tx_iq"], jammer_sampling_freq, whole_sr)
         jam_iq_rx_resam = repeat_to_length_fn(jam_iq_rx_resam, whole_iq.shape[0])
         jam_iq_t = torch.as_tensor(jam_iq_rx_resam[: whole_iq.shape[0]], dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
-        whole_iq_t = whole_iq.to(device=device, non_blocking=True)
+        whole_iq_t = whole_iq.to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
         jammed = whole_iq_t + jam_iq_t
         scores.append(criterion(jammed, whole_iq_t, whole_meta))
 
@@ -1040,7 +1040,7 @@ class JammerVecEnv:
             jam_iq_rx_resam_t = torch.as_tensor(jam_iq_rx_resam[:whole_iq.shape[0]],
                                                 dtype=link7.DEFAULT_COMPLEX_DTYPE,
                                                 device=self.device)
-            jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
+            jammed = whole_iq.to(device=self.device, dtype=link7.DEFAULT_COMPLEX_DTYPE) + jam_iq_rx_resam_t
             rx_result = link7.rx_command_iq(jammed, whole_meta)
 
             score = torch.tensor(1.0, dtype=torch.float32)
@@ -1164,9 +1164,9 @@ def run_epoch_cached(
         return False
 
     for batch_idx, batch in enumerate(dataloader):
-        iq1 = batch["iq1"].to(device=device, non_blocking=True)
-        iq2 = batch["iq2"].to(device=device, non_blocking=True)
-        iq3 = batch["iq3"].to(device=device, non_blocking=True)
+        iq1 = batch["iq1"].to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
+        iq2 = batch["iq2"].to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
+        iq3 = batch["iq3"].to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
 
         with torch.set_grad_enabled(train_mode):
             with autocast_context(device=device, enabled=amp_enabled, dtype=amp_dtype):
