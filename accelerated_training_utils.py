@@ -713,6 +713,8 @@ def jammer_controller_batch(
     actions: Sequence[Any],
     jammer_sampling_freq: float,
     device: str = "cpu",
+    rx_iq_batches: Optional[Sequence[torch.Tensor]] = None,
+    action_cfg: Optional[Dict[str, Any]] = None,
     default_output_len: int = 8_000,
     default_peak_power_fraction: float = 40.0,
     user_peak_power_fraction: float = 40.0,
@@ -742,16 +744,26 @@ def jammer_controller_batch(
 
     # Only the first action currently controls batch-wide scalar generation
     # settings; per-row action_overrides are not wired into the controlled batch
-    # builder below.  Avoid normalizing every row so callers can pass a batched
-    # tensor without an up-front Python list/CPU conversion in the env step.
-    action_cfg = _normalize_action(first_action)
+    # builder below.  Callers that do not need those batch-wide scalar settings
+    # can pass ``action_cfg={}`` to avoid normalizing a CUDA action tensor through
+    # detach().cpu().tolist() in the rollout hot path.
+    if action_cfg is None:
+        action_cfg = _normalize_action(first_action)
     desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
     # user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
 
-    iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
-    iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
-    iq3 = torch.stack([s["iq3"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+    if rx_iq_batches is None:
+        iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+        iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+        iq3 = torch.stack([s["iq3"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+    else:
+        if len(rx_iq_batches) != 3:
+            raise ValueError("rx_iq_batches must contain exactly iq1, iq2, and iq3 batches")
+        iq1, iq2, iq3 = [
+            torch.as_tensor(x, dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+            for x in rx_iq_batches
+        ]
 
     return build_controlled_tone_pulse_batch_from_iq_batches(
         model=model.backbone,
