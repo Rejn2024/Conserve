@@ -160,11 +160,11 @@ def save_sample_bundle(
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(out_dir / "whole_iq.npy", whole_iq.astype(np.complex64))
+    np.save(out_dir / "whole_iq.npy", whole_iq.astype(np.complex32))
     with open(out_dir / "whole_meta.json", "w", encoding="utf-8") as f:
         json.dump(whole_meta, f, indent=2)
 
-    np.save(out_dir / "sections.npy", sections.astype(np.complex64))
+    np.save(out_dir / "sections.npy", sections.astype(np.complex32))
     with open(out_dir / "sections_meta.json", "w", encoding="utf-8") as f:
         json.dump(sections_meta, f, indent=2)
 
