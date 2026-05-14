@@ -542,7 +542,7 @@ def compute_batch_scores(
     """
 
     if resample_fn is None:
-        import advanced_link_skdsp_v6_robust as link7
+        import advanced_link_skdsp_v7_robust as link7
 
         resample = link7.resample_iq
     else:
