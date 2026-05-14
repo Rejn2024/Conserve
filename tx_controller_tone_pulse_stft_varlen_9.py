@@ -36,15 +36,29 @@ def _as_complex_tensor(iq: Union[torch.Tensor, List[complex]]) -> torch.Tensor:
     return torch.as_tensor(iq, dtype=DEFAULT_COMPLEX_DTYPE)
 
 
+def _sanitize_complex_iq(x: torch.Tensor, clamp: float = 1.0e6) -> torch.Tensor:
+    """Replace non-finite IQ samples and clamp extreme outliers before DSP ops."""
+    return torch.complex(
+        torch.clamp(torch.nan_to_num(x.real, nan=0.0, posinf=0.0, neginf=0.0), min=-float(clamp), max=float(clamp)),
+        torch.clamp(torch.nan_to_num(x.imag, nan=0.0, posinf=0.0, neginf=0.0), min=-float(clamp), max=float(clamp)),
+    ).to(dtype=x.dtype)
+
+
+def _sanitize_stft_feature(feat: torch.Tensor, clamp: float = 1.0e6) -> torch.Tensor:
+    """Keep STFT feature planes finite for policy/distribution construction."""
+    feat = torch.nan_to_num(feat.to(dtype=torch.float32), nan=0.0, posinf=float(clamp), neginf=-float(clamp))
+    return torch.clamp(feat, min=-float(clamp), max=float(clamp))
+
+
 def measure_iq_power(iq: Union[torch.Tensor, List[complex]]) -> torch.Tensor:
-    x = _complex64_for_limited_op(_as_complex_tensor(iq))
+    x = _complex64_for_limited_op(_sanitize_complex_iq(_as_complex_tensor(iq)))
     if x.numel() == 0:
         return torch.tensor(0.0, dtype=torch.float32)
     return torch.mean(torch.abs(x) ** 2).to(dtype=torch.float32)
 
 
 def robust_mad_scale(x: Union[torch.Tensor, List[complex]], eps: float = 1e-12) -> torch.Tensor:
-    xt = _as_complex_tensor(x)
+    xt = _sanitize_complex_iq(_as_complex_tensor(x))
     work = _complex64_for_limited_op(xt)
     xr = torch.cat([work.real, work.imag], dim=0).to(dtype=torch.float32)
     med = torch.median(xr)
@@ -108,7 +122,7 @@ def preprocess_batched_iq_to_stft_feature(
     noverlap: int = 96,
     nfft: int = 128,
 ) -> Dict[str, torch.Tensor]:
-    x_batch = _as_batch_complex_tensor(iq_batch)
+    x_batch = _sanitize_complex_iq(_as_batch_complex_tensor(iq_batch))
     if x_batch.ndim != 2:
         raise ValueError(f"iq_batch must have shape [B, T], got {tuple(x_batch.shape)}")
 
@@ -131,7 +145,7 @@ def preprocess_batched_iq_to_stft_feature(
         peaks.append(proc["peak_hz"].to(dtype=torch.float32))
 
     return {
-        "feature": torch.stack(feats, dim=0).to(dtype=torch.float32),
+        "feature": _sanitize_stft_feature(torch.stack(feats, dim=0)),
         "rx_power": torch.stack(rx_powers, dim=0).to(dtype=torch.float32),
         "peak_hz": torch.stack(peaks, dim=0).to(dtype=torch.float32),
         "lengths": torch.as_tensor(lengths, dtype=torch.float32),
@@ -143,7 +157,7 @@ def preprocess_iq_to_stft_feature(
     noverlap: int = 96,
     nfft: int = 128,
 ) -> Dict[str, torch.Tensor]:
-    x_t = _as_complex_tensor(iq)
+    x_t = _sanitize_complex_iq(_as_complex_tensor(iq))
     if x_t.numel() < 8:
         x_t = F.pad(x_t, (0, 8 - int(x_t.numel())))
 
@@ -223,7 +237,7 @@ def preprocess_iq_to_stft_feature(
     )
 
     return {
-        "feature": feat.to(dtype=torch.float32),
+        "feature": _sanitize_stft_feature(feat),
         "rx_power": measure_iq_power(iq),
         "peak_hz": f[torch.argmax(torch.mean(power, dim=1))].to(dtype=torch.float32) if power.numel() else torch.tensor(0.0, dtype=torch.float32, device=x_work.device),
     }
@@ -552,6 +566,8 @@ class ActorCritic(nn.Module):
 
     def _action_distribution(self, action_mean: torch.Tensor, log_std: torch.Tensor) -> torch.distributions.Normal:
         std = torch.exp(log_std).clamp_min(self._action_std_floor)
+        action_mean = torch.nan_to_num(action_mean, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        std = torch.nan_to_num(std, nan=self._action_std_floor, posinf=20.0, neginf=self._action_std_floor).clamp_min(self._action_std_floor)
         return torch.distributions.Normal(loc=action_mean, scale=std)
 
     def act(
