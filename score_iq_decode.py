@@ -18,25 +18,43 @@ import argparse
 import json
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
 import advanced_link_skdsp_v7_robust as link
 
 
+def _as_numpy_complex64(iq: Any) -> np.ndarray:
+    """Return complex64 IQ for decode/scoring file I/O.
+
+    NumPy has no portable complex32 dtype, and the decoder raw-IQ path reads
+    complex64 samples, so torch complex32/chalf tensors are upcast here.
+    """
+    if hasattr(iq, "detach"):
+        iq = iq.detach()
+    if hasattr(iq, "to"):
+        iq = iq.to(dtype=link.DEFAULT_COMPLEX_DTYPE)
+        iq = link._complex64_for_limited_op(iq)
+    if hasattr(iq, "cpu"):
+        iq = iq.cpu()
+    if hasattr(iq, "numpy"):
+        iq = iq.numpy()
+    return np.asarray(iq, dtype=np.complex64)
+
+
 def load_iq_file(iq_path: Path) -> np.ndarray:
     suffix = iq_path.suffix.lower()
     if suffix == ".npy":
-        return np.asarray(np.load(iq_path), dtype=np.complex64)
+        return _as_numpy_complex64(np.load(iq_path))
     return np.fromfile(iq_path, dtype=np.complex64)
 
 
-def write_temp_raw_iq(iq: np.ndarray) -> Path:
+def write_temp_raw_iq(iq: Any) -> Path:
     tmp = tempfile.NamedTemporaryFile(suffix=".iq", delete=False)
     tmp_path = Path(tmp.name)
     tmp.close()
-    np.asarray(iq, dtype=np.complex64).tofile(tmp_path)
+    _as_numpy_complex64(iq).tofile(tmp_path)
     return tmp_path
 
 
@@ -176,7 +194,7 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iq", type=str, required=True, help="Path to IQ file (.npy or raw complex64)")
+    parser.add_argument("--iq", type=str, required=True, help="Path to IQ file (.npy or raw complex64; complex32 tensors are upcast for decode)")
     parser.add_argument("--metadata", type=str, required=True, help="Path to metadata JSON")
     return parser
 

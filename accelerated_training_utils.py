@@ -29,8 +29,8 @@ import advanced_link_skdsp_v7_robust as link7
 import score_iq_decode as scorer
 
 
-def _to_complex64_tensor(x: Any) -> torch.Tensor:
-    return torch.as_tensor(x, dtype=torch.complex64)
+def _to_complex_tensor(x: Any) -> torch.Tensor:
+    return torch.as_tensor(x, dtype=link7.DEFAULT_COMPLEX_DTYPE)
 
 def repeat_to_length_mod(arr, target_length):
     if arr.ndim != 1:
@@ -142,13 +142,13 @@ def _build_training_cache_record(
     return {
         "sample_name": sdir.name,
         "source_dir": str(sdir),
-        "whole_iq": _to_complex64_tensor(whole["iq"]),
+        "whole_iq": _to_complex_tensor(whole["iq"]),
         "whole_meta": whole["meta"],
         "whole_sample_rate_hz": sample_rate_hz,
         "jammer_sampling_freq": float(jammer_sampling_freq),
-        "iq1": _to_complex64_tensor(iq1),
-        "iq2": _to_complex64_tensor(iq2),
-        "iq3": _to_complex64_tensor(iq3),
+        "iq1": _to_complex_tensor(iq1),
+        "iq2": _to_complex_tensor(iq2),
+        "iq3": _to_complex_tensor(iq3),
     }
 
 
@@ -180,7 +180,7 @@ def precompute_training_cache(
     """Precompute deterministic sample tensors once and save to cache files.
 
     Each cached sample stores:
-    - whole_iq (complex64)
+    - whole_iq (complex32 when available, otherwise complex64)
     - whole_sample_rate_hz (float)
     - iq1/iq2/iq3 resampled to jammer_sampling_freq and cropped to section_len
     - metadata + source path for debugging/auditability
@@ -557,8 +557,8 @@ def compute_batch_scores(
     ):
         jam_iq_rx_resam = resample(jam_item["tx_iq"], jammer_sampling_freq, whole_sr)
         jam_iq_rx_resam = repeat_to_length_fn(jam_iq_rx_resam, whole_iq.shape[0])
-        jam_iq_t = torch.as_tensor(jam_iq_rx_resam[: whole_iq.shape[0]], dtype=torch.complex64, device=device)
-        whole_iq_t = whole_iq.to(device=device, non_blocking=True)
+        jam_iq_t = torch.as_tensor(jam_iq_rx_resam[: whole_iq.shape[0]], dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+        whole_iq_t = whole_iq.to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
         jammed = whole_iq_t + jam_iq_t
         scores.append(criterion(jammed, whole_iq_t, whole_meta))
 
@@ -749,9 +749,9 @@ def jammer_controller_batch(
     # user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
 
-    iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
-    iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
-    iq3 = torch.stack([s["iq3"] for s in samples], dim=0).to(dtype=torch.complex64, device=device)
+    iq1 = torch.stack([s["iq1"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+    iq2 = torch.stack([s["iq2"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+    iq3 = torch.stack([s["iq3"] for s in samples], dim=0).to(dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
 
     return build_controlled_tone_pulse_batch_from_iq_batches(
         model=model.backbone,
@@ -1038,9 +1038,9 @@ class JammerVecEnv:
                                                 whole_meta['sample_rate_hz'])
             jam_iq_rx_resam = repeat_to_length_mod(jam_iq_rx_resam, whole_iq.shape[0])
             jam_iq_rx_resam_t = torch.as_tensor(jam_iq_rx_resam[:whole_iq.shape[0]],
-                                                dtype=torch.complex64,
+                                                dtype=link7.DEFAULT_COMPLEX_DTYPE,
                                                 device=self.device)
-            jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
+            jammed = whole_iq.to(device=self.device, dtype=link7.DEFAULT_COMPLEX_DTYPE) + jam_iq_rx_resam_t
             rx_result = link7.rx_command_iq(jammed, whole_meta)
 
             score = torch.tensor(1.0, dtype=torch.float32)
@@ -1164,9 +1164,9 @@ def run_epoch_cached(
         return False
 
     for batch_idx, batch in enumerate(dataloader):
-        iq1 = batch["iq1"].to(device=device, non_blocking=True)
-        iq2 = batch["iq2"].to(device=device, non_blocking=True)
-        iq3 = batch["iq3"].to(device=device, non_blocking=True)
+        iq1 = batch["iq1"].to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
+        iq2 = batch["iq2"].to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
+        iq3 = batch["iq3"].to(device=device, dtype=link7.DEFAULT_COMPLEX_DTYPE, non_blocking=True)
 
         with torch.set_grad_enabled(train_mode):
             with autocast_context(device=device, enabled=amp_enabled, dtype=amp_dtype):
