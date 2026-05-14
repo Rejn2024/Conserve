@@ -1,0 +1,102 @@
+Conversation summary: torch.complex32 support and IQ cache loading
+
+User's initial question:
+"will my current tx/rx chains and pytorch operations support torch.complex32?"
+
+Answer/context for a future conversation:
+
+Short answer: No, the current TX/RX chains in this repository do not support torch.complex32 end-to-end. They are written around complex64 IQ tensors and float32 real-valued computations/features. A torch.complex32 input may still run in some entry points, but the current code usually casts it to torch.complex64 immediately, so it will not preserve complex32 or deliver end-to-end memory/bandwidth savings.
+
+Evidence from the codebase:
+
+1. Core TX/RX link code is complex64-oriented.
+   - advanced_link_skdsp_v7_robust.py has _as_complex_tensor that converts tensor inputs to torch.complex64 on DEFAULT_TORCH_DEVICE, and converts non-tensors to torch.complex64 tensors.
+   - _as_numpy_complex64 converts tensors/arrays/lists to NumPy complex64.
+   - save_iq writes np.complex64 raw IQ and load_iq reads np.complex64 raw IQ.
+   - _complex_lfilter_fir splits complex IQ into real/imag float32, performs F.conv1d, reconstructs complex output, and casts it back to torch.complex64.
+   - _resample_complex_to_len interpolates real and imaginary parts separately and returns torch.complex64.
+   - BPSK symbols, upsample buffers, carrier rotations, colored noise, and many other link intermediates are explicitly torch.complex64 and/or torch.float32.
+
+2. Controller/STFT preprocessing is complex64 + float32-oriented.
+   - tx_controller_tone_pulse_stft_varlen_9.py has _as_complex_tensor and _as_batch_complex_tensor that convert IQ to torch.complex64.
+   - preprocess_iq_to_stft_feature normalizes IQ as complex64, creates a float32 Hann window, calls torch.stft(..., return_complex=True), then derives float32 feature planes such as magnitude, phase, real, imag, power, centroid, spread, flatness, and frame power.
+   - Therefore, even if input IQ started as torch.complex32, preprocessing converts it to complex64 and later emits float32 features.
+
+3. Training/cache utilities are complex64-oriented.
+   - accelerated_training_utils.py has _to_complex64_tensor returning torch.as_tensor(x, dtype=torch.complex64).
+   - _build_training_cache_record stores whole_iq, iq1, iq2, and iq3 through _to_complex64_tensor.
+   - collate_cached_iq stacks cached iq1/iq2/iq3 tensors without changing dtype, but downstream paths often convert them to complex64.
+   - build_controlled_tone_pulse_batch_from_samples stacks iq1/iq2/iq3 and explicitly converts to torch.complex64 on the selected device.
+   - build_actorcritic_observation_from_cached_iq calls STFT preprocessing and converts resulting features to torch.float32.
+
+4. Dataset/scoring paths are also complex64-oriented.
+   - generate_tx_iq_dataset.py saves whole_iq.npy and sections.npy as np.complex64 and writes temporary candidate raw IQ as np.complex64.
+   - score_iq_decode.py loads .npy and raw IQ as np.complex64 and writes temporary raw IQ as np.complex64.
+
+PyTorch operation support caveats discussed:
+
+- PyTorch exposes torch.complex32 / torch.chalf as a complex dtype made from two float16 components, but support is not universal.
+- torch.fft support for chalf/complex32 has important limitations, especially around CUDA hardware support and power-of-two FFT sizes.
+- torch.stft and other complex operations may not provide broad, reliable complex32 coverage across CPU/GPU and arbitrary lengths.
+- torch.view_as_complex supports float32/float64 real-pair tensors, not float16 real-pair tensors, which is another practical sign that complex32 support is incomplete.
+- The local container did not have torch installed, so no live operation probe was run successfully in this environment.
+
+Practical conclusion from the first answer:
+
+- Passing torch.complex32 into the current chain will generally be upcast to torch.complex64 at helper boundaries.
+- Intermediate real computations will usually be float32.
+- Output IQ, saved IQ, generated datasets, scoring, and decode paths remain complex64.
+- Do not expect complex32 memory savings or speedups in the current end-to-end TX/RX and STFT/controller pipeline without a broader dtype refactor.
+
+Recommended approach if complex32 support is desired:
+
+- Keep complex64 for TX/RX DSP correctness and compatibility unless benchmarks prove otherwise.
+- Add configurable dtype support rather than replacing hard-coded dtypes blindly.
+- Introduce a complex_dtype and corresponding real_dtype in relevant helpers.
+- Replace hard-coded torch.complex64, torch.float32, and np.complex64 casts where appropriate.
+- Decide separately on disk format: PyTorch .pt complex32 tensors, two-channel float16 NumPy arrays, or current complex64 raw/.npy files.
+- Audit torch.stft, torch.fft, conv1d, interpolate, abs, angle, mean, log1p, and model-input paths on the target GPU.
+- Consider limiting complex32/float16 to selected neural network/cache/feature paths while keeping DSP and decode at complex64.
+
+Follow-up question:
+"Would saving IQ data as torch.complex32 permit faster loading?"
+
+Answer/context:
+
+- Potentially yes for raw I/O: complex32 uses about 4 bytes per IQ sample versus complex64's 8 bytes, so file payloads can be roughly half the size.
+- This could make loading faster if disk, network filesystem, or S3 bandwidth is the bottleneck.
+- It may be slower or neutral if Python serialization, many small files, CPU conversion, STFT computation, GPU computation, or immediate upcasting to complex64 dominates.
+- Current repository storage paths mostly use NumPy complex64 or PyTorch .pt records containing complex64 tensors, so switching to complex32 would require code changes.
+
+Follow-up question:
+"Would saving the IQ data produced by precompute_training_cache as torch.complex32 permit faster loading?"
+
+Answer/context:
+
+- For precompute_training_cache specifically, saving cached IQ tensors as torch.complex32 could make each .pt record smaller and may make torch.load faster when I/O or S3 transfer is the bottleneck.
+- The function currently saves one .pt file per sample using torch.save(record, out_path).
+- _build_training_cache_record currently stores whole_iq, iq1, iq2, and iq3 as torch.complex64 via _to_complex64_tensor.
+- CachedIQDataset loads each .pt record with torch.load(..., map_location="cpu", weights_only=False).
+- collate_cached_iq keeps whole_iq as a list and stacks iq1/iq2/iq3, so if the cache were written as complex32, those tensors could remain complex32 through load and collate.
+- However, downstream controller/STFT/control paths generally convert to complex64 and produce float32 features, so the benefit would likely be I/O-only unless those downstream conversions are changed too.
+
+Expected benefit by scenario:
+
+- Local NVMe, enough RAM, DataLoader workers enabled, compute/STFT-bound: low benefit.
+- S3 or network filesystem, large whole_iq records, cold repeated loads: moderate to high benefit.
+- Many tiny .pt records dominated by Python/serialization overhead: low to moderate benefit.
+- Immediate conversion to complex64 before use: I/O-only benefit.
+- Full complex32-aware preprocessing/control pipeline: potentially higher benefit but requires broad audit and validation.
+
+Recommended benchmark plan for cache dtype:
+
+1. Keep the current complex64 cache as baseline.
+2. Add an optional cache dtype parameter, defaulting to torch.complex64.
+3. Test variant A: iq1/iq2/iq3 saved as torch.complex32 while whole_iq remains torch.complex64.
+4. Test variant B: all cached IQ tensors saved as torch.complex32.
+5. Measure cache size, torch.load time, load+collate time, load+STFT preprocessing time, and full run_epoch_cached throughput.
+6. Validate decode/training quality because complex32 means float16 precision for both I and Q.
+
+Bottom-line recommendation:
+
+Do not switch the canonical TX/RX/DSP pipeline to torch.complex32 blindly. If the goal is faster cache loading, treat complex32 as an optional cache/storage optimization, benchmark it under the real storage environment, and expect the current downstream code to upcast back to complex64 unless refactored.
