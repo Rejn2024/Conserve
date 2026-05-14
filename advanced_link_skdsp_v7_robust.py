@@ -11,6 +11,7 @@ import concurrent.futures
 from functools import lru_cache
 import json
 import math
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,30 @@ except Exception:  # pragma: no cover - optional dependency
     AF = None
 
 DEFAULT_TORCH_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TORCH_COMPLEX32_DTYPE = getattr(torch, "complex32", getattr(torch, "chalf", None))
+_COMPLEX_DTYPE_SETTING = os.environ.get("CONSERVE_COMPLEX_DTYPE", "auto").lower()
+if _COMPLEX_DTYPE_SETTING in {"complex32", "chalf", "complex_half"}:
+    DEFAULT_COMPLEX_DTYPE = TORCH_COMPLEX32_DTYPE if TORCH_COMPLEX32_DTYPE is not None else torch.complex64
+elif _COMPLEX_DTYPE_SETTING in {"complex64", "cfloat"}:
+    DEFAULT_COMPLEX_DTYPE = torch.complex64
+elif TORCH_COMPLEX32_DTYPE is not None and DEFAULT_TORCH_DEVICE.type == "cuda":
+    DEFAULT_COMPLEX_DTYPE = TORCH_COMPLEX32_DTYPE
+else:
+    DEFAULT_COMPLEX_DTYPE = torch.complex64
+
+
+def _is_complex32_dtype(dtype: torch.dtype) -> bool:
+    return TORCH_COMPLEX32_DTYPE is not None and dtype == TORCH_COMPLEX32_DTYPE
+
+
+def _complex64_for_limited_op(x: torch.Tensor) -> torch.Tensor:
+    """Use complex64 for PyTorch ops that do not reliably support complex32."""
+    return x.to(dtype=torch.complex64) if _is_complex32_dtype(x.dtype) else x
+
+
+def _restore_complex_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return x.to(dtype=dtype) if torch.is_complex(x) and x.dtype != dtype else x
+
 
 FEC_NONE = "none"
 FEC_REP3 = "rep3"
@@ -177,13 +202,13 @@ def rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
 
 def _as_complex_tensor(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
-        return x.to(dtype=torch.complex64).to(DEFAULT_TORCH_DEVICE)
-    return torch.as_tensor(np.asarray(x), dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
+        return x.to(dtype=DEFAULT_COMPLEX_DTYPE).to(DEFAULT_TORCH_DEVICE)
+    return torch.as_tensor(np.asarray(x), dtype=DEFAULT_COMPLEX_DTYPE, device=DEFAULT_TORCH_DEVICE)
 
 
 def _as_numpy_complex64(x: Union[np.ndarray, torch.Tensor, List[complex]]) -> np.ndarray:
     if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy().astype(np.complex64, copy=False)
+        return x.detach().to(dtype=torch.complex64).cpu().numpy().astype(np.complex64, copy=False)
     return np.asarray(x, dtype=np.complex64)
 
 
@@ -206,7 +231,7 @@ def _complex_lfilter_fir(
     xi_pad = F.pad(xi, (pad, 0))
     yr = F.conv1d(xr_pad, k_r).reshape(-1) - F.conv1d(xi_pad, k_i).reshape(-1)
     yi = F.conv1d(xr_pad, k_i).reshape(-1) + F.conv1d(xi_pad, k_r).reshape(-1)
-    return torch.complex(yr, yi).to(dtype=torch.complex64)
+    return torch.complex(yr, yi).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def _resample_complex_to_len(
@@ -228,30 +253,26 @@ def _resample_complex_to_len(
     # on GPU for long vectors. Linear interpolation has predictable memory usage
     # and is sufficient for our synthetic timing-offset perturbation.
     y_r = F.interpolate(
-        xt.real.reshape(1, 1, -1),
+        xt.real.to(dtype=torch.float32).reshape(1, 1, -1),
         size=int(new_len),
         mode="linear",
         align_corners=False,
     ).reshape(-1)
     y_i = F.interpolate(
-        xt.imag.reshape(1, 1, -1),
+        xt.imag.to(dtype=torch.float32).reshape(1, 1, -1),
         size=int(new_len),
         mode="linear",
         align_corners=False,
     ).reshape(-1)
-    return torch.complex(y_r, y_i).to(dtype=torch.complex64)
+    return torch.complex(y_r, y_i).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def measure_power(x: Union[np.ndarray, torch.Tensor]) -> float:
-    xt = _as_complex_tensor(x)
+    xt = _complex64_for_limited_op(_as_complex_tensor(x))
     return float(torch.mean(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
 
 def measure_peak_power(x: Union[np.ndarray, torch.Tensor]) -> float:
-    xt = _as_complex_tensor(x)
-    return float(torch.max(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
-
-def measure_peak_power(x: Union[np.ndarray, torch.Tensor]) -> float:
-    xt = _as_complex_tensor(x)
+    xt = _complex64_for_limited_op(_as_complex_tensor(x))
     return float(torch.max(torch.abs(xt) ** 2).item()) if xt.numel() else 0.0
 
 
@@ -261,12 +282,12 @@ def bpsk_map(bits: List[int]) -> torch.Tensor:
         b > 0,
         torch.tensor(1.0, device=b.device),
         torch.tensor(-1.0, device=b.device),
-    ).to(dtype=torch.complex64)
+    ).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def upsample_and_shape(symbols: Union[np.ndarray, torch.Tensor], sps: int, taps: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     syms = _as_complex_tensor(symbols)
-    up = torch.zeros(syms.numel() * sps, dtype=torch.complex64, device=syms.device)
+    up = torch.zeros(syms.numel() * sps, dtype=DEFAULT_COMPLEX_DTYPE, device=syms.device)
     up[::sps] = syms
     return _complex_lfilter_fir(up, taps)
 
@@ -287,7 +308,7 @@ def apply_carrier_frequency(iq: Union[np.ndarray, torch.Tensor], carrier_hz: flo
         return x
     n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     phase = 2.0 * torch.pi * carrier_hz * n / sample_rate_hz
-    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=DEFAULT_COMPLEX_DTYPE)
     return x * rot
 
 
@@ -297,7 +318,7 @@ def apply_frequency_offset(iq: Union[np.ndarray, torch.Tensor], freq_offset: flo
         return x
     n = torch.arange(x.numel(), dtype=torch.float64, device=x.device)
     phase = 2.0 * torch.pi * freq_offset * n
-    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=DEFAULT_COMPLEX_DTYPE)
     return x * rot
 
 
@@ -346,7 +367,7 @@ def _complex_colored_noise(
     alpha = exponents[color]
 
     if n <= 0:
-        return torch.zeros(0, dtype=torch.complex64, device=device or DEFAULT_TORCH_DEVICE)
+        return torch.zeros(0, dtype=DEFAULT_COMPLEX_DTYPE, device=device or DEFAULT_TORCH_DEVICE)
     dev = device or DEFAULT_TORCH_DEVICE
 
     def make_real() -> torch.Tensor:
@@ -370,7 +391,7 @@ def _complex_colored_noise(
 
     i = make_real()
     q = make_real()
-    z = torch.complex(i, q).to(dtype=torch.complex64)
+    z = torch.complex(i, q).to(dtype=DEFAULT_COMPLEX_DTYPE)
     p = torch.mean(torch.abs(z) ** 2)
     if float(p.item()) > 0:
         z = z * torch.sqrt(torch.tensor(power, device=dev, dtype=torch.float32) / p)
@@ -401,7 +422,7 @@ def apply_fading(
                 torch.randn((), generator=gen, device=x.device),
             ) / math.sqrt(2.0)
             out[start:end] = x[start:end] * h
-        return out.to(dtype=torch.complex64)
+        return out.to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     if mode == "rician_block":
         out = torch.empty_like(x)
@@ -418,7 +439,7 @@ def apply_fading(
             ) * scat_scale
             h = los + scat
             out[start:end] = x[start:end] * h
-        return out.to(dtype=torch.complex64)
+        return out.to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     if mode == "multipath_static":
         taps = multipath_taps if multipath_taps is not None else [
@@ -426,7 +447,7 @@ def apply_fading(
             0.20 + 0.08j,
             0.06 - 0.04j,
         ]
-        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=torch.complex64)
+        taps_t = _as_complex_tensor(taps).to(device=x.device, dtype=DEFAULT_COMPLEX_DTYPE)
         xr = x.real.to(dtype=torch.float32).reshape(1, 1, -1)
         xi = x.imag.to(dtype=torch.float32).reshape(1, 1, -1)
         kr = torch.flip(taps_t.real.to(dtype=torch.float32), dims=[0]).reshape(1, 1, -1)
@@ -436,8 +457,8 @@ def apply_fading(
         xi_pad = F.pad(xi, (pad, 0))
         yr = F.conv1d(xr_pad, kr).reshape(-1) - F.conv1d(xi_pad, ki).reshape(-1)
         yi = F.conv1d(xr_pad, ki).reshape(-1) + F.conv1d(xi_pad, kr).reshape(-1)
-        y = torch.complex(yr, yi).to(dtype=torch.complex64)
-        return y[: x.numel()].to(dtype=torch.complex64)
+        y = torch.complex(yr, yi).to(dtype=DEFAULT_COMPLEX_DTYPE)
+        return y[: x.numel()].to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     raise ValueError(f"Unsupported fading mode: {mode}")
 
@@ -472,7 +493,7 @@ def add_impulsive_bursts(
             idx = end
         else:
             idx += 1
-    return out.to(dtype=torch.complex64)
+    return out.to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def impair_iq(
@@ -526,7 +547,7 @@ def impair_iq(
         burst_color=burst_color,
         seed=seed,
     )
-    return y.to(dtype=torch.complex64)
+    return y.to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def limit_peak_power(iq: Union[np.ndarray, torch.Tensor], max_peak_power: Optional[float]) -> Tuple[torch.Tensor, bool, float]:
@@ -539,7 +560,7 @@ def limit_peak_power(iq: Union[np.ndarray, torch.Tensor], max_peak_power: Option
     if pre_peak_power <= 0 or pre_peak_power <= max_peak_power:
         return x, False, pre_peak_power
     scale = math.sqrt(max_peak_power / pre_peak_power)
-    return (x * scale).to(dtype=torch.complex64), True, pre_peak_power
+    return (x * scale).to(dtype=DEFAULT_COMPLEX_DTYPE), True, pre_peak_power
 
 
 def robust_agc_and_blanking(x: Union[np.ndarray, torch.Tensor], blanker_k: float = 6.0) -> torch.Tensor:
@@ -547,6 +568,8 @@ def robust_agc_and_blanking(x: Union[np.ndarray, torch.Tensor], blanker_k: float
     if xt.numel() == 0:
         return xt
 
+    output_dtype = xt.dtype
+    xt = _complex64_for_limited_op(xt)
     xt = xt - torch.mean(xt)
     mag = torch.abs(xt)
     med = torch.median(mag)
@@ -563,7 +586,7 @@ def robust_agc_and_blanking(x: Union[np.ndarray, torch.Tensor], blanker_k: float
     p = torch.mean(torch.abs(xt) ** 2)
     if float(p.item()) > 0:
         xt = xt / torch.sqrt(p)
-    return xt.to(dtype=torch.complex64)
+    return _restore_complex_dtype(xt, output_dtype)
 
 
 def lfsr_sequence(n: int, seed: int = 0x5D) -> List[int]:
@@ -861,7 +884,7 @@ def _cached_rrc_taps_cpu(beta: float, sps: int, span: int) -> torch.Tensor:
 
 @lru_cache(maxsize=64)
 def _cached_access_ref_cpu(sps: int, beta: float, span: int) -> torch.Tensor:
-    return tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span).detach().to(dtype=torch.complex64, device="cpu").contiguous()
+    return tx_waveform(ACCESS_BITS, sps=sps, beta=beta, span=span).detach().to(dtype=DEFAULT_COMPLEX_DTYPE, device="cpu").contiguous()
 
 
 def get_cached_rrc_taps(beta: float, sps: int, span: int, device: torch.device) -> torch.Tensor:
@@ -950,13 +973,13 @@ def build_tx_iq_object(
     one_burst_iq = tx_waveform(frame_bits, sps=sps, beta=beta, span=span)
 
     if target_num_samples is None:
-        iq = one_burst_iq.to(dtype=torch.complex64)
+        iq = one_burst_iq.to(dtype=DEFAULT_COMPLEX_DTYPE)
         n_repeats = 1
     else:
         if target_num_samples <= 0:
             raise ValueError("target_num_samples must be > 0")
         n_repeats = int(math.ceil(target_num_samples / len(one_burst_iq)))
-        iq = torch.tile(one_burst_iq, (n_repeats,))[:target_num_samples].to(dtype=torch.complex64)
+        iq = torch.tile(one_burst_iq, (n_repeats,))[:target_num_samples].to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
 
@@ -1019,7 +1042,7 @@ def build_tx_iq_object(
         "avg_power": measure_power(iq),
     }
 
-    return TXBuildResult(iq=iq.to(dtype=torch.complex64), metadata=metadata)
+    return TXBuildResult(iq=iq.to(dtype=DEFAULT_COMPLEX_DTYPE), metadata=metadata)
 
 
 def _scale_iq_to_peak_power(iq: Union[np.ndarray, torch.Tensor], peak_power: Optional[float]) -> torch.Tensor:
@@ -1034,7 +1057,7 @@ def _scale_iq_to_peak_power(iq: Union[np.ndarray, torch.Tensor], peak_power: Opt
     if current_peak_power <= 0.0:
         return x
     gain = np.sqrt(peak_power / current_peak_power)
-    return (x * gain).to(dtype=torch.complex64)
+    return (x * gain).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def build_tone_pulse_iq_object(
@@ -1121,13 +1144,13 @@ def build_tone_pulse_iq_object(
         gate[start:end] = 1.0
 
     n = torch.arange(total_samples, dtype=torch.float64, device=DEFAULT_TORCH_DEVICE)
-    iq = torch.zeros(total_samples, dtype=torch.complex64, device=DEFAULT_TORCH_DEVICE)
+    iq = torch.zeros(total_samples, dtype=DEFAULT_COMPLEX_DTYPE, device=DEFAULT_TORCH_DEVICE)
     for a, f_hz, ph in zip(tone_amplitudes, tone_frequencies_hz, tone_initial_phases_rad):
         if a == 0.0:
             continue
         phase = 2.0 * torch.pi * f_hz * n / sample_rate_hz + ph + tone_phase_offset_rad
-        iq = iq + a * torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-    iq = (iq * gate).to(dtype=torch.complex64)
+        iq = iq + a * torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=DEFAULT_COMPLEX_DTYPE)
+    iq = (iq * gate).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     # iq = _scale_iq_to_peak_power(iq, peak_power)
     iq = apply_carrier_frequency(iq, carrier_hz=carrier_hz, sample_rate_hz=sample_rate_hz)
@@ -1185,7 +1208,7 @@ def build_tone_pulse_iq_object(
         "avg_power": measure_power(iq),
         "measured_peak_power": float(torch.max(torch.abs(iq) ** 2).item()) if iq.numel() else 0.0,
     }
-    return TXBuildResult(iq=iq.to(dtype=torch.complex64), metadata=metadata)
+    return TXBuildResult(iq=iq.to(dtype=DEFAULT_COMPLEX_DTYPE), metadata=metadata)
 
 
 def save_tx_iq_object(
@@ -1300,7 +1323,7 @@ def coarse_frequency_acquire(
         for i in range(0, bins.numel(), max(1, chunk_bins)):
             b = bins[i:i + chunk_bins]
             phase = -2.0 * torch.pi * b[:, None] * n[None, :] / sample_rate_hz
-            rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
+            rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=DEFAULT_COMPLEX_DTYPE)
             y = x[None, :] * rot
 
             yr_in = y.real.to(dtype=torch.float32).unsqueeze(1)
@@ -1354,7 +1377,7 @@ def estimate_residual_cfo_from_preamble(
         s1 = syms[r * half:(r + 1) * half]
         s2 = syms[(r + 1) * half:(r + 2) * half]
         if s1.numel() == half and s2.numel() == half:
-            ph = torch.angle(torch.sum(s2 * torch.conj(s1)))
+            ph = torch.angle(torch.sum(_complex64_for_limited_op(s2) * torch.conj(_complex64_for_limited_op(s1))))
             phases.append(ph / (2.0 * np.pi * half))
     if not phases:
         return 0.0
@@ -1367,8 +1390,8 @@ def apply_symbol_rate_cfo(symbols: Union[np.ndarray, torch.Tensor], cfo_hz: floa
         return syms
     n = torch.arange(syms.numel(), dtype=torch.float64, device=syms.device)
     phase = -2.0 * torch.pi * cfo_hz * n / symbol_rate_hz
-    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=torch.complex64)
-    return (syms * rot).to(dtype=torch.complex64)
+    rot = torch.complex(torch.cos(phase), torch.sin(phase)).to(dtype=DEFAULT_COMPLEX_DTYPE)
+    return (syms * rot).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def matched_filter(iq: Union[np.ndarray, torch.Tensor], sps: int, beta: float, span: int) -> torch.Tensor:
@@ -1387,8 +1410,8 @@ def extract_symbols_from_start(
     mft = _as_complex_tensor(mf)
     first = start_index_samples + 2 * span * sps + sample_delta
     if first < 0 or first >= mft.numel():
-        return torch.zeros(0, dtype=torch.complex64, device=mft.device)
-    return mft[first::sps].to(dtype=torch.complex64)
+        return torch.zeros(0, dtype=DEFAULT_COMPLEX_DTYPE, device=mft.device)
+    return mft[first::sps].to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def design_symbol_equalizer_ls(
@@ -1421,21 +1444,26 @@ def apply_symbol_equalizer(symbols: Union[np.ndarray, torch.Tensor], w: Union[np
     sym_t = symbols if isinstance(symbols, torch.Tensor) else _as_complex_tensor(symbols)
     w_t = w if isinstance(w, torch.Tensor) else _as_complex_tensor(w)
     if not torch.is_complex(sym_t):
-        sym_t = sym_t.to(dtype=torch.complex64)
+        sym_t = sym_t.to(dtype=DEFAULT_COMPLEX_DTYPE)
     if not torch.is_complex(w_t):
-        w_t = w_t.to(dtype=torch.complex64)
+        w_t = w_t.to(dtype=DEFAULT_COMPLEX_DTYPE)
     common_dtype = torch.promote_types(sym_t.dtype, w_t.dtype)
+    output_dtype = common_dtype
     sym_t = sym_t.to(dtype=common_dtype)
     w_t = w_t.to(dtype=common_dtype)
-    ntaps = int(w_t.numel())
+    # Complex half matmul/convolution support is limited; equalization runs in
+    # complex64 when needed and restores the requested complex dtype afterward.
+    sym_work = _complex64_for_limited_op(sym_t)
+    w_work = _complex64_for_limited_op(w_t)
+    ntaps = int(w_work.numel())
     if ntaps == 1:
-        return sym_t * w_t[0]
+        return _restore_complex_dtype(sym_work * w_work[0], output_dtype)
 
     half = ntaps // 2
-    spad = F.pad(sym_t.reshape(1, 1, -1), (half, half)).reshape(-1)
-    X = torch.stack([spad[i:i + ntaps] for i in range(sym_t.numel())], dim=0)
-    out = X @ w_t
-    return out
+    spad = F.pad(sym_work.reshape(1, 1, -1), (half, half)).reshape(-1)
+    X = torch.stack([spad[i:i + ntaps] for i in range(sym_work.numel())], dim=0)
+    out = X @ w_work
+    return _restore_complex_dtype(out, output_dtype)
 
 
 def apply_pilot_phase_tracking(
@@ -1446,7 +1474,7 @@ def apply_pilot_phase_tracking(
 ) -> torch.Tensor:
     symbols_t = _as_complex_tensor(symbols)
     if symbols_t.numel() < access_and_headers_len + data_with_pilots_len:
-        return symbols_t.to(dtype=torch.complex64)
+        return symbols_t.to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     y = symbols_t.clone()
     payload_stream = y[access_and_headers_len:access_and_headers_len + data_with_pilots_len]
@@ -1459,7 +1487,7 @@ def apply_pilot_phase_tracking(
         if pilot_start >= 0 and pilot_end <= payload_stream.numel():
             rx_pilot = payload_stream[pilot_start:pilot_end]
             if rx_pilot.numel() == pilot_syms.numel():
-                ph = torch.angle(torch.sum(rx_pilot * torch.conj(pilot_syms)))
+                ph = torch.angle(torch.sum(_complex64_for_limited_op(rx_pilot) * torch.conj(_complex64_for_limited_op(pilot_syms))))
                 phase_est = float(ph.item())
                 payload_stream[data_start:pilot_start] *= torch.exp(
                     torch.tensor(-1j * phase_est, dtype=symbols_t.dtype, device=symbols_t.device)
@@ -1503,7 +1531,7 @@ def _quick_header_screen(
     symbols: Union[np.ndarray, torch.Tensor],
     symbol_rate_hz: float,
 ) -> Optional[int]:
-    syms = _as_complex_tensor(symbols).to(dtype=torch.complex64)
+    syms = _as_complex_tensor(symbols).to(dtype=DEFAULT_COMPLEX_DTYPE)
     if syms.numel() < ACCESS_BITS_LEN + HEADER_COPIES * HEADER_PROT_BITS_LEN:
         return None
     residual_cfo_hz = estimate_residual_cfo_from_preamble(syms[:PREAMBLE_BITS_LEN], symbol_rate_hz)
@@ -1541,8 +1569,8 @@ def try_decode_from_symbols_diagnostics(
         diagnostics["failed_stage"] = stage
         return diagnostics
 
-    symbols_t = _as_complex_tensor(symbols).to(dtype=torch.complex64)
-    access_syms = bpsk_map(ACCESS_BITS).to(device=symbols_t.device, dtype=torch.complex64)
+    symbols_t = _as_complex_tensor(symbols).to(dtype=DEFAULT_COMPLEX_DTYPE)
+    access_syms = bpsk_map(ACCESS_BITS).to(device=symbols_t.device, dtype=DEFAULT_COMPLEX_DTYPE)
 
     if symbols_t.numel() < access_syms.numel() + HEADER_COPIES * HEADER_PROT_BITS_LEN:
         return fail("too_few_symbols_for_access_and_header")
@@ -1558,11 +1586,11 @@ def try_decode_from_symbols_diagnostics(
     rx_train = symbols_t[train_start:train_end]
     tx_train = access_syms[train_start:train_end]
 
-    w = design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3).to(dtype=torch.complex64)
-    eq_symbols = apply_symbol_equalizer(symbols_t, w).to(dtype=torch.complex64)
+    w = design_symbol_equalizer_ls(rx_train, tx_train, ntaps=eq_taps, ridge=1e-3).to(dtype=DEFAULT_COMPLEX_DTYPE)
+    eq_symbols = apply_symbol_equalizer(symbols_t, w).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     rx_train_eq = eq_symbols[train_start:train_end]
-    ph = torch.angle(torch.sum(rx_train_eq * torch.conj(tx_train)))
+    ph = torch.angle(torch.sum(_complex64_for_limited_op(rx_train_eq) * torch.conj(_complex64_for_limited_op(tx_train))))
     eq_symbols = eq_symbols * torch.exp(torch.tensor(-1j * float(ph.item()), dtype=eq_symbols.dtype, device=eq_symbols.device))
 
     soft_bits = eq_symbols.real.to(dtype=torch.float64)

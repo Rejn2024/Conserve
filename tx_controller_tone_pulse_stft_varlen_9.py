@@ -19,16 +19,25 @@ import advanced_link_skdsp_v7_robust as txflex
 
 NOISE_COLORS = ["white", "pink", "brown", "blue", "violet"]
 FADING_MODES = ["none", "rician_block", "rayleigh_block", "multipath_static"]
+DEFAULT_COMPLEX_DTYPE = txflex.DEFAULT_COMPLEX_DTYPE
+
+
+def _complex64_for_limited_op(x: torch.Tensor) -> torch.Tensor:
+    return txflex._complex64_for_limited_op(x)
+
+
+def _restore_complex_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return txflex._restore_complex_dtype(x, dtype)
 
 
 def _as_complex_tensor(iq: Union[torch.Tensor, List[complex]]) -> torch.Tensor:
     if isinstance(iq, torch.Tensor):
-        return iq.to(dtype=torch.complex64)
-    return torch.as_tensor(iq, dtype=torch.complex64)
+        return iq.to(dtype=DEFAULT_COMPLEX_DTYPE)
+    return torch.as_tensor(iq, dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def measure_iq_power(iq: Union[torch.Tensor, List[complex]]) -> torch.Tensor:
-    x = _as_complex_tensor(iq)
+    x = _complex64_for_limited_op(_as_complex_tensor(iq))
     if x.numel() == 0:
         return torch.tensor(0.0, dtype=torch.float32)
     return torch.mean(torch.abs(x) ** 2).to(dtype=torch.float32)
@@ -36,11 +45,12 @@ def measure_iq_power(iq: Union[torch.Tensor, List[complex]]) -> torch.Tensor:
 
 def robust_mad_scale(x: Union[torch.Tensor, List[complex]], eps: float = 1e-12) -> torch.Tensor:
     xt = _as_complex_tensor(x)
-    xr = torch.cat([xt.real, xt.imag], dim=0)
+    work = _complex64_for_limited_op(xt)
+    xr = torch.cat([work.real, work.imag], dim=0).to(dtype=torch.float32)
     med = torch.median(xr)
     mad = torch.median(torch.abs(xr - med))
     sigma = 1.4826 * mad + eps
-    return (xt / sigma).to(dtype=torch.complex64)
+    return _restore_complex_dtype(work / sigma, xt.dtype)
 
 
 def _torch_unwrap(x: torch.Tensor, dim: int = -1, period: float = 2 * torch.pi) -> torch.Tensor:
@@ -72,7 +82,7 @@ def _torch_unwrap(x: torch.Tensor, dim: int = -1, period: float = 2 * torch.pi) 
 
 def _as_batch_complex_tensor(iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]) -> torch.Tensor:
     if isinstance(iq_batch, torch.Tensor):
-        return iq_batch.to(dtype=torch.complex64)
+        return iq_batch.to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     if len(iq_batch) == 0:
         raise ValueError("iq_batch must contain at least one IQ array")
@@ -88,7 +98,7 @@ def _as_batch_complex_tensor(iq_batch: Union[torch.Tensor, Sequence[Union[torch.
         if row.numel() < max_len:
             row = F.pad(row, (0, max_len - int(row.numel())))
         padded.append(row)
-    return torch.stack(padded, dim=0).to(dtype=torch.complex64)
+    return torch.stack(padded, dim=0).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
 def preprocess_batched_iq_to_stft_feature(
@@ -137,15 +147,18 @@ def preprocess_iq_to_stft_feature(
     if x_t.numel() < 8:
         x_t = F.pad(x_t, (0, 8 - int(x_t.numel())))
 
-    x_t = (x_t - torch.mean(x_t)).to(dtype=torch.complex64)
-    x_t = robust_mad_scale(x_t)
+    # torch.stft/torch.fft and some reductions have limited complex32 support;
+    # run this compatibility segment in complex64, then emit float32 features.
+    x_work = _complex64_for_limited_op(x_t)
+    x_work = (x_work - torch.mean(x_work)).to(dtype=torch.complex64)
+    x_work = _complex64_for_limited_op(robust_mad_scale(x_work))
 
-    nperseg_eff = int(min(nperseg, max(8, x_t.numel())))
+    nperseg_eff = int(min(nperseg, max(8, x_work.numel())))
     noverlap_eff = int(min(noverlap, max(0, nperseg_eff - 1)))
     hop_length = max(1, nperseg_eff - noverlap_eff)
-    window = torch.hann_window(nperseg_eff, dtype=torch.float32, device=x_t.device)
+    window = torch.hann_window(nperseg_eff, dtype=torch.float32, device=x_work.device)
     Z = torch.stft(
-        x_t,
+        x_work,
         n_fft=nfft,
         hop_length=hop_length,
         win_length=nperseg_eff,
@@ -155,7 +168,7 @@ def preprocess_iq_to_stft_feature(
     )
 
     Z = torch.fft.fftshift(Z, dim=0)
-    f = torch.fft.fftshift(torch.fft.fftfreq(nfft, d=1.0 / max(sample_rate_hz, 1.0)).to(x_t.device))
+    f = torch.fft.fftshift(torch.fft.fftfreq(nfft, d=1.0 / max(sample_rate_hz, 1.0)).to(x_work.device))
 
     mag = torch.log1p(torch.abs(Z)).to(dtype=torch.float32)
     phase = torch.angle(Z).to(dtype=torch.float32)
@@ -212,7 +225,7 @@ def preprocess_iq_to_stft_feature(
     return {
         "feature": feat.to(dtype=torch.float32),
         "rx_power": measure_iq_power(iq),
-        "peak_hz": f[torch.argmax(torch.mean(power, dim=1))].to(dtype=torch.float32) if power.numel() else torch.tensor(0.0, dtype=torch.float32, device=x_t.device),
+        "peak_hz": f[torch.argmax(torch.mean(power, dim=1))].to(dtype=torch.float32) if power.numel() else torch.tensor(0.0, dtype=torch.float32, device=x_work.device),
     }
 
 
@@ -613,7 +626,7 @@ def _apply_per_pulse_phase_rotation(
         rot = torch.complex(
             torch.cos(torch.tensor(theta, dtype=torch.float32, device=x.device)),
             torch.sin(torch.tensor(theta, dtype=torch.float32, device=x.device)),
-        ).to(dtype=torch.complex64)
+        ).to(dtype=DEFAULT_COMPLEX_DTYPE)
         x[start:end] = x[start:end] * rot
     return x
 
@@ -639,7 +652,7 @@ def _apply_per_tone_pulse_phase_rotation(
         return torch.zeros_like(x)
 
     t = torch.arange(n, dtype=torch.float32, device=x.device) / max(float(sample_rate_hz), 1.0)
-    y = torch.zeros(n, dtype=torch.complex64, device=x.device)
+    y = torch.zeros(n, dtype=DEFAULT_COMPLEX_DTYPE, device=x.device)
     two_pi = float(2.0 * torch.pi)
 
     num_tones = len(tone_frequencies_hz)
@@ -652,7 +665,7 @@ def _apply_per_tone_pulse_phase_rotation(
         base = torch.complex(
             torch.cos((two_pi * tone_hz) * t + phase0),
             torch.sin((two_pi * tone_hz) * t + phase0),
-        ).to(dtype=torch.complex64) * amp
+        ).to(dtype=DEFAULT_COMPLEX_DTYPE) * amp
 
         on = max(1, int(tone_pulse_on_samples[k] if k < len(tone_pulse_on_samples) else 1))
         off = max(0, int(tone_pulse_off_samples[k] if k < len(tone_pulse_off_samples) else 0))
@@ -673,8 +686,8 @@ def _apply_per_tone_pulse_phase_rotation(
             theta = float(phases[min(p, len(phases) - 1)]) if len(phases) else 0.0
             mask[start:end] = 1.0
             phase_vec[start:end] = theta
-        rot = torch.complex(torch.cos(phase_vec), torch.sin(phase_vec)).to(dtype=torch.complex64)
-        y = y + (base * rot * mask.to(dtype=torch.complex64))
+        rot = torch.complex(torch.cos(phase_vec), torch.sin(phase_vec)).to(dtype=DEFAULT_COMPLEX_DTYPE)
+        y = y + (base * rot * mask.to(dtype=DEFAULT_COMPLEX_DTYPE))
     return y
 
 
@@ -958,9 +971,9 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
 
 
 if __name__ == "__main__":
-    iq_a = torch.complex(torch.randn(900), torch.randn(900)).to(dtype=torch.complex64)
-    iq_b = torch.complex(torch.randn(1700), torch.randn(1700)).to(dtype=torch.complex64)
-    iq_c = torch.complex(torch.randn(3200), torch.randn(3200)).to(dtype=torch.complex64)
+    iq_a = torch.complex(torch.randn(900), torch.randn(900)).to(dtype=DEFAULT_COMPLEX_DTYPE)
+    iq_b = torch.complex(torch.randn(1700), torch.randn(1700)).to(dtype=DEFAULT_COMPLEX_DTYPE)
+    iq_c = torch.complex(torch.randn(3200), torch.randn(3200)).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
     model = TonePulseTXControlNetVarLen(in_ch=4, base_ch=16, n_scalar_features=6, max_tones=8)
     out = build_controlled_tone_pulse_from_variable_inputs(
