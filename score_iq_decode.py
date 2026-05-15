@@ -125,6 +125,83 @@ def bit_error_rate(rx_bits, tx_bits) -> float:
     return float(errors) / float(tx.size)
 
 
+def _bounded_unit(value: float) -> float:
+    if not np.isfinite(value):
+        return 1.0
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def _as_float_array(values) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return None
+    return arr
+
+
+def _soft_confidence_error(payload_soft, tx_bits) -> float:
+    """Return a bounded confidence-loss term from signed soft decisions.
+
+    A correct, high-confidence BPSK bit has a positive expected signed margin.
+    Margins below one symbol unit are treated as increasingly unreliable, while
+    wrong-sign decisions saturate this auxiliary term near one.
+    """
+
+    soft = _as_float_array(payload_soft)
+    if soft is None or tx_bits is None:
+        return 0.0
+
+    tx = np.asarray(tx_bits, dtype=np.int8).reshape(-1)
+    if tx.size == 0:
+        return 0.0
+
+    n = min(soft.size, tx.size)
+    if n == 0:
+        return 0.0
+
+    expected_sign = np.where(tx[:n] > 0, 1.0, -1.0)
+    signed_margin = soft[:n] * expected_sign
+    confidence_loss = np.clip((1.0 - signed_margin) * 0.5, 0.0, 1.0)
+
+    missing = max(0, int(tx.size) - int(soft.size))
+    if missing:
+        confidence_loss = np.concatenate(
+            [confidence_loss, np.ones(missing, dtype=np.float64)]
+        )
+
+    return _bounded_unit(float(np.mean(confidence_loss)))
+
+
+def _payload_length_error(rx_payload_len, expected_payload_crc: Optional[bytes]) -> float:
+    if expected_payload_crc is None:
+        return 0.0
+    expected_len = max(0, len(expected_payload_crc) - 4)
+    if expected_len == 0:
+        return 0.0
+    try:
+        observed_len = int(rx_payload_len)
+    except (TypeError, ValueError):
+        return 0.0
+    return _bounded_unit(abs(observed_len - expected_len) / float(expected_len))
+
+
+def _decode_stage_error(failed_stage: Optional[str]) -> float:
+    if not failed_stage:
+        return 0.0
+
+    stage_penalties = {
+        "too_few_symbols_for_access_and_header": 1.0,
+        "too_few_symbols_for_training": 0.9,
+        "too_few_symbols_for_header": 0.8,
+        "header_decode_failed": 0.7,
+        "too_few_symbols_for_payload": 0.6,
+        "fec_decode_too_short": 0.5,
+        "crc_failed": 0.35,
+    }
+    return stage_penalties.get(str(failed_stage), 0.5)
+
+
 def expected_coded_bits(payload_crc_bytes: bytes, fec_mode: str) -> list[int]:
     payload_plain_bits = link.bytes_to_bits_msb(payload_crc_bytes)
     payload_scrambled = link.scramble_bits(payload_plain_bits, seed=0x5D)
@@ -150,11 +227,20 @@ def decoded_payload_missing(rx_result: Optional[dict], metadata: dict) -> bool:
 
 
 def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
-    expected_payload_crc = expected_payload_crc_bytes(metadata)
-    missing_penalty = 2.0 if decoded_payload_missing(rx_result, metadata) else 0.0
+    """Score a receive result with dense, bounded decode-shaping terms.
 
-    # if rx_result is None or expected_payload_crc is None:
-    #     return missing_penalty
+    Lower scores are still better for this script: a perfect decode scores 0.0,
+    while failed or unreliable decodes receive progressively larger values.  The
+    structure keeps the authoritative end-to-end outcome term and adds dense
+    diagnostics so partially corrupted packets are distinguishable from clean
+    packets and from complete synchronization failures.
+    """
+
+    expected_payload_crc = expected_payload_crc_bytes(metadata)
+    missing_penalty = 1.0 if decoded_payload_missing(rx_result, metadata) else 0.0
+
+    if rx_result is None or expected_payload_crc is None:
+        return missing_penalty
 
     diagnostics = rx_result.get("decode_diagnostics") or {}
     fec_mode = str(metadata.get("fec", "none"))
@@ -170,8 +256,31 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
         diagnostics.get("rx_fec_decoded_bits"),
         tx_payload_crc_bits,
     )
+    confidence_error = _soft_confidence_error(
+        diagnostics.get("payload_soft"),
+        tx_coded_bits,
+    )
+    stage_error = _decode_stage_error(diagnostics.get("failed_stage"))
+    length_error = _payload_length_error(
+        diagnostics.get("payload_len", rx_result.get("payload_len")),
+        expected_payload_crc,
+    )
+    crc_ok = bool(diagnostics.get("crc_ok") or rx_result.get("crc_ok"))
+    crc_status_known = "crc_ok" in diagnostics or "crc_ok" in rx_result
+    crc_error = 0.0 if crc_ok else (1.0 if crc_status_known else missing_penalty)
 
-    return pre_fec_coded_ber + post_fec_payload_crc_ber + missing_penalty
+    dense_score = (
+        (0.40 * _bounded_unit(pre_fec_coded_ber))
+        + (0.40 * _bounded_unit(post_fec_payload_crc_ber))
+        + (0.10 * confidence_error)
+        + (0.10 * length_error)
+        + (0.25 * stage_error)
+        + (0.25 * crc_error)
+    )
+
+    # Keep the historical, easy-to-interpret missing-payload step of 1.0 while
+    # adding bounded dense terms above it when receiver diagnostics are present.
+    return float(missing_penalty + dense_score)
 
 
 def build_parser():
