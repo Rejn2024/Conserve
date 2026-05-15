@@ -61,14 +61,55 @@ Recommendations:
 
 ### 6) Improve observation features for timing and spectral overlap
 
-The STFT feature path already exposes magnitude, phase, power, deltas, centroid, spread, flatness, and frame power. Add side information that makes jamming decisions easier to learn without requiring the CNN to infer every scalar from images.
+The STFT feature path already exposes magnitude, phase, power, deltas, centroid, spread, flatness, and frame power. Add side information that makes jamming decisions easier to learn without requiring the CNN to infer every scalar from images. The goal is not to leak labels or receiver internals into the agent, but to provide compact, physically meaningful summaries of the observed packet so the policy can spend capacity choosing waveform parameters instead of relearning basic estimators from scratch.
+
+Why this matters:
+
+- Timing-sensitive actions such as pulse start, duty cycle, and sweep windows need explicit information about where useful packet energy begins and ends. If timing is only encoded in a spectrogram image, a small CNN may need many samples before it learns a stable alignment heuristic.
+- Frequency-sensitive actions such as tone placement, notch placement, bandwidth, and sweep span are easier to learn when the observation includes coarse estimates of occupied bandwidth and center frequency.
+- Power-control actions benefit from measured RX power, noise-floor estimates, and SNR-like summaries so the policy can avoid collapsing to always-max-power behavior.
+- Scalar metadata improves credit assignment because action dimensions can correlate directly with interpretable observation dimensions, making PPO/SAC value estimation less noisy.
+
+Recommended feature groups:
+
+- Packet geometry: estimated packet start index, packet end index, duration in samples/seconds, active-frame count, inter-section offsets, and the fraction of the capture occupied by packet-like energy.
+- Spectral geometry: estimated center frequency, lower/upper occupied-band edges, occupied bandwidth, spectral rolloff points, strongest-bin frequency, and per-band energy fractions around the estimated carrier.
+- Timing landmarks: compact preamble/synchronization energy summaries such as the top-k high-energy frame centers, normalized preamble-likelihood curve moments, first/last threshold crossings, and the energy centroid over time.
+- Power and channel context: measured RX power, estimated noise floor from quiet frames, peak-to-average power ratio, approximate SNR, sample-rate ratio, carrier-offset estimate, and any channel/fading mode identifier that is already available to the simulation and is appropriate for the deployment assumption.
+- Confidence and validity flags: binary masks indicating whether each estimate was observed, imputed, clipped, or unavailable, so the policy can learn to distrust weak estimates instead of treating missing values as real zeros.
+
+Implementation guidance:
+
+- Keep scalar features in a separate vector branch next to the STFT/CNN branch, then concatenate the scalar embedding with the visual embedding before the actor and critic heads. A small MLP with layer normalization is usually enough for the scalar branch.
+- Normalize every continuous scalar with running mean/variance or robust percentile statistics computed from the training split only. Persist the normalization state with checkpoints and reuse the same frozen statistics during validation and evaluation.
+- Express timing and frequency scalars in normalized coordinates where possible, such as fractions of capture length or fractions of Nyquist bandwidth, so policies transfer across sample rates and capture lengths.
+- Add validity masks alongside normalized values. For example, represent an unavailable center-frequency estimate as `(value=0, valid=0)` instead of only `0`, because zero may also be a meaningful normalized center.
+- Avoid introducing direct decode labels, ground-truth messages, or future-only information into observations. If a feature would not be available at decision time in the intended closed-loop simulation, keep it out of the policy input and use it only for logging or curriculum scheduling.
+- Store a feature schema/version string in checkpoints and evaluation artifacts so old policies are not accidentally loaded with a changed observation layout.
+
+Suggested first-pass feature vector:
+
+- `packet_start_frac`, `packet_end_frac`, `packet_duration_frac`, and `active_frame_frac`.
+- `time_energy_centroid_frac`, `time_energy_spread_frac`, and the normalized centers/heights of the top 2-4 energy peaks.
+- `center_freq_frac`, `occupied_bw_frac`, `low_edge_frac`, `high_edge_frac`, and `spectral_energy_concentration`.
+- `rx_power_db`, `noise_floor_db`, `snr_est_db`, `papr_db`, and `sample_rate_ratio`.
+- One validity bit per estimated group, plus optional clipped/imputed flags.
+
+Validation and ablation plan:
+
+- Start with a baseline that uses the current STFT-only observation, then compare against STFT plus packet geometry, STFT plus spectral geometry, STFT plus power/channel context, and the full feature set.
+- Track both learning speed and final held-out decode-failure rate; a feature group is useful if it improves sample efficiency, generalization, or power-normalized effectiveness without increasing degenerate behavior.
+- Report ablations by scenario slice, including short/long packets, low/high SNR, carrier-offset extremes, and packets with weak or ambiguous preambles.
+- Inspect learned action distributions conditioned on feature bins. For example, pulse starts should move with packet-start estimates, tone frequencies should track center-frequency estimates, and power should increase mainly when SNR or RX power suggests the packet is otherwise robust.
+- Include a leakage check by recomputing features from only the observation window available to the policy and confirming validation metrics remain similar when labels, decoded text, and held-out metadata are removed.
 
 Recommendations:
 
 - Add scalar features for packet duration, section offsets, observed bandwidth, estimated center frequency, sample-rate ratio, and measured RX power.
 - Include a compact estimate of where synchronization/preamble-like energy occurs in time.
 - Normalize scalar features with running statistics and save those stats with checkpoints.
-- Ablate feature groups to confirm each group improves held-out decode-failure rate.
+- Add validity masks and a feature schema/version so checkpoints remain compatible as the observation layout evolves.
+- Ablate feature groups to confirm each group improves held-out decode-failure rate, sample efficiency, or power-normalized effectiveness.
 
 ### 7) Use off-policy RL or hybrid imitation + RL for expensive rewards
 
