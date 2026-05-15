@@ -1252,18 +1252,16 @@ class JammerVecEnv:
             jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
             rx_result = link7.rx_command_iq(jammed, whole_meta)
 
-            score = torch.tensor(1.0, dtype=torch.float32)
+            # score = torch.tensor(1.0, dtype=torch.float32)
             total += 1
 
-            if rx_result.get("message") is not None:
-                score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
+            score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 
-                if score < 1.0:
-                    success += 1
+            if rx_result.get("message") is None:
+                success += 1
 
                 # metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
                 # score = score + (alpha * metric_div)
-
 
             vals.append(score)#.detach().cpu())
 
