@@ -151,10 +151,10 @@ def decoded_payload_missing(rx_result: Optional[dict], metadata: dict) -> bool:
 
 def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
     expected_payload_crc = expected_payload_crc_bytes(metadata)
-    missing_penalty = 1.0 if decoded_payload_missing(rx_result, metadata) else 0.0
+    missing_penalty = 2.0 if decoded_payload_missing(rx_result, metadata) else 0.0
 
-    if rx_result is None or expected_payload_crc is None:
-        return missing_penalty
+    # if rx_result is None or expected_payload_crc is None:
+    #     return missing_penalty
 
     diagnostics = rx_result.get("decode_diagnostics") or {}
     fec_mode = str(metadata.get("fec", "none"))
