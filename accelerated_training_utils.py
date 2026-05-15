@@ -128,6 +128,9 @@ def _build_training_cache_record(
     jammer_sampling_freq: float,
     section_len: int,
     resample: Callable[[Any, float, float], Any],
+    *,
+    cache_stft_features: bool = False,
+    stft_device: str = "cpu",
 ) -> Dict[str, Any]:
     import load_tx_iq_data as loadmod
 
@@ -135,21 +138,118 @@ def _build_training_cache_record(
     sections = loadmod.load_sections(sdir)
     sample_rate_hz = float(whole["meta"]["sample_rate_hz"])
 
-    iq1 = resample(sections["sections"][0], sample_rate_hz, jammer_sampling_freq)[:section_len]
-    iq2 = resample(sections["sections"][1], sample_rate_hz, jammer_sampling_freq)[:section_len]
-    iq3 = resample(sections["sections"][2], sample_rate_hz, jammer_sampling_freq)[:section_len]
+    iq1 = _to_complex_tensor(
+        resample(sections["sections"][0], sample_rate_hz, jammer_sampling_freq)[:section_len]
+    )
+    iq2 = _to_complex_tensor(
+        resample(sections["sections"][1], sample_rate_hz, jammer_sampling_freq)[:section_len]
+    )
+    iq3 = _to_complex_tensor(
+        resample(sections["sections"][2], sample_rate_hz, jammer_sampling_freq)[:section_len]
+    )
 
-    return {
+    record = {
         "sample_name": sdir.name,
         "source_dir": str(sdir),
         "whole_iq": _to_complex_tensor(whole["iq"]),
         "whole_meta": whole["meta"],
         "whole_sample_rate_hz": sample_rate_hz,
         "jammer_sampling_freq": float(jammer_sampling_freq),
-        "iq1": _to_complex_tensor(iq1),
-        "iq2": _to_complex_tensor(iq2),
-        "iq3": _to_complex_tensor(iq3),
+        "iq1": iq1,
+        "iq2": iq2,
+        "iq3": iq3,
     }
+    if cache_stft_features:
+        record["stft_feature_list"] = compute_stft_feature_list_for_iq_sections(
+            iq1=iq1,
+            iq2=iq2,
+            iq3=iq3,
+            intake_sample_rate_hz=jammer_sampling_freq,
+            device=stft_device,
+            squeeze_batch=True,
+            output_device="cpu",
+        )
+    return record
+
+
+def _normalize_cached_stft_feature_list(
+    stft_feature_list: Sequence[torch.Tensor],
+    *,
+    device: str = "cpu",
+) -> List[torch.Tensor]:
+    """Return cached STFT feature maps as float32 tensors on ``device``.
+
+    Cache records store one tensor per IQ view.  Per-sample records normally use
+    shape ``[C, F, T]`` while collated batches use ``[B, C, F, T]``; both forms
+    are accepted and preserved by this helper.
+    """
+
+    if len(stft_feature_list) != 3:
+        raise ValueError("stft_feature_list must contain exactly three feature tensors")
+    return [
+        torch.as_tensor(feature, dtype=torch.float32, device=device)
+        for feature in stft_feature_list
+    ]
+
+
+def compute_stft_feature_list_for_iq_sections(
+    *,
+    iq1: torch.Tensor,
+    iq2: torch.Tensor,
+    iq3: torch.Tensor,
+    intake_sample_rate_hz: float,
+    device: str = "cpu",
+    squeeze_batch: bool = False,
+    output_device: str = "cpu",
+) -> List[torch.Tensor]:
+    """Compute deterministic STFT feature tensors for cached IQ sections.
+
+    ``iq1``/``iq2``/``iq3`` may be either single examples of shape ``[N]`` or
+    already-batched tensors of shape ``[B, N]``.  The output mirrors the actor
+    input order and can be saved directly in cache records under
+    ``stft_feature_list``.
+    """
+
+    iq_batches = []
+    for iq in (iq1, iq2, iq3):
+        iq_t = torch.as_tensor(iq, dtype=link7.DEFAULT_COMPLEX_DTYPE, device=device)
+        if iq_t.ndim == 1:
+            iq_t = iq_t.unsqueeze(0)
+        if iq_t.ndim != 2:
+            raise ValueError("IQ section tensors must have shape [samples] or [batch, samples]")
+        iq_batches.append(iq_t)
+
+    features: List[torch.Tensor] = []
+    for iq_t in iq_batches:
+        proc = preprocess_batched_iq_to_stft_feature(iq_t, sample_rate_hz=intake_sample_rate_hz)
+        feature = proc["feature"].to(device=output_device, dtype=torch.float32)
+        if squeeze_batch:
+            if feature.shape[0] != 1:
+                raise ValueError("squeeze_batch=True requires single-example IQ sections")
+            feature = feature.squeeze(0).contiguous()
+        features.append(feature.contiguous())
+    return features
+
+
+def _collate_stft_feature_list(batch: Sequence[Dict[str, Any]]) -> Optional[List[torch.Tensor]]:
+    if not batch or not all("stft_feature_list" in x for x in batch):
+        return None
+
+    per_view: List[torch.Tensor] = []
+    for view_idx in range(3):
+        view_tensors = []
+        for row in batch:
+            feature_list = row["stft_feature_list"]
+            if len(feature_list) != 3:
+                raise ValueError("stft_feature_list must contain exactly three feature tensors")
+            feature = torch.as_tensor(feature_list[view_idx], dtype=torch.float32)
+            if feature.ndim == 4 and feature.shape[0] == 1:
+                feature = feature.squeeze(0)
+            if feature.ndim != 3:
+                raise ValueError("per-sample STFT features must have shape [C, F, T]")
+            view_tensors.append(feature)
+        per_view.append(torch.stack(view_tensors, dim=0))
+    return per_view
 
 
 def _resolve_sample_dirs(dataset_root: Path, max_numeric_suffix: Optional[int]) -> List[Path]:
@@ -176,6 +276,8 @@ def precompute_training_cache(
     overwrite: bool = False,
     max_numeric_suffix: Optional[int] = None,
     resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
+    cache_stft_features: bool = False,
+    stft_device: str = "cpu",
 ) -> List[Path]:
     """Precompute deterministic sample tensors once and save to cache files.
 
@@ -195,6 +297,10 @@ def precompute_training_cache(
             suffix of sample directory names. For example, ``100`` processes
             ``sample_000100`` and lower while skipping ``sample_000101``.
         resample_fn: Optional dependency injection hook for custom resampling.
+        cache_stft_features: When True, also stores deterministic STFT feature
+            maps for iq1/iq2/iq3 so RL loops can skip repeated preprocessing.
+        stft_device: Device used while computing STFT features; features are
+            moved back to CPU before they are written to the cache record.
     """
 
     if resample_fn is None:
@@ -222,6 +328,8 @@ def precompute_training_cache(
             jammer_sampling_freq=jammer_sampling_freq,
             section_len=section_len,
             resample=resample,
+            cache_stft_features=cache_stft_features,
+            stft_device=stft_device,
         )
         torch.save(record, out_path)
         produced.append(out_path)
@@ -232,6 +340,7 @@ def precompute_training_cache(
         "jammer_sampling_freq": float(jammer_sampling_freq),
         "section_len": int(section_len),
         "max_numeric_suffix": max_numeric_suffix,
+        "cache_stft_features": bool(cache_stft_features),
         "num_samples": len(produced),
         "files": [str(p.name) for p in produced],
     }
@@ -250,6 +359,8 @@ def precompute_training_cache_s3(
     overwrite: bool = False,
     max_numeric_suffix: Optional[int] = None,
     resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
+    cache_stft_features: bool = False,
+    stft_device: str = "cpu",
     s3_client: Optional[Any] = None,
 ) -> List[str]:
     """Precompute deterministic sample tensors and upload cache records to S3.
@@ -286,6 +397,8 @@ def precompute_training_cache_s3(
             jammer_sampling_freq=jammer_sampling_freq,
             section_len=section_len,
             resample=resample,
+            cache_stft_features=cache_stft_features,
+            stft_device=stft_device,
         )
         buffer = io.BytesIO()
         torch.save(record, buffer)
@@ -300,6 +413,7 @@ def precompute_training_cache_s3(
         "jammer_sampling_freq": float(jammer_sampling_freq),
         "section_len": int(section_len),
         "max_numeric_suffix": max_numeric_suffix,
+        "cache_stft_features": bool(cache_stft_features),
         "num_samples": len(produced),
         "files": [Path(uri).name for uri in produced],
         "s3_uris": produced,
@@ -341,7 +455,7 @@ def collate_cached_iq(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     Resampled section tensors are fixed-length and stackable.
     """
 
-    return {
+    out = {
         "sample_names": [x["sample_name"] for x in batch],
         "source_dirs": [x["source_dir"] for x in batch],
         "whole_iq_list": [x["whole_iq"] for x in batch],
@@ -351,6 +465,10 @@ def collate_cached_iq(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "iq2": torch.stack([x["iq2"] for x in batch], dim=0),
         "iq3": torch.stack([x["iq3"] for x in batch], dim=0),
     }
+    stft_feature_list = _collate_stft_feature_list(batch)
+    if stft_feature_list is not None:
+        out["stft_feature_list"] = stft_feature_list
+    return out
 
 
 class CachedIQDatasetS3(Dataset):
@@ -948,21 +1066,26 @@ class JammerVecEnv:
         whole_iq_list = batch.get("whole_iq_list")
         whole_meta_list = batch.get("whole_meta_list")
         whole_sr_list = batch.get("whole_sr_list")
+        stft_feature_list = batch.get("stft_feature_list")
 
         out: List[Dict[str, Any]] = []
         for i in range(bs):
-            out.append(
-                {
-                    "sample_name": sample_names[i] if sample_names is not None else None,
-                    "source_dir": source_dirs[i] if source_dirs is not None else None,
-                    "whole_iq": whole_iq_list[i] if whole_iq_list is not None else None,
-                    "whole_meta": whole_meta_list[i] if whole_meta_list is not None else None,
-                    "whole_sample_rate_hz": whole_sr_list[i] if whole_sr_list is not None else None,
-                    "iq1": iq1[i],
-                    "iq2": iq2[i],
-                    "iq3": iq3[i],
-                }
-            )
+            row = {
+                "sample_name": sample_names[i] if sample_names is not None else None,
+                "source_dir": source_dirs[i] if source_dirs is not None else None,
+                "whole_iq": whole_iq_list[i] if whole_iq_list is not None else None,
+                "whole_meta": whole_meta_list[i] if whole_meta_list is not None else None,
+                "whole_sample_rate_hz": whole_sr_list[i] if whole_sr_list is not None else None,
+                "iq1": iq1[i],
+                "iq2": iq2[i],
+                "iq3": iq3[i],
+            }
+            if stft_feature_list is not None:
+                row["stft_feature_list"] = [
+                    torch.as_tensor(view[i], dtype=torch.float32)
+                    for view in stft_feature_list
+                ]
+            out.append(row)
         return out
 
     @classmethod
@@ -1073,14 +1196,18 @@ class JammerVecEnv:
         return torch.stack(vals), success, total #.to(dtype=torch.float32)
 
     @staticmethod
-    def _obs_from_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        return {
+    def _obs_from_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        obs: Dict[str, Any] = {
             "iq1": torch.stack([s["iq1"] for s in samples], dim=0),
             "iq2": torch.stack([s["iq2"] for s in samples], dim=0),
             "iq3": torch.stack([s["iq3"] for s in samples], dim=0),
         }
+        stft_feature_list = _collate_stft_feature_list(samples)
+        if stft_feature_list is not None:
+            obs["stft_feature_list"] = stft_feature_list
+        return obs
 
-    def reset(self) -> Dict[str, torch.Tensor]:
+    def reset(self) -> Dict[str, Any]:
         self._step_count = 0
         self._active = self._next_samples()
         return self._obs_from_samples(self._active)
@@ -1237,22 +1364,59 @@ def build_stft_observation_from_iq_batch(
     iq3: torch.Tensor,
     intake_sample_rate_hz: float,
     device: str = "cpu",
+    stft_feature_list: Optional[Sequence[torch.Tensor]] = None,
 ) -> Dict[str, List[torch.Tensor]]:
     """Build the ActorCritic observation payload from cached IQ sections.
 
-    The controller v3 observation is image-only and contains:
+    The controller observation is image-only and contains:
     - stft_feature_list[0]: STFT feature map for iq1, shape [B, C, F, T1]
     - stft_feature_list[1]: STFT feature map for iq2, shape [B, C, F, T2]
     - stft_feature_list[2]: STFT feature map for iq3, shape [B, C, F, T3]
+
+    Pass ``stft_feature_list`` from a cache record or collated batch to bypass
+    repeated STFT preprocessing in RL loops.  When omitted, this function keeps
+    the previous behavior and computes features from the IQ batches.
     """
 
-    proc1 = preprocess_batched_iq_to_stft_feature(iq1, sample_rate_hz=intake_sample_rate_hz)
-    proc2 = preprocess_batched_iq_to_stft_feature(iq2, sample_rate_hz=intake_sample_rate_hz)
-    proc3 = preprocess_batched_iq_to_stft_feature(iq3, sample_rate_hz=intake_sample_rate_hz)
+    if stft_feature_list is not None:
+        return {"stft_feature_list": _normalize_cached_stft_feature_list(stft_feature_list, device=device)}
+
     return {
-        "stft_feature_list": [
-            proc1["feature"].to(device=device, dtype=torch.float32),
-            proc2["feature"].to(device=device, dtype=torch.float32),
-            proc3["feature"].to(device=device, dtype=torch.float32),
-        ]
+        "stft_feature_list": compute_stft_feature_list_for_iq_sections(
+            iq1=iq1,
+            iq2=iq2,
+            iq3=iq3,
+            intake_sample_rate_hz=intake_sample_rate_hz,
+            device=device,
+            squeeze_batch=False,
+            output_device=device,
+        )
     }
+
+
+def build_stft_observation_from_samples(
+    samples: Sequence[Dict[str, Any]],
+    *,
+    intake_sample_rate_hz: float,
+    device: str = "cpu",
+    use_cached_stft: bool = True,
+) -> Dict[str, List[torch.Tensor]]:
+    """Build an ActorCritic STFT observation from sample dictionaries.
+
+    If every sample contains ``stft_feature_list`` and ``use_cached_stft`` is
+    True, cached features are stacked and moved to ``device``.  Otherwise the
+    helper falls back to stacking ``iq1``/``iq2``/``iq3`` and computing STFT
+    features on demand.
+    """
+
+    cached = _collate_stft_feature_list(samples) if use_cached_stft else None
+    if cached is not None:
+        return {"stft_feature_list": _normalize_cached_stft_feature_list(cached, device=device)}
+
+    return build_stft_observation_from_iq_batch(
+        iq1=torch.stack([s["iq1"] for s in samples], dim=0),
+        iq2=torch.stack([s["iq2"] for s in samples], dim=0),
+        iq3=torch.stack([s["iq3"] for s in samples], dim=0),
+        intake_sample_rate_hz=intake_sample_rate_hz,
+        device=device,
+    )
