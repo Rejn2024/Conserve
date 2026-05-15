@@ -633,3 +633,103 @@ def test_create_cached_dataloader_s3_rejects_empty_prefix():
             pin_memory=False,
             s3_client=_FakeS3Client(),
         )
+
+
+def test_collate_cached_iq_stacks_cached_stft_features():
+    rows = []
+    for i in range(2):
+        rows.append(
+            {
+                "sample_name": f"s{i}",
+                "source_dir": "tmp",
+                "whole_iq": torch.ones(64, dtype=torch.complex64),
+                "whole_meta": {"sample_rate_hz": 1_000_000.0},
+                "whole_sample_rate_hz": 1_000_000.0,
+                "iq1": torch.ones(32, dtype=torch.complex64),
+                "iq2": torch.ones(32, dtype=torch.complex64),
+                "iq3": torch.ones(32, dtype=torch.complex64),
+                "stft_feature_list": [
+                    torch.full((2, 3, 4), float(i + view))
+                    for view in range(3)
+                ],
+            }
+        )
+
+    batch = atu.collate_cached_iq(rows)
+
+    assert "stft_feature_list" in batch
+    assert len(batch["stft_feature_list"]) == 3
+    assert batch["stft_feature_list"][0].shape == (2, 2, 3, 4)
+    assert torch.allclose(batch["stft_feature_list"][2][1], torch.full((2, 3, 4), 3.0))
+
+
+def test_build_stft_observation_from_iq_batch_uses_cached_features(monkeypatch):
+    def fail_preprocess(*_args, **_kwargs):
+        raise AssertionError("preprocess should not be called when cached STFT is supplied")
+
+    monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", fail_preprocess)
+    cached = [torch.ones(2, 3, 4, 5) * view for view in range(3)]
+
+    obs = atu.build_stft_observation_from_iq_batch(
+        iq1=torch.ones(2, 16, dtype=torch.complex64),
+        iq2=torch.ones(2, 16, dtype=torch.complex64),
+        iq3=torch.ones(2, 16, dtype=torch.complex64),
+        intake_sample_rate_hz=2e9,
+        stft_feature_list=cached,
+        device="cpu",
+    )
+
+    assert len(obs["stft_feature_list"]) == 3
+    assert torch.allclose(obs["stft_feature_list"][1], torch.ones(2, 3, 4, 5))
+
+
+def test_build_stft_observation_from_samples_prefers_cached_features(monkeypatch):
+    def fail_preprocess(*_args, **_kwargs):
+        raise AssertionError("preprocess should not be called when cached STFT is supplied")
+
+    monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", fail_preprocess)
+    samples = [
+        {
+            "iq1": torch.ones(8, dtype=torch.complex64),
+            "iq2": torch.ones(8, dtype=torch.complex64),
+            "iq3": torch.ones(8, dtype=torch.complex64),
+            "stft_feature_list": [torch.ones(2, 3, 4) * (i + view) for view in range(3)],
+        }
+        for i in range(2)
+    ]
+
+    obs = atu.build_stft_observation_from_samples(samples, intake_sample_rate_hz=2e9, device="cpu")
+
+    assert obs["stft_feature_list"][0].shape == (2, 2, 3, 4)
+    assert torch.allclose(obs["stft_feature_list"][1][1], torch.full((2, 3, 4), 2.0))
+
+
+def test_precompute_training_cache_can_store_stft_features(tmp_path: Path, monkeypatch):
+    pytest.importorskip("numpy")
+    data_root = tmp_path / "dataset"
+    cache_root = tmp_path / "cache"
+    data_root.mkdir()
+    _write_sample(data_root, 0)
+
+    def fake_preprocess(iq, sample_rate_hz):
+        batch = iq.shape[0]
+        return {"feature": torch.ones(batch, 2, 3, 4) * float(sample_rate_hz)}
+
+    monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", fake_preprocess)
+
+    produced = atu.precompute_training_cache(
+        dataset_root=data_root,
+        cache_root=cache_root,
+        jammer_sampling_freq=2e9,
+        section_len=16,
+        resample_fn=lambda x, _fs_in, _fs_out: x,
+        cache_stft_features=True,
+    )
+
+    record = torch.load(produced[0], map_location="cpu", weights_only=False)
+    assert "stft_feature_list" in record
+    assert len(record["stft_feature_list"]) == 3
+    assert record["stft_feature_list"][0].shape == (2, 3, 4)
+
+    manifest = json.loads((cache_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cache_stft_features"] is True
