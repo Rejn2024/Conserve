@@ -4,7 +4,14 @@ import math
 
 import torch
 
-from tx_controller_tone_pulse_stft_varlen_9 import decode_tone_pulse_config
+from tx_controller_tone_pulse_stft_varlen_9 import (
+    FIRST_PASS_SCALAR_FEATURE_NAMES,
+    N_FIRST_PASS_SCALAR_FEATURES,
+    TonePulseTXControlNetVarLen,
+    build_first_pass_scalar_side_from_iq_sections,
+    compute_first_pass_scalar_features_for_iq_batch,
+    decode_tone_pulse_config,
+)
 
 
 def test_decode_tone_pulse_config_sanitizes_nan_model_outputs():
@@ -72,3 +79,39 @@ def test_decode_tone_pulse_config_sanitizes_nan_model_outputs():
     assert all(math.isfinite(x) for x in cfg.tone_frequency_std_hz)
     assert all(math.isfinite(x) for x in cfg.tone_amplitudes)
     assert all(math.isfinite(x) for x in cfg.pulse_phase_rotations_rad)
+
+
+def test_first_pass_scalar_features_are_finite_and_follow_schema():
+    iq = torch.zeros(2, 128, dtype=torch.complex64)
+    iq[0, 32:96] = 1.0 + 0.0j
+    iq[1, 8:24] = 0.5 + 0.25j
+
+    result = compute_first_pass_scalar_features_for_iq_batch(iq, sample_rate_hz=1_000_000.0)
+    scalar = result["scalar_side"]
+
+    assert result["feature_names"] == FIRST_PASS_SCALAR_FEATURE_NAMES
+    assert scalar.shape == (2, N_FIRST_PASS_SCALAR_FEATURES)
+    assert torch.isfinite(scalar).all()
+
+    names = {name: idx for idx, name in enumerate(FIRST_PASS_SCALAR_FEATURE_NAMES)}
+    assert scalar[0, names["packet_start_frac"]] > 0.20
+    assert scalar[0, names["packet_end_frac"]] < 0.80
+    assert scalar[0, names["packet_duration_frac"]] > 0.40
+    assert scalar[0, names["packet_geometry_valid"]] == 1.0
+    assert scalar[0, names["spectral_geometry_valid"]] == 1.0
+
+
+def test_first_pass_scalar_side_from_sections_feeds_default_network():
+    batch = 2
+    iq1 = torch.complex(torch.randn(batch, 96), torch.randn(batch, 96))
+    iq2 = torch.complex(torch.randn(batch, 96), torch.randn(batch, 96))
+    iq3 = torch.complex(torch.randn(batch, 96), torch.randn(batch, 96))
+    scalar = build_first_pass_scalar_side_from_iq_sections([iq1, iq2, iq3], sample_rate_hz=2_000_000.0)
+
+    model = TonePulseTXControlNetVarLen(in_ch=14, base_ch=4, max_tones=2, max_pulses=3)
+    stft = [torch.randn(batch, 14, 16, 8) for _ in range(3)]
+    out = model(stft, scalar)
+
+    assert model.scalar_proj[0].in_features == N_FIRST_PASS_SCALAR_FEATURES
+    assert out["tone_freq_mean_norms"].shape == (batch, 2)
+    assert out["pulse_phase_rel_rad"].shape == (batch, 3)

@@ -680,6 +680,8 @@ def test_build_stft_observation_from_iq_batch_uses_cached_features(monkeypatch):
     )
 
     assert len(obs["stft_feature_list"]) == 3
+    assert obs["scalar_side"].shape[0] == 2
+    assert "packet_start_frac" in obs["scalar_feature_names"]
     assert torch.allclose(obs["stft_feature_list"][1], torch.ones(2, 3, 4, 5))
 
 
@@ -701,6 +703,8 @@ def test_build_stft_observation_from_samples_prefers_cached_features(monkeypatch
     obs = atu.build_stft_observation_from_samples(samples, intake_sample_rate_hz=2e9, device="cpu")
 
     assert obs["stft_feature_list"][0].shape == (2, 2, 3, 4)
+    assert obs["scalar_side"].shape[0] == 2
+    assert "packet_start_frac" in obs["scalar_feature_names"]
     assert torch.allclose(obs["stft_feature_list"][1][1], torch.full((2, 3, 4), 2.0))
 
 

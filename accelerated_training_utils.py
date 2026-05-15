@@ -21,7 +21,10 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from tx_controller_tone_pulse_stft_varlen_9 import (
+    FIRST_PASS_SCALAR_FEATURE_NAMES,
+    FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION,
     build_controlled_tone_pulse_batch_from_iq_batches,
+    build_first_pass_scalar_side_from_iq_sections,
     preprocess_batched_iq_to_stft_feature,
 )
 
@@ -1252,29 +1255,32 @@ class JammerVecEnv:
             jammed = whole_iq.to(self.device) + jam_iq_rx_resam_t
             rx_result = link7.rx_command_iq(jammed, whole_meta)
 
-            score = torch.tensor(1.0, dtype=torch.float32)
+            # score = torch.tensor(1.0, dtype=torch.float32)
             total += 1
 
-            if rx_result.get("message") is not None:
-                score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
+            score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 
-                if score < 1.0:
-                    success += 1
+            if rx_result.get("message") is None:
+                success += 1
 
                 # metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
                 # score = score + (alpha * metric_div)
-
 
             vals.append(score)#.detach().cpu())
 
         return torch.stack(vals), success, total #.to(dtype=torch.float32)
 
-    @staticmethod
-    def _obs_from_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    def _obs_from_samples(self, samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        iq1 = torch.stack([s["iq1"] for s in samples], dim=0)
+        iq2 = torch.stack([s["iq2"] for s in samples], dim=0)
+        iq3 = torch.stack([s["iq3"] for s in samples], dim=0)
         obs: Dict[str, Any] = {
-            "iq1": torch.stack([s["iq1"] for s in samples], dim=0),
-            "iq2": torch.stack([s["iq2"] for s in samples], dim=0),
-            "iq3": torch.stack([s["iq3"] for s in samples], dim=0),
+            "iq1": iq1,
+            "iq2": iq2,
+            "iq3": iq3,
+            "scalar_side": build_first_pass_scalar_side_from_iq_sections([iq1, iq2, iq3], self.jammer_sampling_freq),
+            "scalar_feature_names": FIRST_PASS_SCALAR_FEATURE_NAMES,
+            "scalar_feature_schema": FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION,
         }
         stft_feature_list = _collate_stft_feature_list(samples)
         if stft_feature_list is not None:
@@ -1439,33 +1445,48 @@ def build_stft_observation_from_iq_batch(
     intake_sample_rate_hz: float,
     device: str = "cpu",
     stft_feature_list: Optional[Sequence[torch.Tensor]] = None,
-) -> Dict[str, List[torch.Tensor]]:
+) -> Dict[str, Any]:
     """Build the ActorCritic observation payload from cached IQ sections.
 
-    The controller observation is image-only and contains:
+    The controller observation contains both STFT image inputs and the
+    first-pass scalar side vector described by
+    ``FIRST_PASS_SCALAR_FEATURE_NAMES``:
     - stft_feature_list[0]: STFT feature map for iq1, shape [B, C, F, T1]
     - stft_feature_list[1]: STFT feature map for iq2, shape [B, C, F, T2]
     - stft_feature_list[2]: STFT feature map for iq3, shape [B, C, F, T3]
+    - scalar_side: packet/timing/spectral/power feature matrix, shape [B, F_s]
 
     Pass ``stft_feature_list`` from a cache record or collated batch to bypass
-    repeated STFT preprocessing in RL loops.  When omitted, this function keeps
-    the previous behavior and computes features from the IQ batches.
+    repeated STFT preprocessing in RL loops.  Scalar features are still computed
+    from the available IQ tensors so cached STFT records receive the same
+    side-information as uncached records.
     """
 
-    if stft_feature_list is not None:
-        return {"stft_feature_list": _normalize_cached_stft_feature_list(stft_feature_list, device=device)}
-
-    return {
-        "stft_feature_list": compute_stft_feature_list_for_iq_sections(
-            iq1=iq1,
-            iq2=iq2,
-            iq3=iq3,
-            intake_sample_rate_hz=intake_sample_rate_hz,
-            device=device,
-            squeeze_batch=False,
-            output_device=device,
-        )
+    scalar_side = build_first_pass_scalar_side_from_iq_sections(
+        [iq1, iq2, iq3],
+        intake_sample_rate_hz,
+        device=device,
+    )
+    obs: Dict[str, Any] = {
+        "scalar_side": scalar_side,
+        "scalar_feature_names": FIRST_PASS_SCALAR_FEATURE_NAMES,
+        "scalar_feature_schema": FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION,
     }
+
+    if stft_feature_list is not None:
+        obs["stft_feature_list"] = _normalize_cached_stft_feature_list(stft_feature_list, device=device)
+        return obs
+
+    obs["stft_feature_list"] = compute_stft_feature_list_for_iq_sections(
+        iq1=iq1,
+        iq2=iq2,
+        iq3=iq3,
+        intake_sample_rate_hz=intake_sample_rate_hz,
+        device=device,
+        squeeze_batch=False,
+        output_device=device,
+    )
+    return obs
 
 
 def build_stft_observation_from_samples(
@@ -1474,23 +1495,22 @@ def build_stft_observation_from_samples(
     intake_sample_rate_hz: float,
     device: str = "cpu",
     use_cached_stft: bool = True,
-) -> Dict[str, List[torch.Tensor]]:
+) -> Dict[str, Any]:
     """Build an ActorCritic STFT observation from sample dictionaries.
 
-    If every sample contains ``stft_feature_list`` and ``use_cached_stft`` is
-    True, cached features are stacked and moved to ``device``.  Otherwise the
-    helper falls back to stacking ``iq1``/``iq2``/``iq3`` and computing STFT
-    features on demand.
+    The returned observation includes the first-pass scalar side vector.  If
+    every sample contains ``stft_feature_list`` and ``use_cached_stft`` is True,
+    cached STFT features are stacked and moved to ``device``; scalar features are
+    still computed from ``iq1``/``iq2``/``iq3``.  Otherwise the helper computes
+    STFT features on demand.
     """
 
     cached = _collate_stft_feature_list(samples) if use_cached_stft else None
-    if cached is not None:
-        return {"stft_feature_list": _normalize_cached_stft_feature_list(cached, device=device)}
-
     return build_stft_observation_from_iq_batch(
         iq1=torch.stack([s["iq1"] for s in samples], dim=0),
         iq2=torch.stack([s["iq2"] for s in samples], dim=0),
         iq3=torch.stack([s["iq3"] for s in samples], dim=0),
         intake_sample_rate_hz=intake_sample_rate_hz,
         device=device,
+        stft_feature_list=cached,
     )
