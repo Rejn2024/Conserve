@@ -733,3 +733,100 @@ def test_precompute_training_cache_can_store_stft_features(tmp_path: Path, monke
 
     manifest = json.loads((cache_root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["cache_stft_features"] is True
+
+def test_jammer_controller_batch_passes_per_row_action_overrides(monkeypatch):
+    captured = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        overrides = kwargs["action_overrides"]
+        return [
+            {
+                "tx_iq": torch.ones(8, dtype=torch.complex64) * (i + 1),
+                "tx_metadata": {"override": overrides[i]},
+            }
+            for i in range(len(overrides))
+        ]
+
+    monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
+
+    samples = [
+        {
+            "iq1": torch.ones(16, dtype=torch.complex64),
+            "iq2": torch.ones(16, dtype=torch.complex64),
+            "iq3": torch.ones(16, dtype=torch.complex64),
+        }
+        for _ in range(2)
+    ]
+    actions = [
+        {"num_tones": 1, "carrier_hz": 10.0, "seed": 101},
+        {"num_tones": 3, "carrier_hz": 20.0, "seed": 202},
+    ]
+
+    out = atu.jammer_controller_batch(
+        model=torch.nn.Identity(),
+        samples=samples,
+        actions=actions,
+        jammer_sampling_freq=1_000_000.0,
+        device="cpu",
+    )
+
+    assert len(out) == 2
+    assert captured["action_overrides"][0]["num_tones"] == 1
+    assert captured["action_overrides"][0]["carrier_hz"] == pytest.approx(10.0)
+    assert captured["action_overrides"][0]["seed"] == 101
+    assert captured["action_overrides"][1]["num_tones"] == 3
+    assert captured["action_overrides"][1]["carrier_hz"] == pytest.approx(20.0)
+    assert captured["action_overrides"][1]["seed"] == 202
+
+
+def test_jammer_controller_batch_decodes_actor_action_rows(monkeypatch):
+    captured = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return [
+            {"tx_iq": torch.ones(8, dtype=torch.complex64), "tx_metadata": {}}
+            for _ in kwargs["action_overrides"]
+        ]
+
+    class DummyBackbone(torch.nn.Module):
+        max_tones = 2
+        max_pulses = 3
+
+    class DummyActor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = DummyBackbone()
+
+    monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
+
+    samples = [
+        {
+            "iq1": torch.ones(16, dtype=torch.complex64),
+            "iq2": torch.ones(16, dtype=torch.complex64),
+            "iq3": torch.ones(16, dtype=torch.complex64),
+        }
+        for _ in range(2)
+    ]
+    actions = torch.zeros((2, 11 + 4 * 2 + 3), dtype=torch.float32)
+    actions[0, 4] = 1.0
+    actions[0, 5:7] = torch.tensor([0.1, -0.1])
+    actions[1, 4] = 2.0
+    actions[1, 5:7] = torch.tensor([0.2, -0.2])
+    actions[1, -1] = 7.0
+
+    atu.jammer_controller_batch(
+        model=DummyActor(),
+        samples=samples,
+        actions=actions,
+        jammer_sampling_freq=1_000_000.0,
+        device="cpu",
+    )
+
+    assert captured["model"].max_tones == 2
+    assert captured["action_overrides"][0]["num_tones"] == pytest.approx(1.0)
+    assert captured["action_overrides"][0]["tone_freq_mean_norms"] == pytest.approx([0.1, -0.1])
+    assert captured["action_overrides"][1]["num_tones"] == pytest.approx(2.0)
+    assert captured["action_overrides"][1]["tone_freq_mean_norms"] == pytest.approx([0.2, -0.2])
+    assert captured["action_overrides"][1]["start_offset_samples"] == pytest.approx(7.0)
