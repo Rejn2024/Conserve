@@ -21,6 +21,38 @@ NOISE_COLORS = ["white", "pink", "brown", "blue", "violet"]
 FADING_MODES = ["none", "rician_block", "rayleigh_block", "multipath_static"]
 DEFAULT_COMPLEX_DTYPE = txflex.DEFAULT_COMPLEX_DTYPE
 
+FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION = "first_pass_scalar_features_v1"
+FIRST_PASS_TIME_PEAK_COUNT = 3
+FIRST_PASS_SCALAR_FEATURE_NAMES: Tuple[str, ...] = (
+    "packet_start_frac",
+    "packet_end_frac",
+    "packet_duration_frac",
+    "active_frame_frac",
+    "time_energy_centroid_frac",
+    "time_energy_spread_frac",
+    "time_peak_0_center_frac",
+    "time_peak_0_height_norm",
+    "time_peak_1_center_frac",
+    "time_peak_1_height_norm",
+    "time_peak_2_center_frac",
+    "time_peak_2_height_norm",
+    "center_freq_frac",
+    "occupied_bw_frac",
+    "low_edge_frac",
+    "high_edge_frac",
+    "spectral_energy_concentration",
+    "rx_power_db",
+    "noise_floor_db",
+    "snr_est_db",
+    "papr_db",
+    "sample_rate_ratio",
+    "packet_geometry_valid",
+    "spectral_geometry_valid",
+    "power_context_valid",
+    "time_peaks_valid",
+)
+N_FIRST_PASS_SCALAR_FEATURES = len(FIRST_PASS_SCALAR_FEATURE_NAMES)
+
 
 def _complex64_for_limited_op(x: torch.Tensor) -> torch.Tensor:
     return txflex._complex64_for_limited_op(x)
@@ -113,6 +145,244 @@ def _as_batch_complex_tensor(iq_batch: Union[torch.Tensor, Sequence[Union[torch.
             row = F.pad(row, (0, max_len - int(row.numel())))
         padded.append(row)
     return torch.stack(padded, dim=0).to(dtype=DEFAULT_COMPLEX_DTYPE)
+
+
+def compute_first_pass_scalar_features_for_iq_batch(
+    iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]],
+    sample_rate_hz: float,
+    *,
+    reference_sample_rate_hz: float = 1.0e9,
+    time_bins: int = 64,
+) -> Dict[str, torch.Tensor]:
+    """Build the first-pass scalar observation vector from batched IQ.
+
+    The vector follows ``FIRST_PASS_SCALAR_FEATURE_NAMES`` and is intended to be
+    fused beside STFT/CNN embeddings.  All features are computed from the IQ
+    samples available to the policy: packet/time geometry, coarse spectral
+    overlap, power context, sample-rate scale, and validity flags.
+    """
+
+    x = _complex64_for_limited_op(_sanitize_complex_iq(_as_batch_complex_tensor(iq_batch)))
+    if x.ndim != 2:
+        raise ValueError(f"iq_batch must have shape [B, T], got {tuple(x.shape)}")
+    if x.shape[1] < 2:
+        x = F.pad(x, (0, 2 - int(x.shape[1])))
+
+    device = x.device
+    dtype = torch.float32
+    batch_size, n_samples = int(x.shape[0]), int(x.shape[1])
+    eps = torch.tensor(1e-12, dtype=dtype, device=device)
+    sample_rate = float(max(sample_rate_hz, 1.0))
+
+    power = torch.nan_to_num((x.real.square() + x.imag.square()).to(dtype), nan=0.0, posinf=0.0, neginf=0.0)
+    total_power = torch.sum(power, dim=1).clamp_min(eps)
+    mean_power = torch.mean(power, dim=1).clamp_min(eps)
+    peak_power = torch.max(power, dim=1).values.clamp_min(eps)
+    noise_floor = torch.quantile(power, 0.10, dim=1).clamp_min(eps)
+
+    # Packet geometry from a robust per-row threshold.  The threshold floats
+    # above a quiet-floor estimate so low-SNR packets still produce conservative
+    # active masks without peeking at labels or decode results.
+    threshold = noise_floor + 0.10 * (peak_power - noise_floor).clamp_min(0.0)
+    active = power > threshold[:, None]
+    valid_packet = active.any(dim=1).to(dtype)
+    idx = torch.arange(n_samples, dtype=dtype, device=device)
+    idx_norm = idx / float(max(n_samples - 1, 1))
+
+    active_i = active.to(torch.int64)
+    start_idx = torch.argmax(active_i, dim=1).to(dtype)
+    last_from_end = torch.argmax(torch.flip(active_i, dims=[1]), dim=1).to(dtype)
+    end_idx = (n_samples - 1) - last_from_end
+    start_frac = torch.where(valid_packet > 0, start_idx / float(max(n_samples - 1, 1)), torch.zeros_like(start_idx))
+    end_frac = torch.where(valid_packet > 0, end_idx / float(max(n_samples - 1, 1)), torch.zeros_like(end_idx))
+    duration_frac = torch.where(
+        valid_packet > 0,
+        (end_idx - start_idx + 1.0).clamp_min(0.0) / float(max(n_samples, 1)),
+        torch.zeros_like(end_idx),
+    )
+    active_frame_frac = active.to(dtype).mean(dim=1)
+
+    time_centroid = torch.sum(power * idx_norm[None, :], dim=1) / total_power
+    time_spread = torch.sqrt(torch.sum(power * (idx_norm[None, :] - time_centroid[:, None]).square(), dim=1) / total_power + eps)
+
+    n_bins = max(1, min(int(time_bins), n_samples))
+    pooled = F.adaptive_avg_pool1d(power.unsqueeze(1), n_bins).squeeze(1)
+    pooled_peak = torch.max(pooled, dim=1, keepdim=True).values.clamp_min(eps)
+    peak_heights, peak_bin_idx = torch.topk(
+        pooled,
+        k=min(FIRST_PASS_TIME_PEAK_COUNT, n_bins),
+        dim=1,
+        largest=True,
+        sorted=True,
+    )
+    if peak_heights.shape[1] < FIRST_PASS_TIME_PEAK_COUNT:
+        pad_width = FIRST_PASS_TIME_PEAK_COUNT - int(peak_heights.shape[1])
+        peak_heights = F.pad(peak_heights, (0, pad_width))
+        peak_bin_idx = F.pad(peak_bin_idx, (0, pad_width))
+    peak_centers = peak_bin_idx.to(dtype) / float(max(n_bins - 1, 1))
+    peak_heights_norm = peak_heights / pooled_peak
+    valid_time_peaks = (pooled_peak.squeeze(1) > eps).to(dtype)
+
+    spectrum = torch.fft.fftshift(torch.fft.fft(x, dim=1), dim=1)
+    spec_power = torch.nan_to_num((spectrum.real.square() + spectrum.imag.square()).to(dtype), nan=0.0, posinf=0.0, neginf=0.0)
+    spec_total = torch.sum(spec_power, dim=1).clamp_min(eps)
+    freq_frac = torch.fft.fftshift(torch.fft.fftfreq(n_samples, d=1.0 / sample_rate).to(device=device, dtype=dtype)) / sample_rate
+    center_freq_frac = torch.sum(spec_power * freq_frac[None, :], dim=1) / spec_total
+    cdf = torch.cumsum(spec_power, dim=1) / spec_total[:, None]
+    low_idx = torch.argmax((cdf >= 0.05).to(torch.int64), dim=1)
+    high_idx = torch.argmax((cdf >= 0.95).to(torch.int64), dim=1)
+    low_edge_frac = freq_frac[low_idx]
+    high_edge_frac = freq_frac[high_idx]
+    occupied_bw_frac = (high_edge_frac - low_edge_frac).clamp_min(0.0)
+    spectral_concentration = torch.max(spec_power, dim=1).values / spec_total
+    spectral_valid = (spec_total > eps).to(dtype)
+
+    rx_power_db = 10.0 * torch.log10(mean_power)
+    noise_floor_db = 10.0 * torch.log10(noise_floor)
+    snr_est_db = 10.0 * torch.log10((mean_power - noise_floor).clamp_min(eps) / noise_floor)
+    papr_db = 10.0 * torch.log10(peak_power / mean_power)
+    sample_rate_ratio = torch.full(
+        (batch_size,),
+        float(sample_rate / max(reference_sample_rate_hz, 1.0)),
+        dtype=dtype,
+        device=device,
+    )
+    power_valid = torch.isfinite(mean_power).to(dtype)
+
+    pieces: List[torch.Tensor] = [
+        start_frac,
+        end_frac,
+        duration_frac,
+        active_frame_frac,
+        time_centroid,
+        time_spread,
+    ]
+    for j in range(FIRST_PASS_TIME_PEAK_COUNT):
+        pieces.extend([peak_centers[:, j], peak_heights_norm[:, j]])
+    pieces.extend(
+        [
+            center_freq_frac,
+            occupied_bw_frac,
+            low_edge_frac,
+            high_edge_frac,
+            spectral_concentration,
+            rx_power_db,
+            noise_floor_db,
+            snr_est_db,
+            papr_db,
+            sample_rate_ratio,
+            valid_packet,
+            spectral_valid,
+            power_valid,
+            valid_time_peaks,
+        ]
+    )
+    feature = torch.stack(pieces, dim=1).to(dtype=dtype)
+    feature = torch.nan_to_num(feature, nan=0.0, posinf=1.0e6, neginf=-1.0e6).clamp(-1.0e6, 1.0e6)
+    if feature.shape[1] != N_FIRST_PASS_SCALAR_FEATURES:
+        raise RuntimeError(
+            f"first-pass scalar feature width {feature.shape[1]} does not match schema width {N_FIRST_PASS_SCALAR_FEATURES}"
+        )
+    return {
+        "scalar_side": feature,
+        "feature_names": FIRST_PASS_SCALAR_FEATURE_NAMES,
+        "schema_version": FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION,
+    }
+
+
+def build_first_pass_scalar_side_from_iq_sections(
+    iq_sections: Sequence[Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]],
+    sample_rate_hz: float,
+    *,
+    device: Optional[Union[str, torch.device]] = None,
+) -> torch.Tensor:
+    """Concatenate section IQ and return the first-pass scalar feature matrix."""
+
+    if len(iq_sections) != 3:
+        raise ValueError(f"iq_sections must contain exactly 3 IQ batches, got {len(iq_sections)}")
+    batches = [_as_batch_complex_tensor(section) for section in iq_sections]
+    batch_size = int(batches[0].shape[0])
+    if any(int(batch.shape[0]) != batch_size for batch in batches):
+        raise ValueError("All IQ sections must use the same batch size")
+    max_lens = [int(batch.shape[1]) for batch in batches]
+    if any(length <= 0 for length in max_lens):
+        raise ValueError("IQ sections must contain at least one sample")
+    combined = torch.cat(batches, dim=1)
+    if device is not None:
+        combined = combined.to(device=device)
+    return compute_first_pass_scalar_features_for_iq_batch(combined, sample_rate_hz)["scalar_side"]
+
+
+def _legacy_scalar_side_from_preprocessed(
+    proc: Sequence[Dict[str, torch.Tensor]],
+    intake_sample_rate_hz: float,
+    device: Union[str, torch.device],
+) -> torch.Tensor:
+    batch_size = int(proc[0]["feature"].shape[0])
+    rx_power_stack = torch.stack([p["rx_power"].to(device) for p in proc], dim=0)
+    peak_stack = torch.stack([p["peak_hz"].to(device) for p in proc], dim=0)
+    lengths = torch.stack([p["lengths"].to(device) for p in proc], dim=0).transpose(0, 1)
+    max_len = torch.clamp(torch.max(lengths, dim=1).values, min=1.0)
+    return torch.stack(
+        [
+            torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32, device=device)) / 10.0
+            * torch.ones(batch_size, dtype=torch.float32, device=device),
+            torch.mean(lengths, dim=1) / max_len,
+            torch.std(lengths, dim=1, unbiased=False) / max_len,
+            rx_power_stack.mean(dim=0).to(dtype=torch.float32),
+            peak_stack.mean(dim=0) / max(intake_sample_rate_hz, 1.0),
+            peak_stack.std(dim=0, unbiased=False) / max(intake_sample_rate_hz, 1.0),
+        ],
+        dim=1,
+    ).to(dtype=torch.float32, device=device)
+
+
+def _expected_model_scalar_features(model: nn.Module) -> int:
+    scalar_proj = getattr(model, "scalar_proj", None)
+    if scalar_proj is None and hasattr(model, "backbone"):
+        scalar_proj = getattr(model.backbone, "scalar_proj", None)
+    if scalar_proj is not None:
+        first = scalar_proj[0] if isinstance(scalar_proj, nn.Sequential) else scalar_proj
+        in_features = getattr(first, "in_features", None)
+        if in_features is not None:
+            return int(in_features)
+    return N_FIRST_PASS_SCALAR_FEATURES
+
+
+def _fit_scalar_side_width(scalar_side: torch.Tensor, expected_width: int) -> torch.Tensor:
+    if scalar_side.shape[1] == expected_width:
+        return scalar_side
+    if scalar_side.shape[1] > expected_width:
+        return scalar_side[:, :expected_width]
+    pad = torch.zeros(
+        scalar_side.shape[0],
+        expected_width - int(scalar_side.shape[1]),
+        dtype=scalar_side.dtype,
+        device=scalar_side.device,
+    )
+    return torch.cat([scalar_side, pad], dim=1)
+
+
+def build_scalar_side_for_model(
+    model: nn.Module,
+    iq_sections: Sequence[Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]],
+    intake_sample_rate_hz: float,
+    *,
+    device: Union[str, torch.device] = "cpu",
+    preprocessed: Optional[Sequence[Dict[str, torch.Tensor]]] = None,
+) -> torch.Tensor:
+    """Return scalar side features with the width expected by ``model``.
+
+    New models default to the first-pass schema.  Legacy six-scalar models keep
+    the previous length/rate/power/peak summary for checkpoint compatibility.
+    Custom widths receive the first-pass vector truncated or zero-padded.
+    """
+
+    expected = _expected_model_scalar_features(model)
+    if expected == 6 and preprocessed is not None:
+        return _legacy_scalar_side_from_preprocessed(preprocessed, intake_sample_rate_hz, device)
+    scalar_side = build_first_pass_scalar_side_from_iq_sections(iq_sections, intake_sample_rate_hz, device=device)
+    return _fit_scalar_side_width(scalar_side.to(dtype=torch.float32, device=device), expected)
 
 
 def preprocess_batched_iq_to_stft_feature(
@@ -332,7 +602,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self,
         in_ch: int = 14,
         base_ch: int = 24,
-        n_scalar_features: int = 6,
+        n_scalar_features: int = N_FIRST_PASS_SCALAR_FEATURES,
         max_tones: int = 8,
         max_pulses: int = 33,
     ):
@@ -458,7 +728,7 @@ class ActorCritic(nn.Module):
         action_dim: Optional[int] = None,
         in_ch: int = 14,
         base_ch: int = 24,
-        n_scalar_features: int = 6,
+        n_scalar_features: int = N_FIRST_PASS_SCALAR_FEATURES,
         max_tones: int = 8,
         max_pulses: int = 33,
         action_std_init: float = 0.25,
@@ -969,19 +1239,13 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
     rf_center_est_t = peak_stack.mean(dim=0)
 
     lengths = torch.stack([p["lengths"].to(device) for p in proc], dim=0).transpose(0, 1)
-    max_len = torch.clamp(torch.max(lengths, dim=1).values, min=1.0)
-    scalar_side = torch.stack(
-        [
-            torch.log10(torch.tensor(max(intake_sample_rate_hz, 1.0), dtype=torch.float32, device=device)) / 10.0
-            * torch.ones(batch_size, dtype=torch.float32, device=device),
-            torch.mean(lengths, dim=1) / max_len,
-            torch.std(lengths, dim=1, unbiased=False) / max_len,
-            rx_input_power_t.to(dtype=torch.float32),
-            peak_stack.mean(dim=0) / max(intake_sample_rate_hz, 1.0),
-            peak_stack.std(dim=0, unbiased=False) / max(intake_sample_rate_hz, 1.0),
-        ],
-        dim=1,
-    ).to(dtype=torch.float32, device=device)
+    scalar_side = build_scalar_side_for_model(
+        model,
+        rx_iq_batches,
+        intake_sample_rate_hz,
+        device=device,
+        preprocessed=proc,
+    )
 
     model = model.to(device)
     y = model(stft_tensors, scalar_side)
@@ -1049,6 +1313,9 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
         tx_metadata = dict(tx_result.metadata)
         tx_metadata["controller_input_lengths"] = [int(v) for v in lengths[i].tolist()]
         tx_metadata["controller_rx_input_power"] = float(rx_input_power_t[i].item())
+        tx_metadata["controller_scalar_feature_schema"] = FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION
+        tx_metadata["controller_scalar_feature_names"] = list(FIRST_PASS_SCALAR_FEATURE_NAMES[: scalar_side.shape[1]])
+        tx_metadata["controller_scalar_side"] = [float(v) for v in scalar_side[i].detach().cpu().tolist()]
         tx_metadata["controller_pulse_phase_rotations_rad"] = [float(v) for v in cfg.pulse_phase_rotations_rad]
         tx_metadata["controller_tone_pulse_on_samples"] = [int(v) for v in cfg.tone_pulse_on_samples]
         tx_metadata["controller_tone_pulse_off_samples"] = [int(v) for v in cfg.tone_pulse_off_samples]
@@ -1077,7 +1344,7 @@ if __name__ == "__main__":
     iq_b = torch.complex(torch.randn(1700), torch.randn(1700)).to(dtype=DEFAULT_COMPLEX_DTYPE)
     iq_c = torch.complex(torch.randn(3200), torch.randn(3200)).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
-    model = TonePulseTXControlNetVarLen(in_ch=4, base_ch=16, n_scalar_features=6, max_tones=8)
+    model = TonePulseTXControlNetVarLen(in_ch=4, base_ch=16, max_tones=8)
     out = build_controlled_tone_pulse_from_variable_inputs(
         model=model,
         rx_iq_windows=[iq_a, iq_b, iq_c],
