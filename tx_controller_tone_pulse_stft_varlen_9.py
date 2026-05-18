@@ -571,59 +571,28 @@ class ResidualBlock2D(nn.Module):
         return F.relu(out + identity, inplace=True)
 
 
-class ResidualUNetSTFTEncoder(nn.Module):
-    """Encodes one variable-size [B,C,F,T] STFT map with a Res-U-Net backbone.
-
-    The encoder preserves the residual convolutions used by the previous STFT
-    backbone, but arranges them in a U-Net with downsample/upsample skip paths so
-    the pooled embedding can use both coarse context and restored local detail.
-    """
+class VarLenSTFTEncoder(nn.Module):
+    """Encodes one variable-size [B,C,F,T] STFT map into [B,D] with a ResNet backbone."""
 
     def __init__(self, in_ch: int = 14, base_ch: int = 24):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, base_ch, 5, stride=1, padding=2, bias=False),
+            nn.Conv2d(in_ch, base_ch, 5, stride=2, padding=2, bias=False),
             nn.BatchNorm2d(base_ch),
             nn.ReLU(inplace=True),
         )
-        self.enc0 = ResidualBlock2D(base_ch, base_ch)
-        self.down1 = ResidualBlock2D(base_ch, base_ch * 2, stride=2)
-        self.enc1 = ResidualBlock2D(base_ch * 2, base_ch * 2)
-        self.down2 = ResidualBlock2D(base_ch * 2, base_ch * 4, stride=2)
-        self.enc2 = ResidualBlock2D(base_ch * 4, base_ch * 4)
-        self.bridge = ResidualBlock2D(base_ch * 4, base_ch * 8)
-        self.dec2 = ResidualBlock2D(base_ch * 12, base_ch * 4)
-        self.dec1 = ResidualBlock2D(base_ch * 6, base_ch * 2)
-        self.dec0 = ResidualBlock2D(base_ch * 3, base_ch)
-        self.out_proj = nn.Sequential(
-            nn.Conv2d(base_ch, base_ch * 4, 1, bias=False),
-            nn.BatchNorm2d(base_ch * 4),
-            nn.ReLU(inplace=True),
-        )
+        self.layer1 = ResidualBlock2D(base_ch, base_ch)
+        self.layer2 = ResidualBlock2D(base_ch, base_ch * 2, stride=2)
+        self.layer3 = ResidualBlock2D(base_ch * 2, base_ch * 4, stride=2)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.feature_dim = base_ch * 4
 
-    @staticmethod
-    def _upsample_like(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        return F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e0 = self.enc0(self.stem(x))
-        e1 = self.enc1(self.down1(e0))
-        e2 = self.enc2(self.down2(e1))
-        bridge = self.bridge(e2)
-
-        d2 = self._upsample_like(bridge, e2)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-        d1 = self._upsample_like(d2, e1)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-        d0 = self._upsample_like(d1, e0)
-        d0 = self.dec0(torch.cat([d0, e0], dim=1))
-        return self.pool(self.out_proj(d0)).flatten(1)
-
-
-# Backwards-compatible alias for code that imports the old encoder name.
-VarLenSTFTEncoder = ResidualUNetSTFTEncoder
+        z = self.stem(x)
+        z = self.layer1(z)
+        z = self.layer2(z)
+        z = self.layer3(z)
+        return self.pool(z).flatten(1)
 
 
 class TonePulseTXControlNetVarLen(nn.Module):
@@ -650,7 +619,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
             pulse_phase_ar_hidden: Hidden width for the transformer pulse-phase mixture decoder.
         """
         super().__init__()
-        self.encoder = ResidualUNetSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
+        self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
         self.max_pulses = max_pulses
         self.pulse_phase_ar_components = max(1, int(pulse_phase_ar_components))
