@@ -717,10 +717,13 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
         desired_output_iq_len, user_peak_power_fraction, seed,
         noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
         num_tones, base_f, spacing, amp_raw, pulse_on_samples,
-        pulse_off_samples, pulse_count, start_offset_samples
+        pulse_off_samples, pulse_count, start_offset_samples, pulse_phase_rel_rad
     - sequence/tensor:
         * up to 3 items mapped to desired_output_iq_len, user_peak_power_fraction, seed
-        * > 3 items interpreted as continuous control action vector in this order:
+        * when max_tones/max_pulses are known, the current ActorCritic layout is
+          decoded as 11 + 4*max_tones + max_pulses controls.  The pulse phase
+          slice contains samples from the autoregressive circular mixture.
+        * > 3 legacy items are interpreted as continuous controls in this order:
           noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
           num_tones, base_f, spacing, [amp_raw...], pulse_on_samples,
           pulse_off_samples, pulse_count, start_offset_samples
@@ -833,6 +836,9 @@ _ACTION_OVERRIDE_KEYS = (
     "tone_phase_rel_rad",
     "tone_phase_offset_rad",
     "pulse_phase_rel_rad",
+    "pulse_phase_rel_mix_logits",
+    "pulse_phase_rel_mix_loc_rad",
+    "pulse_phase_rel_mix_concentration",
     "pulse_phase_offset_rad",
     "pulse_phase_rotations_rad",
     "snr_db",
@@ -863,7 +869,12 @@ def jammer_controller(
 ) -> Dict[str, Any]:
     """Concrete (sample, action) adapter around build_controlled_tone_pulse_batch_from_iq_batches."""
 
-    action_cfg = _normalize_action(action)
+    synthesis_model = getattr(model, "backbone", model)
+    action_cfg = _normalize_action(
+        action,
+        max_tones=getattr(synthesis_model, "max_tones", None),
+        max_pulses=getattr(synthesis_model, "max_pulses", None),
+    )
     desired_output_iq_len = _as_int(action_cfg.get("desired_output_iq_len"), default_output_len)
     user_peak_power_fraction = _as_float(action_cfg.get("user_peak_power_fraction"), default_peak_power_fraction)
     seed = _as_int(action_cfg.get("seed"), default_seed)
@@ -871,7 +882,7 @@ def jammer_controller(
     action_overrides = _action_overrides_from_cfg(action_cfg)
 
     jam_batch = build_controlled_tone_pulse_batch_from_iq_batches(
-        model=model,
+        model=synthesis_model,
         rx_iq_batches=[
             sample["iq1"].unsqueeze(0),
             sample["iq2"].unsqueeze(0),
