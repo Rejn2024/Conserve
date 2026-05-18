@@ -605,6 +605,8 @@ class TonePulseTXControlNetVarLen(nn.Module):
         n_scalar_features: int = N_FIRST_PASS_SCALAR_FEATURES,
         max_tones: int = 8,
         max_pulses: int = 33,
+        pulse_phase_ar_components: int = 4,
+        pulse_phase_ar_hidden: int = 64,
     ):
         """
         Args:
@@ -613,11 +615,15 @@ class TonePulseTXControlNetVarLen(nn.Module):
             n_scalar_features: Number of non-image scalar side features fused with STFT features.
             max_tones: Upper bound on synthesized tone count (also output width for tone amplitudes).
             max_pulses: Upper bound on synthesized pulse count (output width for per-pulse phase controls).
+            pulse_phase_ar_components: Number of circular mixture components per autoregressive pulse step.
+            pulse_phase_ar_hidden: Hidden width for the autoregressive pulse-phase GRUCell.
         """
         super().__init__()
         self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
         self.max_pulses = max_pulses
+        self.pulse_phase_ar_components = max(1, int(pulse_phase_ar_components))
+        self.pulse_phase_ar_hidden = max(8, int(pulse_phase_ar_hidden))
         self.n_windows = 3
 
         self.window_fusion = nn.Sequential(
@@ -650,7 +656,15 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.tone_power_raw_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones)])
         self.tone_phase_rel_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones)])
         self.tone_phase_offset_head = nn.Linear(96, 1)
+        # Autoregressive circular mixture for pulse-relative phases.  The legacy
+        # per-slot scalar heads are retained for checkpoint key compatibility;
+        # the active path below uses the GRUCell mixture heads instead.
         self.pulse_phase_rel_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_pulses)])
+        self.pulse_phase_ar_init = nn.Linear(96, self.pulse_phase_ar_hidden)
+        self.pulse_phase_ar_step = nn.GRUCell(4, self.pulse_phase_ar_hidden)
+        self.pulse_phase_ar_logits_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
+        self.pulse_phase_ar_loc_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
+        self.pulse_phase_ar_concentration_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
         self.pulse_phase_offset_head = nn.Linear(96, 1)
         self.pulse_on_head = nn.Linear(96, 1)
         self.pulse_off_head = nn.Linear(96, 1)
@@ -670,12 +684,131 @@ class TonePulseTXControlNetVarLen(nn.Module):
         z_cat = torch.cat(emb, dim=-1)
         return self.window_fusion(z_cat)
 
-    def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Dict[str, torch.Tensor]:
-        emb = [self.encoder(x) for x in stft_feature_list]
-        z_stft = self._fuse_window_embeddings(emb)
-        z = torch.cat([z_stft, self.scalar_proj(scalar_side)], dim=-1)
-        z = self.fusion(z)
+    def _pulse_index_features(self, step: int, batch_size: int, device: torch.device) -> torch.Tensor:
+        denom = max(1, self.max_pulses - 1)
+        frac = float(step) / float(denom)
+        angle = 2.0 * math.pi * frac
+        return torch.stack(
+            [
+                torch.full((batch_size,), math.sin(angle), dtype=torch.float32, device=device),
+                torch.full((batch_size,), math.cos(angle), dtype=torch.float32, device=device),
+            ],
+            dim=-1,
+        )
 
+    def pulse_phase_autoregressive_mixture(
+        self,
+        z: torch.Tensor,
+        teacher_phases: Optional[torch.Tensor] = None,
+        deterministic: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Unroll an autoregressive circular mixture over pulse-relative phases.
+
+        Args:
+            z: Fused controller features with shape [B, 96].
+            teacher_phases: Optional [B, max_pulses] phase tensor.  When given,
+                step i+1 is conditioned on the wrapped phase from step i, enabling
+                correct autoregressive log-prob evaluation under teacher forcing.
+            deterministic: If False and no teacher is provided, sample the next
+                previous phase from the mixture before advancing the GRU.  The
+                returned ``pulse_phase_rel_rad`` is still the actual unrolled phase
+                vector used by callers.
+        """
+
+        batch_size = int(z.shape[0])
+        device = z.device
+        hidden = torch.tanh(self.pulse_phase_ar_init(z))
+        prev_phase = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        logits_steps: List[torch.Tensor] = []
+        loc_steps: List[torch.Tensor] = []
+        conc_steps: List[torch.Tensor] = []
+        phase_steps: List[torch.Tensor] = []
+
+        teacher = None
+        if teacher_phases is not None:
+            teacher = teacher_phases.to(device=device, dtype=torch.float32)
+            if teacher.ndim == 1:
+                teacher = teacher.unsqueeze(0)
+            if teacher.shape[0] != batch_size:
+                raise ValueError("teacher_phases batch size must match z")
+
+        for step in range(int(self.max_pulses)):
+            step_feat = self._pulse_index_features(step, batch_size, device)
+            ar_in = torch.cat([torch.sin(prev_phase).unsqueeze(-1), torch.cos(prev_phase).unsqueeze(-1), step_feat], dim=-1)
+            hidden = self.pulse_phase_ar_step(ar_in, hidden)
+            logits = self.pulse_phase_ar_logits_head(hidden)
+            loc = _wrap_phase_rad(torch.pi * torch.tanh(self.pulse_phase_ar_loc_head(hidden)))
+            concentration = F.softplus(self.pulse_phase_ar_concentration_head(hidden)) + 1.0e-3
+            probs = torch.softmax(logits, dim=-1)
+            mean_sin = torch.sum(probs * torch.sin(loc), dim=-1)
+            mean_cos = torch.sum(probs * torch.cos(loc), dim=-1)
+            mean_phase = torch.atan2(mean_sin, mean_cos)
+
+            if teacher is not None and step < teacher.shape[1]:
+                current_phase = _wrap_phase_rad(teacher[:, step])
+            elif deterministic:
+                current_phase = mean_phase
+            else:
+                comp = torch.distributions.Categorical(logits=logits).sample()
+                picked_loc = loc.gather(1, comp.unsqueeze(-1)).squeeze(-1)
+                picked_conc = concentration.gather(1, comp.unsqueeze(-1)).squeeze(-1)
+                std = torch.rsqrt(picked_conc.clamp_min(1.0e-3))
+                current_phase = _wrap_phase_rad(picked_loc + std * torch.randn_like(picked_loc))
+
+            logits_steps.append(logits)
+            loc_steps.append(loc)
+            conc_steps.append(concentration)
+            phase_steps.append(current_phase)
+            prev_phase = current_phase
+
+        return {
+            "pulse_phase_rel_rad": torch.stack(phase_steps, dim=1),
+            "pulse_phase_rel_mix_logits": torch.stack(logits_steps, dim=1),
+            "pulse_phase_rel_mix_loc_rad": torch.stack(loc_steps, dim=1),
+            "pulse_phase_rel_mix_concentration": torch.stack(conc_steps, dim=1),
+        }
+
+    def pulse_phase_autoregressive_log_prob(
+        self,
+        z: torch.Tensor,
+        phases: torch.Tensor,
+        *,
+        shifts: Tuple[int, ...] = (-1, 0, 1),
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Teacher-forced log probability under the autoregressive phase mixture."""
+
+        phases = phases.to(device=z.device, dtype=torch.float32)
+        if phases.ndim == 1:
+            phases = phases.unsqueeze(0)
+        mix = self.pulse_phase_autoregressive_mixture(z, teacher_phases=phases, deterministic=True)
+        logits = mix["pulse_phase_rel_mix_logits"]
+        loc = mix["pulse_phase_rel_mix_loc_rad"]
+        concentration = mix["pulse_phase_rel_mix_concentration"]
+        scale = torch.rsqrt(concentration.clamp_min(1.0e-3))
+        value = _wrap_phase_rad(phases[:, : self.max_pulses]).unsqueeze(-1)
+        shifted_terms = []
+        for shift in shifts:
+            shifted = value + float(shift) * 2.0 * torch.pi
+            shifted_terms.append(torch.distributions.Normal(loc, scale).log_prob(shifted))
+        wrapped_component_logp = torch.logsumexp(torch.stack(shifted_terms, dim=0), dim=0)
+        log_mix = torch.log_softmax(logits, dim=-1)
+        per_step = torch.logsumexp(log_mix + wrapped_component_logp, dim=-1)
+        return per_step.sum(dim=-1), mix
+
+    def pulse_phase_autoregressive_entropy(self, z: torch.Tensor) -> torch.Tensor:
+        """Approximate entropy of the autoregressive mixture using deterministic feedback."""
+
+        mix = self.pulse_phase_autoregressive_mixture(z, deterministic=True)
+        logits = mix["pulse_phase_rel_mix_logits"]
+        concentration = mix["pulse_phase_rel_mix_concentration"]
+        cat = torch.distributions.Categorical(logits=logits)
+        scale = torch.rsqrt(concentration.clamp_min(1.0e-3))
+        component_entropy = torch.distributions.Normal(torch.zeros_like(scale), scale).entropy()
+        weights = torch.softmax(logits, dim=-1)
+        return (cat.entropy() + torch.sum(weights * component_entropy, dim=-1)).sum(dim=-1)
+
+    def model_outputs_from_fused(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
+        pulse_phase_mix = self.pulse_phase_autoregressive_mixture(z, deterministic=True)
         return {
             "noise_color_logits": self.noise_color_head(z),
             "fading_mode_logits": self.fading_mode_head(z),
@@ -698,7 +831,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "tone_power_logits": torch.cat([h(z) for h in self.tone_power_raw_heads], dim=1),
             "tone_phase_rel_rad": torch.cat([torch.pi * torch.tanh(h(z)) for h in self.tone_phase_rel_heads], dim=1),
             "tone_phase_offset_rad": torch.pi * torch.tanh(self.tone_phase_offset_head(z)),
-            "pulse_phase_rel_rad": torch.cat([torch.pi * torch.tanh(h(z)) for h in self.pulse_phase_rel_heads], dim=1),
+            **pulse_phase_mix,
             "pulse_phase_offset_rad": torch.pi * torch.tanh(self.pulse_phase_offset_head(z)),
             "pulse_on_samples": 128.0 + 8192.0 * torch.sigmoid(self.pulse_on_head(z)),
             "pulse_off_samples": 0.0 + 8192.0 * torch.sigmoid(self.pulse_off_head(z)),
@@ -712,6 +845,13 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "burst_probability": 1e-2 * torch.sigmoid(self.burst_prob_head(z)),
             "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z)),
         }
+
+    def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Dict[str, torch.Tensor]:
+        emb = [self.encoder(x) for x in stft_feature_list]
+        z_stft = self._fuse_window_embeddings(emb)
+        z = torch.cat([z_stft, self.scalar_proj(scalar_side)], dim=-1)
+        z = self.fusion(z)
+        return self.model_outputs_from_fused(z)
 
 
 class ActorCritic(nn.Module):
@@ -732,6 +872,8 @@ class ActorCritic(nn.Module):
         max_tones: int = 8,
         max_pulses: int = 33,
         action_std_init: float = 0.25,
+        pulse_phase_ar_components: int = 4,
+        pulse_phase_ar_hidden: int = 64,
     ):
         super().__init__()
         self.backbone = TonePulseTXControlNetVarLen(
@@ -740,6 +882,8 @@ class ActorCritic(nn.Module):
             n_scalar_features=n_scalar_features,
             max_tones=max_tones,
             max_pulses=max_pulses,
+            pulse_phase_ar_components=pulse_phase_ar_components,
+            pulse_phase_ar_hidden=pulse_phase_ar_hidden,
         )
         self.max_tones = max_tones
         self.max_pulses = max_pulses
@@ -762,13 +906,7 @@ class ActorCritic(nn.Module):
         z = torch.cat([z_stft, self.backbone.scalar_proj(scalar_side)], dim=-1)
         return self.backbone.fusion(z)
 
-    def _continuous_action_mean(
-        self,
-        stft_feature_list: List[torch.Tensor],
-        scalar_side: torch.Tensor,
-    ) -> torch.Tensor:
-        y = self.backbone(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
-
+    def _action_mean_from_model_out(self, y: Dict[str, torch.Tensor]) -> torch.Tensor:
         def _expected_index(logits: torch.Tensor) -> torch.Tensor:
             probs = torch.softmax(logits, dim=-1)
             idx = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype)
@@ -800,19 +938,42 @@ class ActorCritic(nn.Module):
             )
         return action_mean
 
+    def _continuous_action_mean(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._action_mean_from_model_out(self.backbone(stft_feature_list=stft_feature_list, scalar_side=scalar_side))
+
     def _log_std_from_features(self, fused_features: torch.Tensor) -> torch.Tensor:
         raw = self.log_std_head(fused_features)
         return self._init_log_std + torch.tanh(raw)
+
+    def _pulse_phase_action_slice(self) -> slice:
+        start = 5 + (4 * int(self.max_tones)) + 1
+        return slice(start, start + int(self.max_pulses))
+
+    def _policy_tensors(
+        self,
+        stft_feature_list: List[torch.Tensor],
+        scalar_side: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        fused = self._encode(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        y = self.backbone.model_outputs_from_fused(fused)
+        action_mean = self._action_mean_from_model_out(y)
+        value = self.value_head(fused).squeeze(-1)
+        log_std = self._log_std_from_features(fused)
+        return action_mean, value, log_std, fused, y
 
     def forward(
         self,
         stft_feature_list: List[torch.Tensor],
         scalar_side: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean = self._continuous_action_mean(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
-        fused = self._encode(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
-        value = self.value_head(fused).squeeze(-1)
-        log_std = self._log_std_from_features(fused)
+        action_mean, value, log_std, _, _ = self._policy_tensors(
+            stft_feature_list=stft_feature_list,
+            scalar_side=scalar_side,
+        )
         return action_mean, value, log_std
 
     def forward_observation(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -834,11 +995,70 @@ class ActorCritic(nn.Module):
             scalar_side=scalar_side,
         )
 
+    def _policy_tensors_from_observation(
+        self,
+        observation: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        scalar_side = observation.get("scalar_side")
+        if scalar_side is None:
+            stft_list = observation["stft_feature_list"]
+            if not stft_list:
+                raise ValueError("observation['stft_feature_list'] must contain at least one tensor")
+            ref = stft_list[0]
+            scalar_side = torch.zeros(
+                ref.shape[0],
+                self.backbone.scalar_proj[0].in_features,
+                dtype=ref.dtype,
+                device=ref.device,
+            )
+        return self._policy_tensors(stft_feature_list=observation["stft_feature_list"], scalar_side=scalar_side)
+
     def _action_distribution(self, action_mean: torch.Tensor, log_std: torch.Tensor) -> torch.distributions.Normal:
         std = torch.exp(log_std).clamp_min(self._action_std_floor)
         action_mean = torch.nan_to_num(action_mean, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         std = torch.nan_to_num(std, nan=self._action_std_floor, posinf=20.0, neginf=self._action_std_floor).clamp_min(self._action_std_floor)
         return torch.distributions.Normal(loc=action_mean, scale=std)
+
+    def _normal_log_prob_excluding_pulse_phase(
+        self,
+        dist: torch.distributions.Normal,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        per_dim = dist.log_prob(action)
+        pulse_slice = self._pulse_phase_action_slice()
+        mask = torch.ones(per_dim.shape[-1], dtype=torch.bool, device=per_dim.device)
+        mask[pulse_slice] = False
+        return per_dim[..., mask].sum(dim=-1)
+
+    def _normal_entropy_excluding_pulse_phase(self, dist: torch.distributions.Normal) -> torch.Tensor:
+        entropy = dist.entropy()
+        pulse_slice = self._pulse_phase_action_slice()
+        mask = torch.ones(entropy.shape[-1], dtype=torch.bool, device=entropy.device)
+        mask[pulse_slice] = False
+        return entropy[..., mask].sum(dim=-1)
+
+    def _sample_hybrid_action(
+        self,
+        *,
+        action_mean: torch.Tensor,
+        log_std: torch.Tensor,
+        fused: torch.Tensor,
+        deterministic: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
+        action = action_mean.clone() if deterministic else dist.rsample()
+        pulse_slice = self._pulse_phase_action_slice()
+        if deterministic:
+            pulse_phases = action_mean[:, pulse_slice]
+            pulse_log_prob, _ = self.backbone.pulse_phase_autoregressive_log_prob(fused, pulse_phases)
+        else:
+            mix = self.backbone.pulse_phase_autoregressive_mixture(fused, deterministic=False)
+            pulse_phases = mix["pulse_phase_rel_rad"]
+            pulse_log_prob, _ = self.backbone.pulse_phase_autoregressive_log_prob(fused, pulse_phases)
+            action[:, pulse_slice] = pulse_phases
+        log_prob = self._normal_log_prob_excluding_pulse_phase(dist, action) + pulse_log_prob
+        entropy = self._normal_entropy_excluding_pulse_phase(dist) + self.backbone.pulse_phase_autoregressive_entropy(fused)
+        return action, log_prob, entropy
 
     def act(
         self,
@@ -846,10 +1066,13 @@ class ActorCritic(nn.Module):
         scalar_side: torch.Tensor,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, value, log_std = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
-        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
-        action = action_mean if deterministic else dist.rsample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
+        action_mean, value, log_std, fused, _ = self._policy_tensors(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        action, log_prob, _ = self._sample_hybrid_action(
+            action_mean=action_mean,
+            log_std=log_std,
+            fused=fused,
+            deterministic=deterministic,
+        )
         return action, log_prob, value
 
     def evaluate_actions(
@@ -858,10 +1081,12 @@ class ActorCritic(nn.Module):
         scalar_side: torch.Tensor,
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, value, log_std = self.forward(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
+        action_mean, value, log_std, fused, _ = self._policy_tensors(stft_feature_list=stft_feature_list, scalar_side=scalar_side)
         dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
-        log_prob = dist.log_prob(actions).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
+        pulse_slice = self._pulse_phase_action_slice()
+        pulse_log_prob, _ = self.backbone.pulse_phase_autoregressive_log_prob(fused, actions[:, pulse_slice])
+        log_prob = self._normal_log_prob_excluding_pulse_phase(dist, actions) + pulse_log_prob
+        entropy = self._normal_entropy_excluding_pulse_phase(dist) + self.backbone.pulse_phase_autoregressive_entropy(fused)
         return log_prob, entropy, value
 
     def get_action_value_logp(
@@ -870,11 +1095,19 @@ class ActorCritic(nn.Module):
         action: Optional[torch.Tensor] = None,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, value, log_std = self.forward_observation(observation)
-        dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
+        action_mean, value, log_std, fused, _ = self._policy_tensors_from_observation(observation)
         if action is None:
-            action = action_mean if deterministic else dist.rsample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
+            action, log_prob, _ = self._sample_hybrid_action(
+                action_mean=action_mean,
+                log_std=log_std,
+                fused=fused,
+                deterministic=deterministic,
+            )
+        else:
+            dist = self._action_distribution(action_mean=action_mean, log_std=log_std)
+            pulse_slice = self._pulse_phase_action_slice()
+            pulse_log_prob, _ = self.backbone.pulse_phase_autoregressive_log_prob(fused, action[:, pulse_slice])
+            log_prob = self._normal_log_prob_excluding_pulse_phase(dist, action) + pulse_log_prob
         return action, value, log_prob
 
 

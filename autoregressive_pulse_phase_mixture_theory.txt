@@ -1,0 +1,53 @@
+Autoregressive pulse-phase mixture: theory and implementation notes
+==================================================================
+
+1. Problem being solved
+-----------------------
+The controller previously emitted model_out["pulse_phase_rel_rad"] as one bounded scalar per pulse slot.  That representation can only express a single deterministic phase trajectory at the controller-output level, and the ActorCritic wrapper placed a factorized Normal distribution over the flattened action vector.  A factorized unimodal Normal is poorly matched to pulse phase control because useful phase schedules can be multi-modal: for example, a policy may want either an alternating phase-inversion pattern, a monotone phase walk, or a reset-like pattern for the same observation.
+
+2. Why phases need circular mixture distributions
+-------------------------------------------------
+Pulse phases live on a circle.  The numerical values -pi and +pi represent nearby physical phases, not distant endpoints.  Treating phase with an ordinary line distribution creates artificial boundary discontinuities.  The implementation therefore keeps every phase wrapped with atan2(sin(x), cos(x)) and models each pulse step with a mixture of wrapped Gaussian components.  Each component has:
+
+  * logits: unnormalized mixture weights,
+  * loc_rad: a component location on [-pi, pi], and
+  * concentration: an inverse-variance-like positive precision.
+
+Sampling selects a component and then samples a local Gaussian perturbation around its circular location before wrapping the result back to [-pi, pi].  Log probabilities approximate the wrapped density by evaluating the component Normal density at phase shifts of -2*pi, 0, and +2*pi and log-summing those aliases.
+
+3. Why the model is autoregressive
+----------------------------------
+The decoded pulse rotations are cumulative: later pulse rotations depend on earlier relative increments.  A fully independent mixture per pulse slot would represent multiple modes, but it would not model the sequential dependence between pulse decisions.  The autoregressive factorization is:
+
+  p(phi_1, phi_2, ..., phi_N | observation)
+    = product_i p(phi_i | phi_1, ..., phi_{i-1}, observation)
+
+The code embodies this with a GRUCell in TonePulseTXControlNetVarLen.  The fused observation embedding initializes the recurrent hidden state.  At each pulse index, the GRU receives sin(previous_phase), cos(previous_phase), sin(index_angle), and cos(index_angle).  The hidden state emits mixture logits, circular locations, and concentrations for the next pulse-relative phase.
+
+4. Deterministic controller output
+----------------------------------
+The synthesis path still needs a tensor named model_out["pulse_phase_rel_rad"] so existing decode_tone_pulse_config and apply_tone_pulse_action_overrides logic can continue to operate.  In deterministic controller forward passes, the code computes the circular mean of the mixture at each autoregressive step and stores that mean trajectory under model_out["pulse_phase_rel_rad"].  It also returns the full distribution parameters:
+
+  * model_out["pulse_phase_rel_mix_logits"],
+  * model_out["pulse_phase_rel_mix_loc_rad"], and
+  * model_out["pulse_phase_rel_mix_concentration"].
+
+This preserves backward compatibility while making the distributional structure available for RL and diagnostics.
+
+5. ActorCritic policy integration
+---------------------------------
+The ActorCritic class keeps the same flattened action dimension, 11 + 4*max_tones + max_pulses.  The pulse phase slice has not moved; it starts after the categorical expectations, tone frequency/std/amplitude/phase controls, and tone phase offset.  Non-phase action dimensions continue to use the existing factorized Normal policy.  The pulse phase slice is replaced by the autoregressive mixture policy:
+
+  * sampling calls pulse_phase_autoregressive_mixture(..., deterministic=False),
+  * log_prob for pulse phases uses teacher-forced autoregressive evaluation, and
+  * entropy is approximated as categorical mixture entropy plus weighted component Normal entropy.
+
+Teacher forcing means evaluate_actions conditions step i+1 on the actual phase from the action tensor at step i, rather than on a deterministic mean.  This is what makes the log probability consistent with the autoregressive factorization used during sampling.
+
+6. Notebook SAC integration
+---------------------------
+RL_Jamming_test_02.ipynb keeps its SAC action dimension unchanged, but its SACActorVarLen now replaces the pulse phase slice of the tanh-Gaussian SAC action with samples from the controller backbone's autoregressive circular mixture.  The SAC log probability sums the squashed-Gaussian contribution for non-phase dimensions and the autoregressive mixture contribution for pulse phase dimensions.  The SAC critics are constructed with the same max_pulses and mixture-component settings so their backbone dimensions match the actor and environment action layout.
+
+7. accelerated_training_utils integration
+-----------------------------------------
+The environment action normalizer still decodes the same flattened ActorCritic action vector.  The difference is semantic: when the vector length matches 11 + 4*max_tones + max_pulses, the pulse_phase_rel_rad slice is now expected to contain samples drawn from the autoregressive circular mixture.  The single-sample and batched jammer controller paths both infer max_tones/max_pulses from the synthesis model/backbone so this vector layout can be decoded consistently.
