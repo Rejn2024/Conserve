@@ -571,28 +571,59 @@ class ResidualBlock2D(nn.Module):
         return F.relu(out + identity, inplace=True)
 
 
-class VarLenSTFTEncoder(nn.Module):
-    """Encodes one variable-size [B,C,F,T] STFT map into [B,D]."""
+class ResidualUNetSTFTEncoder(nn.Module):
+    """Encodes one variable-size [B,C,F,T] STFT map with a Res-U-Net backbone.
+
+    The encoder preserves the residual convolutions used by the previous STFT
+    backbone, but arranges them in a U-Net with downsample/upsample skip paths so
+    the pooled embedding can use both coarse context and restored local detail.
+    """
 
     def __init__(self, in_ch: int = 14, base_ch: int = 24):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, base_ch, 5, stride=2, padding=2, bias=False),
+            nn.Conv2d(in_ch, base_ch, 5, stride=1, padding=2, bias=False),
             nn.BatchNorm2d(base_ch),
             nn.ReLU(inplace=True),
         )
-        self.layer1 = ResidualBlock2D(base_ch, base_ch)
-        self.layer2 = ResidualBlock2D(base_ch, base_ch * 2, stride=2)
-        self.layer3 = ResidualBlock2D(base_ch * 2, base_ch * 4, stride=2)
+        self.enc0 = ResidualBlock2D(base_ch, base_ch)
+        self.down1 = ResidualBlock2D(base_ch, base_ch * 2, stride=2)
+        self.enc1 = ResidualBlock2D(base_ch * 2, base_ch * 2)
+        self.down2 = ResidualBlock2D(base_ch * 2, base_ch * 4, stride=2)
+        self.enc2 = ResidualBlock2D(base_ch * 4, base_ch * 4)
+        self.bridge = ResidualBlock2D(base_ch * 4, base_ch * 8)
+        self.dec2 = ResidualBlock2D(base_ch * 12, base_ch * 4)
+        self.dec1 = ResidualBlock2D(base_ch * 6, base_ch * 2)
+        self.dec0 = ResidualBlock2D(base_ch * 3, base_ch)
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch * 4, 1, bias=False),
+            nn.BatchNorm2d(base_ch * 4),
+            nn.ReLU(inplace=True),
+        )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.feature_dim = base_ch * 4
 
+    @staticmethod
+    def _upsample_like(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.stem(x)
-        z = self.layer1(z)
-        z = self.layer2(z)
-        z = self.layer3(z)
-        return self.pool(z).flatten(1)
+        e0 = self.enc0(self.stem(x))
+        e1 = self.enc1(self.down1(e0))
+        e2 = self.enc2(self.down2(e1))
+        bridge = self.bridge(e2)
+
+        d2 = self._upsample_like(bridge, e2)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self._upsample_like(d2, e1)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        d0 = self._upsample_like(d1, e0)
+        d0 = self.dec0(torch.cat([d0, e0], dim=1))
+        return self.pool(self.out_proj(d0)).flatten(1)
+
+
+# Backwards-compatible alias for code that imports the old encoder name.
+VarLenSTFTEncoder = ResidualUNetSTFTEncoder
 
 
 class TonePulseTXControlNetVarLen(nn.Module):
@@ -616,10 +647,10 @@ class TonePulseTXControlNetVarLen(nn.Module):
             max_tones: Upper bound on synthesized tone count (also output width for tone amplitudes).
             max_pulses: Upper bound on synthesized pulse count (output width for per-pulse phase controls).
             pulse_phase_ar_components: Number of circular mixture components per autoregressive pulse step.
-            pulse_phase_ar_hidden: Hidden width for the autoregressive pulse-phase GRUCell.
+            pulse_phase_ar_hidden: Hidden width for the transformer pulse-phase mixture decoder.
         """
         super().__init__()
-        self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
+        self.encoder = ResidualUNetSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
         self.max_pulses = max_pulses
         self.pulse_phase_ar_components = max(1, int(pulse_phase_ar_components))
@@ -658,10 +689,22 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.tone_phase_offset_head = nn.Linear(96, 1)
         # Autoregressive circular mixture for pulse-relative phases.  The legacy
         # per-slot scalar heads are retained for checkpoint key compatibility;
-        # the active path below uses the GRUCell mixture heads instead.
+        # the active path below uses causal transformer mixture heads instead of
+        # recurrent LSTM/GRU cells.
         self.pulse_phase_rel_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_pulses)])
-        self.pulse_phase_ar_init = nn.Linear(96, self.pulse_phase_ar_hidden)
-        self.pulse_phase_ar_step = nn.GRUCell(4, self.pulse_phase_ar_hidden)
+        self.pulse_phase_context_proj = nn.Linear(96, self.pulse_phase_ar_hidden)
+        self.pulse_phase_token_proj = nn.Linear(4, self.pulse_phase_ar_hidden)
+        self.pulse_phase_pos_embed = nn.Parameter(torch.zeros(max_pulses, self.pulse_phase_ar_hidden))
+        nhead = 4 if self.pulse_phase_ar_hidden % 4 == 0 else 2 if self.pulse_phase_ar_hidden % 2 == 0 else 1
+        pulse_phase_layer = nn.TransformerEncoderLayer(
+            d_model=self.pulse_phase_ar_hidden,
+            nhead=nhead,
+            dim_feedforward=self.pulse_phase_ar_hidden * 4,
+            dropout=0.0,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.pulse_phase_transformer = nn.TransformerEncoder(pulse_phase_layer, num_layers=2)
         self.pulse_phase_ar_logits_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
         self.pulse_phase_ar_loc_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
         self.pulse_phase_ar_concentration_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
@@ -696,13 +739,42 @@ class TonePulseTXControlNetVarLen(nn.Module):
             dim=-1,
         )
 
+    def _pulse_index_feature_sequence(self, length: int, batch_size: int, device: torch.device) -> torch.Tensor:
+        steps = torch.arange(length, dtype=torch.float32, device=device)
+        denom = float(max(1, self.max_pulses - 1))
+        angles = 2.0 * math.pi * steps / denom
+        features = torch.stack([torch.sin(angles), torch.cos(angles)], dim=-1)
+        return features.unsqueeze(0).expand(batch_size, -1, -1)
+
+    def _pulse_phase_transformer_states(self, z: torch.Tensor, prev_phases: torch.Tensor) -> torch.Tensor:
+        """Return causal transformer states for tokens conditioned on prior phases."""
+
+        batch_size, length = int(prev_phases.shape[0]), int(prev_phases.shape[1])
+        device = z.device
+        token_features = torch.cat(
+            [
+                torch.sin(prev_phases).unsqueeze(-1),
+                torch.cos(prev_phases).unsqueeze(-1),
+                self._pulse_index_feature_sequence(length, batch_size, device),
+            ],
+            dim=-1,
+        )
+        tokens = self.pulse_phase_token_proj(token_features)
+        tokens = tokens + self.pulse_phase_context_proj(z).unsqueeze(1)
+        tokens = tokens + self.pulse_phase_pos_embed[:length].unsqueeze(0)
+        causal_mask = torch.triu(
+            torch.full((length, length), float("-inf"), dtype=tokens.dtype, device=device),
+            diagonal=1,
+        )
+        return self.pulse_phase_transformer(tokens, mask=causal_mask)
+
     def pulse_phase_autoregressive_mixture(
         self,
         z: torch.Tensor,
         teacher_phases: Optional[torch.Tensor] = None,
         deterministic: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        """Unroll an autoregressive circular mixture over pulse-relative phases.
+        """Unroll a transformer autoregressive circular mixture over pulse phases.
 
         Args:
             z: Fused controller features with shape [B, 96].
@@ -710,15 +782,13 @@ class TonePulseTXControlNetVarLen(nn.Module):
                 step i+1 is conditioned on the wrapped phase from step i, enabling
                 correct autoregressive log-prob evaluation under teacher forcing.
             deterministic: If False and no teacher is provided, sample the next
-                previous phase from the mixture before advancing the GRU.  The
-                returned ``pulse_phase_rel_rad`` is still the actual unrolled phase
+                previous phase from the mixture before extending the transformer
+                prefix.  The returned ``pulse_phase_rel_rad`` is the unrolled phase
                 vector used by callers.
         """
 
         batch_size = int(z.shape[0])
         device = z.device
-        hidden = torch.tanh(self.pulse_phase_ar_init(z))
-        prev_phase = torch.zeros(batch_size, dtype=torch.float32, device=device)
         logits_steps: List[torch.Tensor] = []
         loc_steps: List[torch.Tensor] = []
         conc_steps: List[torch.Tensor] = []
@@ -732,10 +802,11 @@ class TonePulseTXControlNetVarLen(nn.Module):
             if teacher.shape[0] != batch_size:
                 raise ValueError("teacher_phases batch size must match z")
 
+        prev_prefix = torch.zeros(batch_size, 1, dtype=torch.float32, device=device)
+
         for step in range(int(self.max_pulses)):
-            step_feat = self._pulse_index_features(step, batch_size, device)
-            ar_in = torch.cat([torch.sin(prev_phase).unsqueeze(-1), torch.cos(prev_phase).unsqueeze(-1), step_feat], dim=-1)
-            hidden = self.pulse_phase_ar_step(ar_in, hidden)
+            states = self._pulse_phase_transformer_states(z, prev_prefix)
+            hidden = states[:, -1, :]
             logits = self.pulse_phase_ar_logits_head(hidden)
             loc = _wrap_phase_rad(torch.pi * torch.tanh(self.pulse_phase_ar_loc_head(hidden)))
             concentration = F.softplus(self.pulse_phase_ar_concentration_head(hidden)) + 1.0e-3
@@ -759,7 +830,9 @@ class TonePulseTXControlNetVarLen(nn.Module):
             loc_steps.append(loc)
             conc_steps.append(concentration)
             phase_steps.append(current_phase)
-            prev_phase = current_phase
+
+            if step + 1 < int(self.max_pulses):
+                prev_prefix = torch.cat([prev_prefix, current_phase.unsqueeze(1)], dim=1)
 
         return {
             "pulse_phase_rel_rad": torch.stack(phase_steps, dim=1),
