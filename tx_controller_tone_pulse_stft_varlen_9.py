@@ -616,7 +616,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
             max_tones: Upper bound on synthesized tone count (also output width for tone amplitudes).
             max_pulses: Upper bound on synthesized pulse count (output width for per-pulse phase controls).
             pulse_phase_ar_components: Number of circular mixture components per autoregressive pulse step.
-            pulse_phase_ar_hidden: Hidden width for the autoregressive pulse-phase GRUCell.
+            pulse_phase_ar_hidden: Hidden width for the autoregressive pulse-phase LSTMCell.
         """
         super().__init__()
         self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
@@ -658,10 +658,11 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.tone_phase_offset_head = nn.Linear(96, 1)
         # Autoregressive circular mixture for pulse-relative phases.  The legacy
         # per-slot scalar heads are retained for checkpoint key compatibility;
-        # the active path below uses the GRUCell mixture heads instead.
+        # the active path below uses the LSTMCell mixture heads instead.
         self.pulse_phase_rel_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_pulses)])
         self.pulse_phase_ar_init = nn.Linear(96, self.pulse_phase_ar_hidden)
-        self.pulse_phase_ar_step = nn.GRUCell(4, self.pulse_phase_ar_hidden)
+        self.pulse_phase_ar_cell_init = nn.Linear(96, self.pulse_phase_ar_hidden)
+        self.pulse_phase_ar_step = nn.LSTMCell(4, self.pulse_phase_ar_hidden)
         self.pulse_phase_ar_logits_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
         self.pulse_phase_ar_loc_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
         self.pulse_phase_ar_concentration_head = nn.Linear(self.pulse_phase_ar_hidden, self.pulse_phase_ar_components)
@@ -710,7 +711,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
                 step i+1 is conditioned on the wrapped phase from step i, enabling
                 correct autoregressive log-prob evaluation under teacher forcing.
             deterministic: If False and no teacher is provided, sample the next
-                previous phase from the mixture before advancing the GRU.  The
+                previous phase from the mixture before advancing the LSTM.  The
                 returned ``pulse_phase_rel_rad`` is still the actual unrolled phase
                 vector used by callers.
         """
@@ -718,6 +719,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
         batch_size = int(z.shape[0])
         device = z.device
         hidden = torch.tanh(self.pulse_phase_ar_init(z))
+        cell = torch.tanh(self.pulse_phase_ar_cell_init(z))
         prev_phase = torch.zeros(batch_size, dtype=torch.float32, device=device)
         logits_steps: List[torch.Tensor] = []
         loc_steps: List[torch.Tensor] = []
@@ -735,7 +737,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
         for step in range(int(self.max_pulses)):
             step_feat = self._pulse_index_features(step, batch_size, device)
             ar_in = torch.cat([torch.sin(prev_phase).unsqueeze(-1), torch.cos(prev_phase).unsqueeze(-1), step_feat], dim=-1)
-            hidden = self.pulse_phase_ar_step(ar_in, hidden)
+            hidden, cell = self.pulse_phase_ar_step(ar_in, (hidden, cell))
             logits = self.pulse_phase_ar_logits_head(hidden)
             loc = _wrap_phase_rad(torch.pi * torch.tanh(self.pulse_phase_ar_loc_head(hidden)))
             concentration = F.softplus(self.pulse_phase_ar_concentration_head(hidden)) + 1.0e-3

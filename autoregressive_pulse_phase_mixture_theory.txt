@@ -22,7 +22,7 @@ The decoded pulse rotations are cumulative: later pulse rotations depend on earl
   p(phi_1, phi_2, ..., phi_N | observation)
     = product_i p(phi_i | phi_1, ..., phi_{i-1}, observation)
 
-The code embodies this with a GRUCell in TonePulseTXControlNetVarLen.  The fused observation embedding initializes the recurrent hidden state.  At each pulse index, the GRU receives sin(previous_phase), cos(previous_phase), sin(index_angle), and cos(index_angle).  The hidden state emits mixture logits, circular locations, and concentrations for the next pulse-relative phase.
+The code embodies this with an LSTMCell in TonePulseTXControlNetVarLen.  The fused observation embedding initializes both recurrent hidden and cell states.  At each pulse index, the LSTM receives sin(previous_phase), cos(previous_phase), sin(index_angle), and cos(index_angle).  The hidden state emits mixture logits, circular locations, and concentrations for the next pulse-relative phase.
 
 4. Deterministic controller output
 ----------------------------------

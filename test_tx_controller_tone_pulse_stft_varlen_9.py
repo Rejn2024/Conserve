@@ -113,5 +113,6 @@ def test_first_pass_scalar_side_from_sections_feeds_default_network():
     out = model(stft, scalar)
 
     assert model.scalar_proj[0].in_features == N_FIRST_PASS_SCALAR_FEATURES
+    assert isinstance(model.pulse_phase_ar_step, torch.nn.LSTMCell)
     assert out["tone_freq_mean_norms"].shape == (batch, 2)
     assert out["pulse_phase_rel_rad"].shape == (batch, 3)
