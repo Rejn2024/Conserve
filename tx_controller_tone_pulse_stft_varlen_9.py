@@ -1355,10 +1355,9 @@ def decode_tone_pulse_config(
     pulse_count = max(1, min(pulse_count, max_pulses))
     pulse_phase_rel = _finite_vector(model_out["pulse_phase_rel_rad"], default=0.0, dtype=torch.float64)[:pulse_count]
     pulse_phase_offset_rad = _finite_model_scalar(model_out, "pulse_phase_offset_rad", default=0.0)
-    pulse_phase_rotations_rad = torch.zeros(pulse_count, dtype=torch.float64)
-    pulse_phase_rotations_rad[0] = pulse_phase_offset_rad
-    if pulse_count > 1:
-        pulse_phase_rotations_rad[1:] = pulse_phase_offset_rad + torch.cumsum(pulse_phase_rel[1:], dim=0)
+    # Interpret pulse_phase_rel_rad as per-pulse absolute assignments (relative
+    # to a shared global offset), not as incremental phase deltas.
+    pulse_phase_rotations_rad = pulse_phase_offset_rad + pulse_phase_rel
     pulse_phase_rotations_rad = _wrap_phase_rad(pulse_phase_rotations_rad.to(dtype=torch.float32)).to(dtype=torch.float64).tolist()
 
     tone_pulse_on_samples = []
