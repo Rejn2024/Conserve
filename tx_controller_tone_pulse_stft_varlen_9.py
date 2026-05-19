@@ -534,6 +534,7 @@ class TonePulseControlConfig:
     tone_pulse_count: List[int]
     tone_start_offset_samples: List[int]
     tone_pulse_phase_rotations_rad: List[List[float]]
+    tone_pulse_amplitudes: List[List[float]]
     snr_db: Optional[float]
     noise_color: str
     freq_offset: float
@@ -670,6 +671,12 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.pulse_off_head = nn.Linear(96, 1)
         self.pulse_count_head = nn.Linear(96, 1)
         self.start_offset_head = nn.Linear(96, 1)
+        self.tone_pulse_on_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones)])
+        self.tone_pulse_off_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones)])
+        self.tone_pulse_count_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones)])
+        self.tone_start_offset_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones)])
+        self.tone_pulse_phase_rel_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones * max_pulses)])
+        self.tone_pulse_amp_heads = nn.ModuleList([nn.Linear(96, 1) for _ in range(max_tones * max_pulses)])
         self.snr_db_head = nn.Linear(96, 1)
         self.freq_offset_head = nn.Linear(96, 1)
         self.timing_offset_head = nn.Linear(96, 1)
@@ -844,6 +851,12 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "pulse_off_samples": 0.0 + 8192.0 * torch.sigmoid(self.pulse_off_head(z)),
             "pulse_count": 1.0 + 32.0 * torch.sigmoid(self.pulse_count_head(z)),
             "start_offset": 0.0 + 4096.0 * torch.sigmoid(self.start_offset_head(z)),
+            "tone_pulse_on_samples": torch.cat([1.0 + 8192.0 * torch.sigmoid(h(z)) for h in self.tone_pulse_on_heads], dim=1),
+            "tone_pulse_off_samples": torch.cat([8192.0 * torch.sigmoid(h(z)) for h in self.tone_pulse_off_heads], dim=1),
+            "tone_pulse_count": torch.cat([1.0 + 32.0 * torch.sigmoid(h(z)) for h in self.tone_pulse_count_heads], dim=1),
+            "tone_start_offset_samples": torch.cat([4096.0 * torch.sigmoid(h(z)) for h in self.tone_start_offset_heads], dim=1),
+            "tone_pulse_phase_rel_rad": torch.cat([torch.pi * torch.tanh(h(z)) for h in self.tone_pulse_phase_rel_heads], dim=1),
+            "tone_pulse_amp": torch.cat([torch.sigmoid(h(z)) for h in self.tone_pulse_amp_heads], dim=1),
             "snr_db": 50.0 * torch.sigmoid(self.snr_db_head(z)),
             "freq_offset": 0.005 * torch.tanh(self.freq_offset_head(z)),
             "timing_offset": 1.0 + 0.002 * torch.tanh(self.timing_offset_head(z)),
@@ -1220,6 +1233,7 @@ def _apply_per_tone_pulse_phase_rotation(
     tone_pulse_count: Sequence[int],
     tone_start_offset_samples: Sequence[int],
     tone_pulse_phase_rotations_rad: Sequence[Sequence[float]],
+    tone_pulse_amplitudes: Optional[Sequence[Sequence[float]]] = None,
 ) -> torch.Tensor:
     """Apply per-tone pulse schedules and per-tone/per-pulse phase rotations."""
     x = _as_complex_tensor(iq)
@@ -1248,6 +1262,7 @@ def _apply_per_tone_pulse_phase_rotation(
         count = max(0, int(tone_pulse_count[k] if k < len(tone_pulse_count) else 0))
         start0 = max(0, int(tone_start_offset_samples[k] if k < len(tone_start_offset_samples) else 0))
         phases = tone_pulse_phase_rotations_rad[k] if k < len(tone_pulse_phase_rotations_rad) else [0.0]
+        pulse_amps = tone_pulse_amplitudes[k] if tone_pulse_amplitudes is not None and k < len(tone_pulse_amplitudes) else []
         if count <= 0:
             continue
         cycle = max(1, on + off)
@@ -1260,7 +1275,8 @@ def _apply_per_tone_pulse_phase_rotation(
                 break
             end = min(start + on, n)
             theta = float(phases[min(p, len(phases) - 1)]) if len(phases) else 0.0
-            mask[start:end] = 1.0
+            amp_step = float(pulse_amps[min(p, len(pulse_amps) - 1)]) if len(pulse_amps) else 1.0
+            mask[start:end] = max(0.0, amp_step)
             phase_vec[start:end] = theta
         rot = torch.complex(torch.cos(phase_vec), torch.sin(phase_vec)).to(dtype=DEFAULT_COMPLEX_DTYPE)
         y = y + (base * rot * mask.to(dtype=DEFAULT_COMPLEX_DTYPE))
@@ -1365,11 +1381,22 @@ def decode_tone_pulse_config(
     tone_pulse_count = []
     tone_start_offset_samples = []
     tone_pulse_phase_rotations_rad = []
+    tone_pulse_amplitudes = []
+    tone_on_direct = _finite_vector(model_out.get("tone_pulse_on_samples", torch.tensor([])), default=float(pulse_on_samples), dtype=torch.float64)
+    tone_off_direct = _finite_vector(model_out.get("tone_pulse_off_samples", torch.tensor([])), default=float(pulse_off_samples), dtype=torch.float64)
+    tone_count_direct = _finite_vector(model_out.get("tone_pulse_count", torch.tensor([])), default=float(pulse_count), dtype=torch.float64)
+    tone_start_direct = _finite_vector(model_out.get("tone_start_offset_samples", torch.tensor([])), default=float(start_offset_samples), dtype=torch.float64)
+    tone_phase_direct = _finite_vector(model_out.get("tone_pulse_phase_rel_rad", torch.tensor([])), default=0.0, dtype=torch.float64)
+    tone_amp_direct = _finite_vector(model_out.get("tone_pulse_amp", torch.tensor([])), default=1.0, dtype=torch.float64)
     for k in range(num_tones):
-        on_k = max(1, pulse_on_samples + int(round((k - (num_tones - 1) / 2.0) * 0.1 * pulse_on_samples)))
-        off_k = max(0, pulse_off_samples + int(round((k - (num_tones - 1) / 2.0) * 0.1 * max(1, pulse_off_samples))))
-        count_k = max(1, pulse_count - k)
-        start_k = max(0, start_offset_samples + (k * max(1, on_k // 8)))
+        on_k = int(round(float(tone_on_direct[k].item()))) if k < tone_on_direct.numel() else max(1, pulse_on_samples + int(round((k - (num_tones - 1) / 2.0) * 0.1 * pulse_on_samples)))
+        off_k = int(round(float(tone_off_direct[k].item()))) if k < tone_off_direct.numel() else max(0, pulse_off_samples + int(round((k - (num_tones - 1) / 2.0) * 0.1 * max(1, pulse_off_samples))))
+        count_k = int(round(float(tone_count_direct[k].item()))) if k < tone_count_direct.numel() else max(1, pulse_count - k)
+        start_k = int(round(float(tone_start_direct[k].item()))) if k < tone_start_direct.numel() else max(0, start_offset_samples + (k * max(1, on_k // 8)))
+        on_k = max(1, on_k)
+        off_k = max(0, off_k)
+        count_k = max(1, min(count_k, max_pulses))
+        start_k = max(0, start_k)
         if desired_output_iq_len is not None and desired_output_iq_len > 0:
             on_k = min(on_k, desired_output_iq_len)
             start_k = min(start_k, max(0, desired_output_iq_len - 1))
@@ -1377,14 +1404,21 @@ def decode_tone_pulse_config(
         tone_pulse_off_samples.append(int(off_k))
         tone_pulse_count.append(int(count_k))
         tone_start_offset_samples.append(int(start_k))
-        rel_k = _finite_vector(model_out["pulse_phase_rel_rad"], default=0.0, dtype=torch.float64)[:count_k]
         phase_list_k = torch.zeros(count_k, dtype=torch.float64)
         phase_list_k[0] = tone_phase_offset_rad + pulse_phase_offset_rad + float(tone_initial_phases_rad[k])
-        if count_k > 1:
+        if tone_phase_direct.numel() >= (k + 1) * max_pulses:
+            phase_list_k = tone_phase_direct[k * max_pulses : k * max_pulses + count_k]
+        elif count_k > 1:
+            rel_k = _finite_vector(model_out["pulse_phase_rel_rad"], default=0.0, dtype=torch.float64)[:count_k]
             phase_list_k[1:] = phase_list_k[0] + torch.cumsum(rel_k[1:], dim=0) + (k * 0.25)
         tone_pulse_phase_rotations_rad.append(
             _wrap_phase_rad(phase_list_k.to(dtype=torch.float32)).to(dtype=torch.float64).tolist()
         )
+        if tone_amp_direct.numel() >= (k + 1) * max_pulses:
+            amps_k = tone_amp_direct[k * max_pulses : k * max_pulses + count_k].tolist()
+        else:
+            amps_k = [float(tone_amplitudes[k])] * count_k
+        tone_pulse_amplitudes.append([max(0.0, float(a)) for a in amps_k])
 
     if desired_output_iq_len is not None and desired_output_iq_len > 0:
         pulse_on_samples = min(pulse_on_samples, desired_output_iq_len)
@@ -1410,6 +1444,7 @@ def decode_tone_pulse_config(
         tone_pulse_count=tone_pulse_count,
         tone_start_offset_samples=tone_start_offset_samples,
         tone_pulse_phase_rotations_rad=tone_pulse_phase_rotations_rad,
+        tone_pulse_amplitudes=tone_pulse_amplitudes,
         snr_db=_finite_model_scalar(model_out, "snr_db", default=30.0, min_value=0.0, max_value=100.0),
         noise_color=noise_color,
         freq_offset=_finite_model_scalar(model_out, "freq_offset", default=0.0, min_value=-1.0, max_value=1.0),
@@ -1637,6 +1672,17 @@ def apply_tone_pulse_action_overrides(
         tone_initial_phases_rad=tone_initial_phases_rad,
         pulse_phase_rel_rad=pulse_phase_rel_rad,
     )
+    tone_pulse_amplitudes = []
+    override_tone_pulse_amplitudes = overrides.get("tone_pulse_amplitudes")
+    for k in range(num_tones):
+        ck = tone_pulse_count[k] if k < len(tone_pulse_count) else pulse_count
+        base = float(tone_amplitudes[k]) if k < len(tone_amplitudes) else 1.0
+        if isinstance(override_tone_pulse_amplitudes, (list, tuple)) and k < len(override_tone_pulse_amplitudes):
+            tone_pulse_amplitudes.append(
+                [max(0.0, float(v)) for v in _finite_float_list(override_tone_pulse_amplitudes[k], default=[base], length=ck)]
+            )
+        else:
+            tone_pulse_amplitudes.append([base] * ck)
 
     return replace(
         cfg,
@@ -1659,6 +1705,7 @@ def apply_tone_pulse_action_overrides(
         tone_pulse_count=tone_pulse_count,
         tone_start_offset_samples=tone_start_offset_samples,
         tone_pulse_phase_rotations_rad=tone_pulse_phase_rotations_rad,
+        tone_pulse_amplitudes=tone_pulse_amplitudes,
         noise_color=_choice_from_override(overrides.get("noise_color", cfg.noise_color), NOISE_COLORS, cfg.noise_color),
         fading_mode=_choice_from_override(overrides.get("fading_mode", cfg.fading_mode), FADING_MODES, cfg.fading_mode),
         burst_color=_choice_from_override(overrides.get("burst_color", cfg.burst_color), NOISE_COLORS, cfg.burst_color),
@@ -1803,6 +1850,7 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
             tone_pulse_count=cfg.tone_pulse_count,
             tone_start_offset_samples=cfg.tone_start_offset_samples,
             tone_pulse_phase_rotations_rad=cfg.tone_pulse_phase_rotations_rad,
+            tone_pulse_amplitudes=cfg.tone_pulse_amplitudes,
         )
 
         tx_metadata = dict(tx_result.metadata)
@@ -1818,6 +1866,9 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
         tx_metadata["controller_tone_start_offset_samples"] = [int(v) for v in cfg.tone_start_offset_samples]
         tx_metadata["controller_tone_pulse_phase_rotations_rad"] = [
             [float(p) for p in plist] for plist in cfg.tone_pulse_phase_rotations_rad
+        ]
+        tx_metadata["controller_tone_pulse_amplitudes"] = [
+            [float(a) for a in alist] for alist in cfg.tone_pulse_amplitudes
         ]
         tx_metadata["controller_action_overrides_applied"] = bool(row_overrides)
 
