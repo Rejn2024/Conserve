@@ -1249,7 +1249,7 @@ class JammerVecEnv:
         # alpha = 10.0
         vals: List[torch.Tensor] = []
 
-        success = 0
+        decode_success = 0
         total = 0
 
         for jam_item, sample in zip(jam_batch, samples):
@@ -1271,15 +1271,15 @@ class JammerVecEnv:
 
             score = torch.as_tensor(scorer.score_decode(rx_result, whole_meta), dtype=torch.float32)
 
-            if rx_result.get("message") is None:
-                success += 1
+            if rx_result.get("message") is not None:
+                decode_success += 1
 
                 # metric_div = torch.as_tensor(rx_result.get("metric_div", 0.0), dtype=torch.float32)
                 # score = score + (alpha * metric_div)
 
             vals.append(score)#.detach().cpu())
 
-        return torch.stack(vals), success, total #.to(dtype=torch.float32)
+        return torch.stack(vals), decode_success, total #.to(dtype=torch.float32)
 
     def _obs_from_samples(self, samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         iq1 = torch.stack([s["iq1"] for s in samples], dim=0)
