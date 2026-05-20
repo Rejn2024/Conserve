@@ -229,8 +229,8 @@ def decoded_payload_missing(rx_result: Optional[dict], metadata: dict) -> bool:
 def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
     """Score a receive result with dense, bounded decode-shaping terms.
 
-    Lower scores are still better for this script: a perfect decode scores 0.0,
-    while failed or unreliable decodes receive progressively larger values.  The
+    Lower scores correspond to effective decoding: a perfect decode scores 0.0,
+    while failed or unreliable decodes (due to effective jamming) receive progressively larger values.  The
     structure keeps the authoritative end-to-end outcome term and adds dense
     diagnostics so partially corrupted packets are distinguishable from clean
     packets and from complete synchronization failures.
