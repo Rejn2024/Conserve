@@ -13,13 +13,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Dict, List
+import torch
 
 import numpy as np
 
 
 def load_whole_iq(sample_dir: Path) -> Dict:
     sample_dir = Path(sample_dir)
-    iq = np.load(sample_dir / "whole_iq.npy")
+    iq = torch.load(sample_dir / "whole_iq.pt")
     with open(sample_dir / "whole_meta.json", "r", encoding="utf-8") as f:
         meta = json.load(f)
     return {
@@ -30,7 +31,7 @@ def load_whole_iq(sample_dir: Path) -> Dict:
 
 def load_sections(sample_dir: Path) -> Dict:
     sample_dir = Path(sample_dir)
-    sections = np.load(sample_dir / "sections.npy")
+    sections = torch.load(sample_dir / "sections.pt")
     with open(sample_dir / "sections_meta.json", "r", encoding="utf-8") as f:
         meta = json.load(f)
     return {

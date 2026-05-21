@@ -275,7 +275,7 @@ def precompute_training_cache(
     cache_root: Path,
     jammer_sampling_freq: float,
     *,
-    section_len: int = 1024,
+    section_len: int = 200_000,
     overwrite: bool = False,
     max_numeric_suffix: Optional[int] = None,
     resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
@@ -334,6 +334,11 @@ def precompute_training_cache(
             cache_stft_features=cache_stft_features,
             stft_device=stft_device,
         )
+
+        # print(f'record["iq1"].shape : {record["iq1"].shape}')
+        # print(f'record["iq2"].shape : {record["iq2"].shape}')
+        # print(f'record["iq3"].shape : {record["iq3"].shape}')
+
         torch.save(record, out_path)
         produced.append(out_path)
 
@@ -358,7 +363,7 @@ def precompute_training_cache_s3(
     cache_s3_uri: str,
     jammer_sampling_freq: float,
     *,
-    section_len: int = 1024,
+    section_len: int = 200_000,
     overwrite: bool = False,
     max_numeric_suffix: Optional[int] = None,
     resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
