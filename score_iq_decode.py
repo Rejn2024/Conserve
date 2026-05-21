@@ -241,7 +241,7 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
     # missing_penalty
 
     if rx_result is None or expected_payload_crc is None:
-        return missing_penalty * 2.5
+        return missing_penalty
 
     diagnostics = rx_result.get("decode_diagnostics") or {}
     fec_mode = str(metadata.get("fec", "none"))
@@ -269,10 +269,12 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
     crc_ok = bool(diagnostics.get("crc_ok") or rx_result.get("crc_ok"))
     crc_status_known = "crc_ok" in diagnostics or "crc_ok" in rx_result
     crc_error = 0.0 if crc_ok else (1.0 if crc_status_known else missing_penalty)
+    decode_failure = 1.0 if rx_result.get("message") is None else 0.0
 
     dense_score = (
-        (0.40 * _bounded_unit(pre_fec_coded_ber))
-        + (0.40 * _bounded_unit(post_fec_payload_crc_ber))
+        (0.75 * decode_failure)
+        + (0.40 * _bounded_unit(pre_fec_coded_ber))
+        + (0.50 * _bounded_unit(post_fec_payload_crc_ber))
         + (0.10 * confidence_error)
         + (0.10 * length_error)
         + (0.25 * stage_error)
@@ -281,7 +283,7 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
 
     # Keep the historical, easy-to-interpret missing-payload step of 1.0 while
     # adding bounded dense terms above it when receiver diagnostics are present.
-    return float(missing_penalty + dense_score)
+    return dense_score #float(missing_penalty + dense_score)
 
 
 def build_parser():

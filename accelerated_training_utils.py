@@ -863,7 +863,7 @@ def jammer_controller(
     action: Any,
     jammer_sampling_freq: float,
     device: str = "cpu",
-    default_output_len: int = 8_000,
+    default_output_len: int = 100_000,
     default_peak_power_fraction: float = 40.0,
     default_seed: int = 11,
 ) -> Dict[str, Any]:
@@ -907,8 +907,7 @@ def jammer_controller_batch(
     device: str = "cpu",
     rx_iq_batches: Optional[Sequence[torch.Tensor]] = None,
     action_cfg: Optional[Dict[str, Any]] = None,
-    default_output_len: int = 8_000,
-    default_peak_power_fraction: float = 40.0,
+    default_output_len: int = 100_000,
     user_peak_power_fraction: float = 40.0,
     default_seed: int = 11,
 ) -> List[Dict[str, Any]]:
@@ -1099,6 +1098,7 @@ class JammerVecEnv:
         jammer_sampling_freq: float,
         num_envs: int,
         reward_fn: Optional[Callable[[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]], torch.Tensor]] = None,
+        default_output_len: int = 100_000,
         max_steps: int = 1,
         user_peak_power_fraction: float = 40.0,
         device: str = "cuda",
@@ -1130,6 +1130,7 @@ class JammerVecEnv:
         self.reward_fn = reward_fn or self._default_reward
         self.user_peak_power_fraction = user_peak_power_fraction
         self.track_env_grad = bool(track_env_grad)
+        self.default_output_len = default_output_len
 
         self._mode = "train"
         self._cursor = {"train": 0, "test": 0}
@@ -1373,6 +1374,7 @@ def run_epoch_cached(
     repeat_to_length_fn: Callable[[Any, int], Any],
     train_mode: bool,
     device: str,
+    output_len: int,
     amp_enabled: bool = True,
     amp_dtype: Optional[torch.dtype] = None,
     grad_scaler: Optional[torch.amp.GradScaler] = None,
@@ -1404,7 +1406,7 @@ def run_epoch_cached(
                     model=model,
                     rx_iq_batches=[iq1, iq2, iq3],
                     intake_sample_rate_hz=jammer_sampling_freq,
-                    desired_output_iq_len=8_000,
+                    desired_output_iq_len=output_len,
                     user_peak_power_fraction=40.0,
                     seed=11 + batch_idx * iq1.shape[0],
                     device=device,

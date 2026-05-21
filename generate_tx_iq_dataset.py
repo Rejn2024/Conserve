@@ -197,7 +197,7 @@ def _build_payload_description(
     return phrase, None, 1, payload_desc
 
 
-def _decode_candidate_with_v4(
+def _decode_candidate(
     iq: np.ndarray,
     metadata: Dict,
 ) -> Optional[Dict]:
@@ -206,7 +206,7 @@ def _decode_candidate_with_v4(
         iq_path = td_path / "candidate.iq"
         meta_path = td_path / "candidate.iq.json"
 
-        np.asarray(iq.detach().cpu(), dtype=np.complex64).tofile(iq_path)
+        np.asarray(iq.detach().cpu(), dtype=np.complex32).tofile(iq_path)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -331,7 +331,7 @@ def build_decodable_sample(
             "requested_target_num_samples": int(target_num_samples),
         }
 
-        rx_result = _decode_candidate_with_v4(tx_result.iq, whole_meta)
+        rx_result = _decode_candidate(tx_result.iq, whole_meta)
         if _candidate_matches_payload(rx_result, payload_desc):
             whole_meta["decode_verified"] = True
             whole_meta["decoder_result_summary"] = {
