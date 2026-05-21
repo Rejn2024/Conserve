@@ -22,6 +22,7 @@ import tempfile
 import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import math
 
 import numpy as np
 
@@ -145,7 +146,7 @@ def cut_random_sections(
     return {
         "sections": sections.to(dtype=link.DEFAULT_COMPLEX_DTYPE),
         "starts": starts,
-        "section_len": section_len,
+        "required_jammer_section_len": section_len,
         "num_sections": num_sections,
         "lengthening_factor": lengthening_factor
     }
@@ -301,9 +302,11 @@ def _build_candidate_iq_with_full_packet(
 def build_decodable_sample(
     *,
     dataset_index: int,
-    target_num_samples: int,
+    # target_num_samples: int,
     rng: random.Random,
     random_payload_probability: float,
+    no_jammer_samples_required_per_section: int = 200_000,
+    jammer_sample_freq: int = int(2e9),
     max_attempts_per_sample: int = 100,
 ) -> Tuple[torch.Tensor, Dict]:
     for attempt in range(max_attempts_per_sample):
@@ -315,11 +318,16 @@ def build_decodable_sample(
             random_payload_probability=random_payload_probability,
         )
 
+        tx_sample_freq = params['sample_rate_hz']
+        no_samples_jammer_sees_per_tx_sample = (jammer_sample_freq/tx_sample_freq)
+        no_tx_samples_required_per_section = int(no_jammer_samples_required_per_section / no_samples_jammer_sees_per_tx_sample)
+        total_no_tx_samples_required = max(5_000, int(no_tx_samples_required_per_section * 5.5))
+
         tx_result = _build_candidate_iq_with_full_packet(
             message=message,
             random_bits=random_bits,
             random_seed=random_seed,
-            requested_target_num_samples=target_num_samples,
+            requested_target_num_samples=total_no_tx_samples_required,
             params=params,
         )
 
@@ -328,7 +336,7 @@ def build_decodable_sample(
             "dataset_index": dataset_index,
             "payload_desc": payload_desc,
             "generation_attempt": attempt + 1,
-            "requested_target_num_samples": int(target_num_samples),
+            "requested_target_num_samples": int(total_no_tx_samples_required),
         }
 
         rx_result = _decode_candidate(tx_result.iq, whole_meta)
@@ -356,11 +364,10 @@ def build_decodable_sample(
 def generate_dataset(
     output_root: Path,
     num_outputs: int,
-    min_total_samples: int,
-    max_total_samples: int,
-    section_len: int = 1024,
     num_sections: int = 3,
     seed: int = 1,
+    no_jammer_samples_required_per_section: int = 200_000,
+    jammer_sample_freq: int = int(2e9),
     random_payload_probability: float = 0.5,
     max_attempts_per_sample: int = 100,
     start_index: int = -1,
@@ -372,27 +379,30 @@ def generate_dataset(
 
     for i in range(num_outputs):
         sample_index = start_index + i + 1
-        requested_target_num_samples = rng.randint(min_total_samples, max_total_samples)
 
         whole_iq, whole_meta = build_decodable_sample(
             dataset_index=sample_index,
-            target_num_samples=requested_target_num_samples,
+            no_jammer_samples_required_per_section=no_jammer_samples_required_per_section,
+            jammer_sample_freq=jammer_sample_freq,
             rng=rng,
             random_payload_probability=random_payload_probability,
             max_attempts_per_sample=max_attempts_per_sample,
         )
 
+        required_tx_section_len = math.ceil((no_jammer_samples_required_per_section / jammer_sample_freq) * whole_meta['sample_rate_hz'])
+
         cuts = cut_random_sections(
             iq=whole_iq,
             num_sections=num_sections,
-            section_len=section_len,
+            section_len=required_tx_section_len,
             seed=seed + 10_000 + sample_index,
         )
 
         sample_dir = output_root / f"sample_{sample_index:06d}"
         sections_meta = {
             "dataset_index": sample_index,
-            "section_len": section_len,
+            "required_jammer_section_len": no_jammer_samples_required_per_section,
+            "required_tx_section_len": required_tx_section_len,
             "num_sections": num_sections,
             "starts": cuts["starts"],
             "whole_num_samples": int(len(whole_iq)),
@@ -434,7 +444,7 @@ def main(argv=None):
         num_outputs=args.num_outputs,
         min_total_samples=args.min_total_samples,
         max_total_samples=args.max_total_samples,
-        section_len=args.section_len,
+        required_jammer_section_len=args.section_len,
         num_sections=args.num_sections,
         seed=args.seed,
         random_payload_probability=args.random_payload_probability,
