@@ -125,7 +125,7 @@ def conservative_fallback_params(rng: random.Random) -> Dict:
 
 
 def cut_random_sections(
-    iq: np.ndarray,
+    iq: torch.Tensor,
     num_sections: int,
     section_len: int,
     seed: int,
@@ -140,10 +140,10 @@ def cut_random_sections(
     rng = np.random.default_rng(seed)
     max_start = len(iq) - 5*section_len
     starts = [int(rng.integers(0, max_start + 1)) for _ in range(num_sections)]
-    sections = np.stack([iq[s:s + lengthened_section] for s in starts], axis=0)
+    sections = torch.stack([iq[s:s + lengthened_section] for s in starts], dim=0)
 
     return {
-        "sections": sections.astype(np.complex64),
+        "sections": sections.to(dtype=link.DEFAULT_COMPLEX_DTYPE),
         "starts": starts,
         "section_len": section_len,
         "num_sections": num_sections,
@@ -153,18 +153,18 @@ def cut_random_sections(
 
 def save_sample_bundle(
     out_dir: Path,
-    whole_iq: np.ndarray,
+    whole_iq: torch.Tensor,
     whole_meta: Dict,
-    sections: np.ndarray,
+    sections: torch.Tensor,
     sections_meta: Dict,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(out_dir / "whole_iq.npy", whole_iq.astype(np.complex32))
+    torch.save(whole_iq.to(dtype=link.DEFAULT_COMPLEX_DTYPE).cpu(), out_dir / "whole_iq.pt")
     with open(out_dir / "whole_meta.json", "w", encoding="utf-8") as f:
         json.dump(whole_meta, f, indent=2)
 
-    np.save(out_dir / "sections.npy", sections.astype(np.complex32))
+    torch.save(sections.to(dtype=link.DEFAULT_COMPLEX_DTYPE).cpu(), out_dir / "sections.pt")
     with open(out_dir / "sections_meta.json", "w", encoding="utf-8") as f:
         json.dump(sections_meta, f, indent=2)
 
@@ -198,7 +198,7 @@ def _build_payload_description(
 
 
 def _decode_candidate(
-    iq: np.ndarray,
+    iq: torch.Tensor,
     metadata: Dict,
 ) -> Optional[Dict]:
     with tempfile.TemporaryDirectory() as td:
@@ -206,7 +206,7 @@ def _decode_candidate(
         iq_path = td_path / "candidate.iq"
         meta_path = td_path / "candidate.iq.json"
 
-        np.asarray(iq.detach().cpu(), dtype=np.complex32).tofile(iq_path)
+        np.asarray(iq.detach().to(dtype=torch.complex64).cpu(), dtype=np.complex64).tofile(iq_path)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -305,7 +305,7 @@ def build_decodable_sample(
     rng: random.Random,
     random_payload_probability: float,
     max_attempts_per_sample: int = 100,
-) -> Tuple[np.ndarray, Dict]:
+) -> Tuple[torch.Tensor, Dict]:
     for attempt in range(max_attempts_per_sample):
         params = realistic_params(rng) if attempt < max_attempts_per_sample // 2 else conservative_fallback_params(rng)
 
@@ -342,10 +342,9 @@ def build_decodable_sample(
             print("sucessfully generated data")
             
             if isinstance(tx_result.iq, np.ndarray):
-                return tx_result.iq.astype(np.complex64), whole_meta
+                return torch.as_tensor(tx_result.iq, dtype=link.DEFAULT_COMPLEX_DTYPE), whole_meta
             elif isinstance(tx_result.iq, torch.Tensor):
-                tri = tx_result.iq.detach().cpu().numpy()
-                return tri.astype(np.complex64), whole_meta
+                return tx_result.iq.detach().to(dtype=link.DEFAULT_COMPLEX_DTYPE), whole_meta
 
 
     raise RuntimeError(
