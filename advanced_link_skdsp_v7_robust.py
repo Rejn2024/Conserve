@@ -79,11 +79,20 @@ POSTAMBLE_BITS = 256
 # -----------------------------------------------------------------------------
 
 def save_iq(path: Union[str, Path], iq: Union[np.ndarray, torch.Tensor]) -> None:
-    np.asarray(_as_numpy_complex64(iq), dtype=np.complex64).tofile(str(path))
+    p = Path(path)
+    iq_t = _as_complex_tensor(iq).detach().cpu()
+    if p.suffix == ".pt":
+        torch.save(iq_t.to(dtype=DEFAULT_COMPLEX_DTYPE), p)
+        return
+    # Raw .iq files are kept as interop-friendly complex64 for byte compatibility.
+    np.asarray(_as_numpy_complex64(iq_t), dtype=np.complex64).tofile(str(p))
 
 
 def load_iq(path: Union[str, Path]) -> np.ndarray:
-    return np.fromfile(str(path), dtype=np.complex64)
+    p = Path(path)
+    if p.suffix == ".pt":
+        return torch.load(p, map_location="cpu").to(dtype=DEFAULT_COMPLEX_DTYPE).cpu().numpy()
+    return np.fromfile(str(p), dtype=np.complex64)
 
 
 def default_metadata_path(iq_path: Union[str, Path]) -> str:
