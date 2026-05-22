@@ -1838,6 +1838,18 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
     device: str = "cpu",
     action_overrides: Optional[Sequence[Optional[Dict[str, object]]]] = None,
 ) -> List[Dict[str, object]]:
+    def _expected_stft_channels(net: nn.Module) -> Optional[int]:
+        encoder = getattr(net, "encoder", None)
+        if encoder is None:
+            return None
+        enc1 = getattr(encoder, "enc1", None)
+        if enc1 is not None and hasattr(enc1, "conv1"):
+            return int(enc1.conv1.in_channels)
+        stem = getattr(encoder, "stem", None)
+        if isinstance(stem, nn.Sequential) and len(stem) > 0 and hasattr(stem[0], "in_channels"):
+            return int(stem[0].in_channels)
+        return None
+
     if len(rx_iq_batches) != 3:
         raise ValueError(f"rx_iq_batches must contain exactly 3 IQ batch inputs, got {len(rx_iq_batches)}")
 
@@ -1851,6 +1863,22 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
         )
 
     stft_tensors = [p["feature"].to(device) for p in proc]
+    expected_channels = _expected_stft_channels(model)
+    if expected_channels is not None:
+        aligned_stft_tensors = []
+        for feat in stft_tensors:
+            actual_channels = int(feat.shape[1])
+            if actual_channels == expected_channels:
+                aligned_stft_tensors.append(feat)
+                continue
+            if actual_channels > expected_channels:
+                aligned_stft_tensors.append(feat[:, :expected_channels, :, :])
+            else:
+                pad_channels = expected_channels - actual_channels
+                aligned_stft_tensors.append(
+                    F.pad(feat, (0, 0, 0, 0, 0, pad_channels), mode="constant", value=0.0)
+                )
+        stft_tensors = aligned_stft_tensors
     rx_power_stack = torch.stack([p["rx_power"].to(device) for p in proc], dim=0)
     peak_stack = torch.stack([p["peak_hz"].to(device) for p in proc], dim=0)
     rx_input_power_t = rx_power_stack.mean(dim=0)
