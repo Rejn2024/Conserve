@@ -477,12 +477,16 @@ def preprocess_iq_to_stft_feature(
         return_complex=True,
     )
     Z_time = torch.fft.fftshift(Z_time, dim=0)
-    Z_time = F.interpolate(
-        Z_time.unsqueeze(0).to(dtype=torch.complex64),
+    # Interpolate in real-valued channel space because torch.nn.functional.interpolate
+    # expects NCHW tensors and does not support complex inputs directly.
+    Z_time_ri = torch.view_as_real(Z_time.to(dtype=torch.complex64)).permute(2, 0, 1).unsqueeze(0)
+    Z_time_ri = F.interpolate(
+        Z_time_ri,
         size=(Z.shape[0], Z.shape[1]),
         mode="bilinear",
         align_corners=False,
-    ).squeeze(0)
+    )
+    Z_time = torch.view_as_complex(Z_time_ri.squeeze(0).permute(1, 2, 0).contiguous())
 
     mag = torch.log1p(torch.abs(Z)).to(dtype=torch.float32)
     phase = torch.angle(Z).to(dtype=torch.float32)
