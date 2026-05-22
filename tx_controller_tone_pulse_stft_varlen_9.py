@@ -671,9 +671,13 @@ class ResUNetSTFTEncoder(nn.Module):
         e3 = self.enc3(e2)
         b = self.bottleneck(e3)
         d2 = self.up2(b)
+        if d2.shape[-2:] != e2.shape[-2:]:
+            d2 = F.interpolate(d2, size=e2.shape[-2:], mode="bilinear", align_corners=False)
         d2 = torch.cat([d2, e2], dim=1)
         d2 = self.dec2(d2)
         d1 = self.up1(d2)
+        if d1.shape[-2:] != e1.shape[-2:]:
+            d1 = F.interpolate(d1, size=e1.shape[-2:], mode="bilinear", align_corners=False)
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
         z = self.out_proj(d1)
