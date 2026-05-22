@@ -391,6 +391,7 @@ def preprocess_batched_iq_to_stft_feature(
     nperseg: int = 128,
     noverlap: int = 96,
     nfft: int = 128,
+    enforce_iq_len: int = 48_000,
 ) -> Dict[str, torch.Tensor]:
     x_batch = _sanitize_complex_iq(_as_batch_complex_tensor(iq_batch))
     if x_batch.ndim != 2:
@@ -409,6 +410,7 @@ def preprocess_batched_iq_to_stft_feature(
             nperseg=nperseg,
             noverlap=noverlap,
             nfft=nfft,
+            enforce_iq_len=enforce_iq_len,
         )
         feats.append(proc["feature"])
         rx_powers.append(proc["rx_power"].to(dtype=torch.float32))
@@ -426,8 +428,14 @@ def preprocess_iq_to_stft_feature(
     nperseg: int = 128,
     noverlap: int = 96,
     nfft: int = 128,
+    enforce_iq_len: int = 48_000,
 ) -> Dict[str, torch.Tensor]:
     x_t = _sanitize_complex_iq(_as_complex_tensor(iq))
+    if int(enforce_iq_len) > 0:
+        if x_t.numel() < int(enforce_iq_len):
+            x_t = F.pad(x_t, (0, int(enforce_iq_len) - int(x_t.numel())))
+        elif x_t.numel() > int(enforce_iq_len):
+            x_t = x_t[: int(enforce_iq_len)]
     if x_t.numel() < 8:
         x_t = F.pad(x_t, (0, 8 - int(x_t.numel())))
 
@@ -453,6 +461,28 @@ def preprocess_iq_to_stft_feature(
 
     Z = torch.fft.fftshift(Z, dim=0)
     f = torch.fft.fftshift(torch.fft.fftfreq(nfft, d=1.0 / max(sample_rate_hz, 1.0)).to(x_work.device))
+    # A second STFT view optimized for timing resolution (shorter windows).
+    nperseg_time = max(32, nperseg_eff // 2)
+    noverlap_time = int(min(max(0, nperseg_time - 1), round(0.50 * nperseg_time)))
+    hop_time = max(1, nperseg_time - noverlap_time)
+    nfft_time = max(64, min(nfft, nperseg_time))
+    window_time = torch.hann_window(nperseg_time, dtype=torch.float32, device=x_work.device)
+    Z_time = torch.stft(
+        x_work,
+        n_fft=nfft_time,
+        hop_length=hop_time,
+        win_length=nperseg_time,
+        window=window_time,
+        center=False,
+        return_complex=True,
+    )
+    Z_time = torch.fft.fftshift(Z_time, dim=0)
+    Z_time = F.interpolate(
+        Z_time.unsqueeze(0).to(dtype=torch.complex64),
+        size=(Z.shape[0], Z.shape[1]),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
 
     mag = torch.log1p(torch.abs(Z)).to(dtype=torch.float32)
     phase = torch.angle(Z).to(dtype=torch.float32)
@@ -486,7 +516,7 @@ def preprocess_iq_to_stft_feature(
     phase_unwrapped_t = _torch_unwrap(phase, dim=1)
     delta_t_phase = torch.diff(phase_unwrapped_t, dim=1, prepend=phase_unwrapped_t[:, :1])
 
-    feat = torch.stack(
+    feat_freq = torch.stack(
         [
             mag,
             phase,
@@ -505,6 +535,24 @@ def preprocess_iq_to_stft_feature(
         ],
         dim=0,
     )
+
+    mag_t = torch.log1p(torch.abs(Z_time)).to(dtype=torch.float32)
+    phase_t = torch.angle(Z_time).to(dtype=torch.float32)
+    real_t = Z_time.real.to(dtype=torch.float32)
+    imag_t = Z_time.imag.to(dtype=torch.float32)
+    power_t = (torch.abs(Z_time) ** 2).to(dtype=torch.float32)
+    power_log_t = torch.log1p(power_t)
+    delta_t_mag_t = torch.diff(mag_t, dim=1, prepend=mag_t[:, :1])
+    delta_f_mag_t = torch.diff(mag_t, dim=0, prepend=mag_t[:1, :])
+    phase_unwrapped_t_t = _torch_unwrap(phase_t, dim=1)
+    delta_t_phase_t = torch.diff(phase_unwrapped_t_t, dim=1, prepend=phase_unwrapped_t_t[:, :1])
+    frame_power_t = torch.mean(power_t, dim=0, keepdim=True)
+    frame_power_norm_t = (frame_power_t / (torch.mean(frame_power_t) + 1e-12)).to(dtype=torch.float32).repeat(mag_t.shape[0], 1)
+    feat_time = torch.stack(
+        [mag_t, phase_t, real_t, imag_t, power_log_t, delta_t_mag_t, delta_f_mag_t, delta_t_phase_t, frame_power_norm_t],
+        dim=0,
+    )
+    feat = torch.cat([feat_freq, feat_time], dim=0)
 
     return {
         "feature": _sanitize_stft_feature(feat),
@@ -596,12 +644,44 @@ class VarLenSTFTEncoder(nn.Module):
         return self.pool(z).flatten(1)
 
 
+class ResUNetSTFTEncoder(nn.Module):
+    """Residual U-Net style encoder for STFT maps, outputting a fixed [B, D] embedding."""
+
+    def __init__(self, in_ch: int = 23, base_ch: int = 24):
+        super().__init__()
+        self.enc1 = ResidualBlock2D(in_ch, base_ch)
+        self.enc2 = ResidualBlock2D(base_ch, base_ch * 2, stride=2)
+        self.enc3 = ResidualBlock2D(base_ch * 2, base_ch * 4, stride=2)
+        self.bottleneck = ResidualBlock2D(base_ch * 4, base_ch * 4)
+        self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
+        self.dec2 = ResidualBlock2D(base_ch * 4, base_ch * 2)
+        self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
+        self.dec1 = ResidualBlock2D(base_ch * 2, base_ch)
+        self.out_proj = nn.Conv2d(base_ch, base_ch * 4, 1)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.feature_dim = base_ch * 4
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        b = self.bottleneck(e3)
+        d2 = self.up2(b)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        z = self.out_proj(d1)
+        return self.pool(z).flatten(1)
+
+
 class TonePulseTXControlNetVarLen(nn.Module):
     """Shared STFT encoder over a variable-length list of IQ windows."""
 
     def __init__(
         self,
-        in_ch: int = 14,
+        in_ch: int = 23,
         base_ch: int = 24,
         n_scalar_features: int = N_FIRST_PASS_SCALAR_FEATURES,
         max_tones: int = 8,
@@ -620,7 +700,7 @@ class TonePulseTXControlNetVarLen(nn.Module):
             pulse_phase_ar_hidden: Hidden width for the LSTM pulse-phase mixture decoder.
         """
         super().__init__()
-        self.encoder = VarLenSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
+        self.encoder = ResUNetSTFTEncoder(in_ch=in_ch, base_ch=base_ch)
         self.max_tones = max_tones
         self.max_pulses = max_pulses
         self.pulse_phase_ar_components = max(1, int(pulse_phase_ar_components))
@@ -886,7 +966,7 @@ class ActorCritic(nn.Module):
     def __init__(
         self,
         action_dim: Optional[int] = None,
-        in_ch: int = 14,
+        in_ch: int = 23,
         base_ch: int = 24,
         n_scalar_features: int = N_FIRST_PASS_SCALAR_FEATURES,
         max_tones: int = 8,
