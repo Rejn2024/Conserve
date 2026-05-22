@@ -15,6 +15,7 @@ discarded and replaced by a new one.
 from __future__ import annotations
 
 import argparse
+import uuid
 import json
 import random
 import string
@@ -388,6 +389,8 @@ def generate_dataset(
             random_payload_probability=random_payload_probability,
             max_attempts_per_sample=max_attempts_per_sample,
         )
+        whole_uuid = str(uuid.uuid4())
+        whole_meta["whole_iq_uuid"] = whole_uuid
 
         required_tx_section_len = math.ceil((no_jammer_samples_required_per_section / jammer_sample_freq) * whole_meta['sample_rate_hz'])
 
@@ -399,6 +402,7 @@ def generate_dataset(
         )
 
         sample_dir = output_root / f"sample_{sample_index:06d}"
+        section_uuids = [str(uuid.uuid4()) for _ in range(num_sections)]
         sections_meta = {
             "dataset_index": sample_index,
             "required_jammer_section_len": no_jammer_samples_required_per_section,
@@ -406,6 +410,8 @@ def generate_dataset(
             "num_sections": num_sections,
             "starts": cuts["starts"],
             "whole_num_samples": int(len(whole_iq)),
+            "whole_iq_uuid": whole_uuid,
+            "section_uuids": section_uuids,
         }
 
         save_sample_bundle(
