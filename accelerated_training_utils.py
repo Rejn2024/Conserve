@@ -158,6 +158,7 @@ def _build_training_cache_record(
         "whole_meta": whole["meta"],
         "whole_sample_rate_hz": sample_rate_hz,
         "jammer_sampling_freq": float(jammer_sampling_freq),
+        "section_uuids": list((sections.get("meta") or {}).get("section_uuids", [])),
         "iq1": iq1,
         "iq2": iq2,
         "iq3": iq3,
@@ -469,6 +470,7 @@ def collate_cached_iq(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "whole_iq_list": [x["whole_iq"] for x in batch],
         "whole_meta_list": [x["whole_meta"] for x in batch],
         "whole_sr_list": [float(x["whole_sample_rate_hz"]) for x in batch],
+        "section_uuids_list": [list(x.get("section_uuids", [])) for x in batch],
         "iq1": torch.stack([x["iq1"] for x in batch], dim=0),
         "iq2": torch.stack([x["iq2"] for x in batch], dim=0),
         "iq3": torch.stack([x["iq3"] for x in batch], dim=0),
@@ -557,8 +559,9 @@ def create_cached_dataloader_s3(
 
     The returned batches use the same ``collate_cached_iq`` structure as
     ``create_cached_dataloader`` (``iq1``, ``iq2``, ``iq3``, ``whole_iq_list``,
-    metadata lists, etc.), so it can be passed directly to ``JammerVecEnv`` and
-    the ``train_rl_batched`` workflow in ``RL_Jamming_test_02.ipynb``.
+    ``section_uuids_list``, metadata lists, etc.), so it can be passed directly
+    to ``JammerVecEnv`` and the ``train_rl_batched`` workflow in
+    ``RL_Jamming_test_02.ipynb``.
     """
 
     ds = CachedIQDatasetS3(cache_s3_uri, s3_client=s3_client)
@@ -1161,6 +1164,7 @@ class JammerVecEnv:
         whole_meta_list = batch.get("whole_meta_list")
         whole_sr_list = batch.get("whole_sr_list")
         stft_feature_list = batch.get("stft_feature_list")
+        section_uuids_list = batch.get("section_uuids_list")
 
         out: List[Dict[str, Any]] = []
         for i in range(bs):
@@ -1170,6 +1174,7 @@ class JammerVecEnv:
                 "whole_iq": whole_iq_list[i] if whole_iq_list is not None else None,
                 "whole_meta": whole_meta_list[i] if whole_meta_list is not None else None,
                 "whole_sample_rate_hz": whole_sr_list[i] if whole_sr_list is not None else None,
+                "section_uuids": section_uuids_list[i] if section_uuids_list is not None else None,
                 "iq1": iq1[i],
                 "iq2": iq2[i],
                 "iq3": iq3[i],
@@ -1295,6 +1300,7 @@ class JammerVecEnv:
             "iq1": iq1,
             "iq2": iq2,
             "iq3": iq3,
+            "section_uuids": [s.get("section_uuids") for s in samples],
             "scalar_side": build_first_pass_scalar_side_from_iq_sections([iq1, iq2, iq3], self.jammer_sampling_freq),
             "scalar_feature_names": FIRST_PASS_SCALAR_FEATURE_NAMES,
             "scalar_feature_schema": FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION,
