@@ -108,8 +108,8 @@ def test_first_pass_scalar_side_from_sections_feeds_default_network():
     iq3 = torch.complex(torch.randn(batch, 96), torch.randn(batch, 96))
     scalar = build_first_pass_scalar_side_from_iq_sections([iq1, iq2, iq3], sample_rate_hz=2_000_000.0)
 
-    model = TonePulseTXControlNetVarLen(in_ch=14, base_ch=4, max_tones=2, max_pulses=3)
-    stft = [torch.randn(batch, 14, 16, 8) for _ in range(3)]
+    model = TonePulseTXControlNetVarLen(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
+    stft = [torch.randn(batch, 23, 16, 8) for _ in range(3)]
     out = model(stft, scalar)
 
     assert model.scalar_proj[0].in_features == N_FIRST_PASS_SCALAR_FEATURES
