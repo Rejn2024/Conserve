@@ -1143,7 +1143,7 @@ class JammerVecEnv:
         self._mode = "train"
         self._cursor = {"train": 0, "test": 0}
         self._step_count = 0
-        self._active: List[Dict[str, Any]] = []
+        self._active_samples: List[Dict[str, Any]] = []
         self._epoch_complete = False
 
     @staticmethod
@@ -1227,8 +1227,34 @@ class JammerVecEnv:
             raise ValueError("test_samples were not provided")
         self._mode = mode
         self._step_count = 0
-        self._active = []
+        self._active_samples = []
         self._epoch_complete = False
+
+    @property
+    def _active(self) -> List[Optional[str]]:
+        """Expose UUIDs for the currently active IQ samples."""
+
+        uuids: List[Optional[str]] = []
+        for idx, sample in enumerate(self._active_samples):
+            uuid_val = None
+            for key in ("whole_iq_uuid", "uuid", "sample_uuid", "id"):
+                if isinstance(sample, dict):
+                    value = sample.get(key)
+                    if value is not None:
+                        uuid_val = str(value)
+                        break
+            if uuid_val is None:
+                sample_name = sample.get("sample_name") if isinstance(sample, dict) else None
+                uuid_val = str(sample_name) if sample_name else f"active_sample_{idx}"
+            uuids.append(uuid_val)
+        return uuids
+
+    @_active.setter
+    def _active(self, value: Sequence[Any]) -> None:
+        rows = list(value) if value is not None else []
+        if rows and not isinstance(rows[0], dict):
+            raise ValueError("_active stores sample dictionaries; received UUID-only values")
+        self._active_samples = rows
 
     @property
     def mode(self) -> str:
@@ -1312,8 +1338,8 @@ class JammerVecEnv:
 
     def reset(self) -> Dict[str, Any]:
         self._step_count = 0
-        self._active = self._next_samples()
-        return self._obs_from_samples(self._active)
+        self._active_samples = self._next_samples()
+        return self._obs_from_samples(self._active_samples)
 
     def step(self, actions: Sequence[Any]):
         # Convenience for single-env training loops: if a single action vector
@@ -1333,19 +1359,19 @@ class JammerVecEnv:
 
         if action_count != self.num_envs:
             raise ValueError(f"actions is of length {action_count} but must contain {self.num_envs} entries")
-        if not self._active:
-            self._active = self._next_samples()
+        if not self._active_samples:
+            self._active_samples = self._next_samples()
 
         with torch.set_grad_enabled(self.track_env_grad):
             jam_batch = jammer_controller_batch(
                 model=self.model,
-                samples=self._active,
+                samples=self._active_samples,
                 actions=actions,
                 jammer_sampling_freq=self.jammer_sampling_freq,
                 user_peak_power_fraction = self.user_peak_power_fraction,
                 device=self.device,
             )
-            rewards_t, success, total = self.reward_fn(jam_batch, self._active)
+            rewards_t, success, total = self.reward_fn(jam_batch, self._active_samples)
 
         rewards = torch.as_tensor(rewards_t)#, dtype=torch.float32)#.cpu().numpy()
         if not self.track_env_grad:
@@ -1362,15 +1388,15 @@ class JammerVecEnv:
                 "mode": self._mode,
                 "epoch_complete": bool(self._epoch_complete),
             }
-            for jam_item, sample in zip(jam_batch, self._active)
+            for jam_item, sample in zip(jam_batch, self._active_samples)
         ]
 
         if done:
-            self._active = self._next_samples()
-            next_obs = self._obs_from_samples(self._active)
+            self._active_samples = self._next_samples()
+            next_obs = self._obs_from_samples(self._active_samples)
             self._step_count = 0
         else:
-            next_obs = self._obs_from_samples(self._active)
+            next_obs = self._obs_from_samples(self._active_samples)
 
         return next_obs, rewards, dones, infos, success, total
 
