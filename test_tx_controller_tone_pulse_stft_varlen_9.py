@@ -8,6 +8,7 @@ from tx_controller_tone_pulse_stft_varlen_9 import (
     FIRST_PASS_SCALAR_FEATURE_NAMES,
     N_FIRST_PASS_SCALAR_FEATURES,
     TonePulseTXControlNetVarLen,
+    tone_pulse_action_dim,
     build_first_pass_scalar_side_from_iq_sections,
     compute_first_pass_scalar_features_for_iq_batch,
     decode_tone_pulse_config,
@@ -59,8 +60,10 @@ def test_decode_tone_pulse_config_sanitizes_nan_model_outputs():
     )
 
     assert cfg.num_tones == 1
-    assert cfg.pulse_on_samples >= 1
+    assert cfg.pulse_on_samples >= 5
+    assert cfg.pulse_off_samples == 0
     assert cfg.pulse_count >= 1
+    assert all(5 <= length <= 10_000 for length in cfg.pulse_lengths_samples)
     assert cfg.start_offset_samples >= 0
 
     finite_scalars = [
@@ -115,3 +118,20 @@ def test_first_pass_scalar_side_from_sections_feeds_default_network():
     assert model.scalar_proj[0].in_features == N_FIRST_PASS_SCALAR_FEATURES
     assert out["tone_freq_mean_norms"].shape == (batch, 2)
     assert out["pulse_phase_rel_rad"].shape == (batch, 3)
+    assert out["pulse_length_log"].shape == (batch, 3)
+    assert out["pulse_power_logit"].shape == (batch, 3)
+    assert out["pulse_phase_ar_control"].shape == (batch, 1)
+    assert out["pulse_length_ar_control"].shape == (batch, 1)
+    assert out["pulse_power_ar_control"].shape == (batch, 1)
+    assert torch.all(out["pulse_length_samples_cont"] >= 5.0)
+    assert torch.all(out["pulse_length_samples_cont"] <= 10_000.0)
+
+
+def test_tone_pulse_action_dim_uses_recurrent_pulse_state():
+    assert tone_pulse_action_dim(max_tones=2, max_pulses=3) == 12 + 4 * 2
+    assert tone_pulse_action_dim(max_tones=2, max_pulses=99) == 12 + 4 * 2
+    model = TonePulseTXControlNetVarLen(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
+    from tx_controller_tone_pulse_stft_varlen_9 import ActorCritic
+
+    actor_critic = ActorCritic(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
+    assert actor_critic.action_dim == tone_pulse_action_dim(model.max_tones, model.max_pulses)
