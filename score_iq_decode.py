@@ -272,7 +272,7 @@ def score_decode(rx_result: Optional[dict], metadata: dict) -> float:
     decode_failure = 1.0 if rx_result.get("message") is None else 0.0
 
     dense_score = (
-        (0.75 * decode_failure)
+        (2 * decode_failure)
         + (0.40 * _bounded_unit(pre_fec_coded_ber))
         + (0.50 * _bounded_unit(post_fec_payload_crc_ber))
         + (0.10 * confidence_error)
