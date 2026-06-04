@@ -26,6 +26,7 @@ from tx_controller_tone_pulse_stft_varlen_9 import (
     build_controlled_tone_pulse_batch_from_iq_batches,
     build_first_pass_scalar_side_from_iq_sections,
     preprocess_batched_iq_to_stft_feature,
+    tone_pulse_action_dim,
 )
 
 import advanced_link_skdsp_v7_robust as link7
@@ -724,17 +725,20 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
     - dict with optional keys:
         desired_output_iq_len, user_peak_power_fraction, seed,
         noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
-        num_tones, base_f, spacing, amp_raw, pulse_on_samples,
-        pulse_off_samples, pulse_count, start_offset_samples, pulse_phase_rel_rad
+        num_tones, base_f, spacing, amp_raw, pulse_count,
+        start_offset_samples, pulse_phase_rel_rad
     - sequence/tensor:
         * up to 3 items mapped to desired_output_iq_len, user_peak_power_fraction, seed
-        * when max_tones/max_pulses are known, the current ActorCritic layout is
-          decoded as 11 + 4*max_tones + max_pulses controls.  The pulse phase
-          slice contains samples from the autoregressive circular mixture.
+        * when max_tones is known, the current ActorCritic layout is
+          decoded as 12 + 4*max_tones controls.  The three extra
+          Gaussian dimensions govern recurrent pulse phase, length, and power
+          controllers without storing per-pulse columns.
         * > 3 legacy items are interpreted as continuous controls in this order:
           noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
-          num_tones, base_f, spacing, [amp_raw...], pulse_on_samples,
-          pulse_off_samples, pulse_count, start_offset_samples
+          num_tones, base_f, spacing, [amp_raw...], legacy pulse_on_samples,
+          legacy pulse_off_samples, pulse_count, start_offset_samples.  The
+          legacy on/off values are parsed only for backward compatibility and
+          are not forwarded as recurrent-controller action overrides.
     - scalar/tensor scalar interpreted as user_peak_power_fraction
     """
 
@@ -749,9 +753,8 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
     if isinstance(action, (list, tuple)):
         if len(action) > 3:
             vec = [float(x) for x in action]
-            if max_tones is not None and max_pulses is not None and len(vec) == 11 + (4 * int(max_tones)) + int(max_pulses):
+            if max_tones is not None and len(vec) == tone_pulse_action_dim(int(max_tones)):
                 mt = int(max_tones)
-                mp = int(max_pulses)
                 idx = 0
                 out = {
                     "noise_color": vec[idx],
@@ -772,14 +775,14 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
                 idx += mt
                 out["tone_phase_offset_rad"] = vec[idx]
                 idx += 1
-                out["pulse_phase_rel_rad"] = vec[idx : idx + mp]
-                idx += mp
+                out["pulse_phase_ar_control"] = vec[idx]
+                out["pulse_length_ar_control"] = vec[idx + 1]
+                out["pulse_power_ar_control"] = vec[idx + 2]
+                idx += 3
                 out["pulse_phase_offset_rad"] = vec[idx]
                 idx += 1
-                out["pulse_on_samples"] = vec[idx]
-                out["pulse_off_samples"] = vec[idx + 1]
-                out["pulse_count"] = vec[idx + 2]
-                out["start_offset_samples"] = vec[idx + 3]
+                out["pulse_count"] = vec[idx]
+                out["start_offset_samples"] = vec[idx + 1]
                 return out
 
             if len(vec) < 12:
@@ -826,8 +829,6 @@ _ACTION_OVERRIDE_KEYS = (
     "base_f",
     "spacing",
     "amp_raw",
-    "pulse_on_samples",
-    "pulse_off_samples",
     "pulse_count",
     "start_offset_samples",
     "sample_rate_hz",
@@ -849,6 +850,13 @@ _ACTION_OVERRIDE_KEYS = (
     "pulse_phase_rel_mix_concentration",
     "pulse_phase_offset_rad",
     "pulse_phase_rotations_rad",
+    "pulse_phase_ar_control",
+    "pulse_length_ar_control",
+    "pulse_power_ar_control",
+    "pulse_length_log",
+    "pulse_lengths_samples",
+    "pulse_power_logit",
+    "pulse_power_amplitudes",
     "snr_db",
     "freq_offset",
     "timing_offset",
