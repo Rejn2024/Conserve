@@ -135,3 +135,55 @@ def test_tone_pulse_action_dim_uses_recurrent_pulse_state():
 
     actor_critic = ActorCritic(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
     assert actor_critic.action_dim == tone_pulse_action_dim(model.max_tones, model.max_pulses)
+
+
+def test_actor_critic_logp_entropy_include_autoregressive_pulse_terms(monkeypatch):
+    from tx_controller_tone_pulse_stft_varlen_9 import ActorCritic
+
+    batch = 2
+    actor_critic = ActorCritic(in_ch=23, base_ch=4, max_tones=2, max_pulses=3).eval()
+    stft = [torch.randn(batch, 23, 16, 8) for _ in range(3)]
+    scalar = torch.randn(batch, N_FIRST_PASS_SCALAR_FEATURES)
+
+    action_mean, _, log_std, _, _ = actor_critic._policy_tensors(
+        stft_feature_list=stft,
+        scalar_side=scalar,
+    )
+    dist = actor_critic._action_distribution(action_mean=action_mean, log_std=log_std)
+    flat_log_prob = dist.log_prob(action_mean).sum(dim=-1)
+    flat_entropy = dist.entropy().sum(dim=-1)
+
+    def fake_phase_log_prob(z, phases):
+        assert phases.shape == (batch, actor_critic.max_pulses)
+        return torch.full((z.shape[0],), 1.25, device=z.device), {}
+
+    def fake_length_power_log_prob(z, length_logs, power_logits):
+        assert length_logs.shape == (batch, actor_critic.max_pulses)
+        assert power_logits.shape == (batch, actor_critic.max_pulses)
+        return torch.full((z.shape[0],), 2.75, device=z.device), {}
+
+    def fake_phase_entropy(z):
+        return torch.full((z.shape[0],), 0.5, device=z.device)
+
+    def fake_length_power_entropy(z):
+        return torch.full((z.shape[0],), 1.5, device=z.device)
+
+    monkeypatch.setattr(actor_critic.backbone, "pulse_phase_autoregressive_log_prob", fake_phase_log_prob)
+    monkeypatch.setattr(actor_critic.backbone, "pulse_length_power_autoregressive_log_prob", fake_length_power_log_prob)
+    monkeypatch.setattr(actor_critic.backbone, "pulse_phase_autoregressive_entropy", fake_phase_entropy)
+    monkeypatch.setattr(actor_critic.backbone, "pulse_length_power_autoregressive_entropy", fake_length_power_entropy)
+
+    log_prob, entropy, _ = actor_critic.evaluate_actions(
+        stft_feature_list=stft,
+        scalar_side=scalar,
+        actions=action_mean,
+    )
+
+    assert torch.allclose(log_prob, flat_log_prob + 4.0)
+    assert torch.allclose(entropy, flat_entropy + 2.0)
+
+    _, _, provided_action_log_prob = actor_critic.get_action_value_logp(
+        {"stft_feature_list": stft, "scalar_side": scalar},
+        action=action_mean,
+    )
+    assert torch.allclose(provided_action_log_prob, flat_log_prob + 4.0)
