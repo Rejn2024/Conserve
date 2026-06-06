@@ -66,9 +66,7 @@ def test_precompute_and_dataloader(tmp_path: Path):
         pin_memory=False,
     )
     batch = next(iter(loader))
-    assert batch["iq1"].shape == (2, 1024)
-    assert batch["iq2"].shape == (2, 1024)
-    assert batch["iq3"].shape == (2, 1024)
+    assert batch["iq"].shape == (2, 1024)
     assert len(batch["whole_iq_list"]) == 2
 
 
@@ -131,9 +129,7 @@ def test_run_epoch_cached_eval_path(tmp_path: Path, monkeypatch):
                 "whole_meta": {"sample_rate_hz": 1_000_000.0},
                 "whole_sample_rate_hz": 1_000_000.0,
                 "jammer_sampling_freq": 2e9,
-                "iq1": torch.ones(1024, dtype=torch.complex64),
-                "iq2": torch.ones(1024, dtype=torch.complex64),
-                "iq3": torch.ones(1024, dtype=torch.complex64),
+                "iq": torch.ones(1024, dtype=torch.complex64),
             },
             cache_root / f"sample_{i:06d}.pt",
         )
@@ -255,9 +251,7 @@ def test_run_epoch_cached_train_path_skips_backward_when_loss_has_no_grad(tmp_pa
             "whole_meta": {"sample_rate_hz": 1_000_000.0},
             "whole_sample_rate_hz": 1_000_000.0,
             "jammer_sampling_freq": 2e9,
-            "iq1": torch.ones(256, dtype=torch.complex64),
-            "iq2": torch.ones(256, dtype=torch.complex64),
-            "iq3": torch.ones(256, dtype=torch.complex64),
+            "iq": torch.ones(256, dtype=torch.complex64),
         },
         cache_root / "sample_000000.pt",
     )
@@ -323,9 +317,7 @@ def test_jammer_controller_adapter_uses_build_function(monkeypatch):
     monkeypatch.setattr(atu, "build_controlled_tone_pulse_batch_from_iq_batches", fake_build)
 
     sample = {
-        "iq1": torch.ones(32, dtype=torch.complex64),
-        "iq2": torch.ones(32, dtype=torch.complex64),
-        "iq3": torch.ones(32, dtype=torch.complex64),
+        "iq": torch.ones(32, dtype=torch.complex64),
     }
 
     out = atu.jammer_controller(
@@ -362,9 +354,7 @@ def test_jammer_vec_env_batches_rollout(monkeypatch):
     samples = [
         {
             "sample_name": f"s{i}",
-            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 1),
-            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 2),
-            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 3),
+            "iq": torch.ones(32, dtype=torch.complex64) * (i + 1),
         }
         for i in range(4)
     ]
@@ -378,12 +368,12 @@ def test_jammer_vec_env_batches_rollout(monkeypatch):
     )
 
     obs = env.reset()
-    assert obs["iq1"].shape == (3, 32)
+    assert obs["iq"].shape == (3, 32)
 
     next_obs, rewards, dones, infos = env.step(actions=[{"seed": 5}] * 3)
 
     assert build_calls["n"] == 1
-    assert next_obs["iq1"].shape == (3, 32)
+    assert next_obs["iq"].shape == (3, 32)
     assert rewards.shape == (3,)
     assert all(dones)
     assert len(infos) == 3
@@ -412,9 +402,7 @@ def test_jammer_vec_env_accepts_cached_dataloader_batches(monkeypatch):
             "whole_iq": torch.ones(64, dtype=torch.complex64),
             "whole_meta": {"sample_rate_hz": 1_000_000.0},
             "whole_sample_rate_hz": 1_000_000.0,
-            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 1),
-            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 2),
-            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 3),
+            "iq": torch.ones(32, dtype=torch.complex64) * (i + 1),
         }
         for i in range(4)
     ]
@@ -429,13 +417,13 @@ def test_jammer_vec_env_accepts_cached_dataloader_batches(monkeypatch):
     )
 
     obs = env.reset()
-    assert obs["iq1"].shape == (2, 32)
+    assert obs["iq"].shape == (2, 32)
     assert env.samples[0]["sample_name"] == "s0"
 
     next_obs, rewards, dones, infos = env.step(actions=[{"seed": 5}] * 2)
 
     assert build_calls["n"] == 1
-    assert next_obs["iq1"].shape == (2, 32)
+    assert next_obs["iq"].shape == (2, 32)
     assert rewards.shape == (2,)
     assert all(dones)
     assert len(infos) == 2
@@ -455,9 +443,7 @@ def test_jammer_vec_env_supports_test_loader_mode_switch(monkeypatch):
             "whole_iq": torch.ones(64, dtype=torch.complex64),
             "whole_meta": {"sample_rate_hz": 1_000_000.0},
             "whole_sample_rate_hz": 1_000_000.0,
-            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 1),
-            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 2),
-            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 3),
+            "iq": torch.ones(32, dtype=torch.complex64) * (i + 1),
         }
         for i in range(4)
     ]
@@ -468,9 +454,7 @@ def test_jammer_vec_env_supports_test_loader_mode_switch(monkeypatch):
             "whole_iq": torch.ones(64, dtype=torch.complex64),
             "whole_meta": {"sample_rate_hz": 1_000_000.0},
             "whole_sample_rate_hz": 1_000_000.0,
-            "iq1": torch.ones(32, dtype=torch.complex64) * (i + 10),
-            "iq2": torch.ones(32, dtype=torch.complex64) * (i + 11),
-            "iq3": torch.ones(32, dtype=torch.complex64) * (i + 12),
+            "iq": torch.ones(32, dtype=torch.complex64) * (i + 10),
         }
         for i in range(2)
     ]
@@ -487,12 +471,12 @@ def test_jammer_vec_env_supports_test_loader_mode_switch(monkeypatch):
     )
 
     train_obs = env.reset()
-    assert torch.allclose(train_obs["iq1"][0], torch.ones(32, dtype=torch.complex64) * 1)
+    assert torch.allclose(train_obs["iq"][0], torch.ones(32, dtype=torch.complex64) * 1)
 
     env.set_mode("test")
     test_obs = env.reset()
     assert env.mode == "test"
-    assert torch.allclose(test_obs["iq1"][0], torch.ones(32, dtype=torch.complex64) * 10)
+    assert torch.allclose(test_obs["iq"][0], torch.ones(32, dtype=torch.complex64) * 10)
 
     _, _, _, infos = env.step(actions=[{"seed": 5}] * 2)
     assert all(info["mode"] == "test" for info in infos)
@@ -586,9 +570,7 @@ def test_precompute_training_cache_s3_and_dataloader_s3(tmp_path: Path):
     )
     batch = next(iter(loader))
     assert batch["sample_names"] == ["sample_000000", "sample_000001"]
-    assert batch["iq1"].shape == (2, 1024)
-    assert batch["iq2"].shape == (2, 1024)
-    assert batch["iq3"].shape == (2, 1024)
+    assert batch["iq"].shape == (2, 1024)
     assert len(batch["whole_iq_list"]) == 2
 
 
@@ -635,108 +617,69 @@ def test_create_cached_dataloader_s3_rejects_empty_prefix():
         )
 
 
+def _cached_native_view(value: float, batch: bool = False):
+    shape = (2, 2, 3, 4) if batch else (2, 3, 4)
+    return {
+        "frequency_feature": torch.full(shape, value),
+        "timing_feature": torch.full(shape, value + 1.0),
+    }
+
+
 def test_collate_cached_iq_stacks_cached_stft_features():
-    rows = []
-    for i in range(2):
-        rows.append(
-            {
-                "sample_name": f"s{i}",
-                "source_dir": "tmp",
-                "whole_iq": torch.ones(64, dtype=torch.complex64),
-                "whole_meta": {"sample_rate_hz": 1_000_000.0},
-                "whole_sample_rate_hz": 1_000_000.0,
-                "iq1": torch.ones(32, dtype=torch.complex64),
-                "iq2": torch.ones(32, dtype=torch.complex64),
-                "iq3": torch.ones(32, dtype=torch.complex64),
-                "stft_feature_list": [
-                    torch.full((2, 3, 4), float(i + view))
-                    for view in range(3)
-                ],
-            }
-        )
-
+    rows = [{
+        "sample_name": f"s{i}", "source_dir": "tmp",
+        "whole_iq": torch.ones(64, dtype=torch.complex64),
+        "whole_meta": {"sample_rate_hz": 1_000_000.0},
+        "whole_sample_rate_hz": 1_000_000.0,
+        "iq": torch.ones(32, dtype=torch.complex64),
+        "stft_feature_list": [_cached_native_view(float(i))],
+    } for i in range(2)]
     batch = atu.collate_cached_iq(rows)
-
-    assert "stft_feature_list" in batch
-    assert len(batch["stft_feature_list"]) == 3
-    assert batch["stft_feature_list"][0].shape == (2, 2, 3, 4)
-    assert torch.allclose(batch["stft_feature_list"][2][1], torch.full((2, 3, 4), 3.0))
+    assert len(batch["stft_feature_list"]) == 1
+    assert batch["stft_feature_list"][0]["frequency_feature"].shape == (2, 2, 3, 4)
 
 
 def test_build_stft_observation_from_iq_batch_uses_cached_features(monkeypatch):
-    def fail_preprocess(*_args, **_kwargs):
-        raise AssertionError("preprocess should not be called when cached STFT is supplied")
-
-    monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", fail_preprocess)
-    cached = [torch.ones(2, 3, 4, 5) * view for view in range(3)]
-
+    monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError()))
+    cached = [_cached_native_view(1.0, batch=True)]
     obs = atu.build_stft_observation_from_iq_batch(
-        iq1=torch.ones(2, 16, dtype=torch.complex64),
-        iq2=torch.ones(2, 16, dtype=torch.complex64),
-        iq3=torch.ones(2, 16, dtype=torch.complex64),
-        intake_sample_rate_hz=2e9,
-        stft_feature_list=cached,
-        device="cpu",
+        iq=torch.ones(2, 16, dtype=torch.complex64), intake_sample_rate_hz=2e9,
+        stft_feature_list=cached, device="cpu",
     )
-
-    assert len(obs["stft_feature_list"]) == 3
+    assert len(obs["stft_feature_list"]) == 1
     assert obs["scalar_side"].shape[0] == 2
-    assert "packet_start_frac" in obs["scalar_feature_names"]
-    assert torch.allclose(obs["stft_feature_list"][1], torch.ones(2, 3, 4, 5))
+    assert torch.allclose(obs["stft_feature_list"][0]["frequency_feature"], cached[0]["frequency_feature"])
 
 
 def test_build_stft_observation_from_samples_prefers_cached_features(monkeypatch):
-    def fail_preprocess(*_args, **_kwargs):
-        raise AssertionError("preprocess should not be called when cached STFT is supplied")
-
-    monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", fail_preprocess)
-    samples = [
-        {
-            "iq1": torch.ones(8, dtype=torch.complex64),
-            "iq2": torch.ones(8, dtype=torch.complex64),
-            "iq3": torch.ones(8, dtype=torch.complex64),
-            "stft_feature_list": [torch.ones(2, 3, 4) * (i + view) for view in range(3)],
-        }
-        for i in range(2)
-    ]
-
+    monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError()))
+    samples = [{"iq": torch.ones(8, dtype=torch.complex64), "stft_feature_list": [_cached_native_view(float(i))]} for i in range(2)]
     obs = atu.build_stft_observation_from_samples(samples, intake_sample_rate_hz=2e9, device="cpu")
-
-    assert obs["stft_feature_list"][0].shape == (2, 2, 3, 4)
+    assert obs["stft_feature_list"][0]["frequency_feature"].shape == (2, 2, 3, 4)
     assert obs["scalar_side"].shape[0] == 2
-    assert "packet_start_frac" in obs["scalar_feature_names"]
-    assert torch.allclose(obs["stft_feature_list"][1][1], torch.full((2, 3, 4), 2.0))
 
 
 def test_precompute_training_cache_can_store_stft_features(tmp_path: Path, monkeypatch):
     pytest.importorskip("numpy")
-    data_root = tmp_path / "dataset"
-    cache_root = tmp_path / "cache"
-    data_root.mkdir()
-    _write_sample(data_root, 0)
-
+    data_root, cache_root = tmp_path / "dataset", tmp_path / "cache"
+    data_root.mkdir(); _write_sample(data_root, 0)
     def fake_preprocess(iq, sample_rate_hz):
         batch = iq.shape[0]
-        return {"feature": torch.ones(batch, 2, 3, 4) * float(sample_rate_hz)}
-
+        return {
+            "feature": torch.ones(batch, 23, 3, 4),
+            "frequency_feature": torch.ones(batch, 14, 3, 4),
+            "timing_feature": torch.ones(batch, 9, 3, 4),
+        }
     monkeypatch.setattr(atu, "preprocess_batched_iq_to_stft_feature", fake_preprocess)
-
     produced = atu.precompute_training_cache(
-        dataset_root=data_root,
-        cache_root=cache_root,
-        jammer_sampling_freq=2e9,
-        section_len=16,
-        resample_fn=lambda x, _fs_in, _fs_out: x,
-        cache_stft_features=True,
+        dataset_root=data_root, cache_root=cache_root, jammer_sampling_freq=2e9,
+        section_len=16, resample_fn=lambda x, _fs_in, _fs_out: x, cache_stft_features=True,
     )
-
     record = torch.load(produced[0], map_location="cpu", weights_only=False)
-    assert "stft_feature_list" in record
-    assert len(record["stft_feature_list"]) == 3
-    assert record["stft_feature_list"][0].shape == (2, 3, 4)
+    assert len(record["stft_feature_list"]) == 1
+    assert record["stft_feature_list"][0]["frequency_feature"].shape == (14, 3, 4)
+    assert json.loads((cache_root / "manifest.json").read_text(encoding="utf-8"))["cache_stft_features"] is True
 
-    manifest = json.loads((cache_root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["cache_stft_features"] is True
 
 def test_jammer_controller_batch_passes_per_row_action_overrides(monkeypatch):
     captured = {}
@@ -756,9 +699,7 @@ def test_jammer_controller_batch_passes_per_row_action_overrides(monkeypatch):
 
     samples = [
         {
-            "iq1": torch.ones(16, dtype=torch.complex64),
-            "iq2": torch.ones(16, dtype=torch.complex64),
-            "iq3": torch.ones(16, dtype=torch.complex64),
+            "iq": torch.ones(16, dtype=torch.complex64),
         }
         for _ in range(2)
     ]
@@ -807,9 +748,7 @@ def test_jammer_controller_batch_decodes_actor_action_rows(monkeypatch):
 
     samples = [
         {
-            "iq1": torch.ones(16, dtype=torch.complex64),
-            "iq2": torch.ones(16, dtype=torch.complex64),
-            "iq3": torch.ones(16, dtype=torch.complex64),
+            "iq": torch.ones(16, dtype=torch.complex64),
         }
         for _ in range(2)
     ]

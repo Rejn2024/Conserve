@@ -7,7 +7,14 @@ import torch
 from tx_controller_tone_pulse_stft_varlen_9 import (
     FIRST_PASS_SCALAR_FEATURE_NAMES,
     N_FIRST_PASS_SCALAR_FEATURES,
+    FREQUENCY_STFT_FEATURE_CHANNELS,
+    TARGET_INPUT_SAMPLES,
+    TARGET_MAX_DETECTABLE_SAMPLES,
+    TIMING_STFT_FEATURE_CHANNELS,
+    TIMING_STFT_HOP_SAMPLES,
+    TIMING_STFT_WINDOW_SAMPLES,
     TonePulseTXControlNetVarLen,
+    preprocess_iq_to_stft_feature,
     tone_pulse_action_dim,
     build_first_pass_scalar_side_from_iq_sections,
     compute_first_pass_scalar_features_for_iq_batch,
@@ -106,13 +113,11 @@ def test_first_pass_scalar_features_are_finite_and_follow_schema():
 
 def test_first_pass_scalar_side_from_sections_feeds_default_network():
     batch = 2
-    iq1 = torch.complex(torch.randn(batch, 96), torch.randn(batch, 96))
-    iq2 = torch.complex(torch.randn(batch, 96), torch.randn(batch, 96))
-    iq3 = torch.complex(torch.randn(batch, 96), torch.randn(batch, 96))
-    scalar = build_first_pass_scalar_side_from_iq_sections([iq1, iq2, iq3], sample_rate_hz=2_000_000.0)
+    iq = torch.complex(torch.randn(batch, 288), torch.randn(batch, 288))
+    scalar = build_first_pass_scalar_side_from_iq_sections([iq], sample_rate_hz=2_000_000.0)
 
     model = TonePulseTXControlNetVarLen(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
-    stft = [torch.randn(batch, 23, 16, 8) for _ in range(3)]
+    stft = [torch.randn(batch, 23, 16, 8)]
     out = model(stft, scalar)
 
     assert model.scalar_proj[0].in_features == N_FIRST_PASS_SCALAR_FEATURES
@@ -137,12 +142,78 @@ def test_tone_pulse_action_dim_uses_recurrent_pulse_state():
     assert actor_critic.action_dim == tone_pulse_action_dim(model.max_tones, model.max_pulses)
 
 
+def test_preprocessing_builds_independent_frequency_and_timing_stfts():
+    iq = torch.complex(torch.randn(256), torch.randn(256))
+    proc = preprocess_iq_to_stft_feature(iq, sample_rate_hz=1_000_000.0, enforce_iq_len=0)
+
+    assert proc["frequency_feature"].shape[0] == FREQUENCY_STFT_FEATURE_CHANNELS
+    assert proc["timing_feature"].shape[0] == TIMING_STFT_FEATURE_CHANNELS
+    assert proc["feature"].shape[0] == FREQUENCY_STFT_FEATURE_CHANNELS + TIMING_STFT_FEATURE_CHANNELS
+    assert proc["timing_feature"].shape[-1] > proc["frequency_feature"].shape[-1]
+    assert TIMING_STFT_WINDOW_SAMPLES == 5
+    assert TIMING_STFT_HOP_SAMPLES == 5
+
+
+def test_network_uses_parallel_resunets_with_requested_temporal_scale():
+    model = TonePulseTXControlNetVarLen(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
+
+    assert model.frequency_encoder is not model.timing_encoder
+    assert model.frequency_encoder.enc1.conv1.in_channels == FREQUENCY_STFT_FEATURE_CHANNELS
+    assert model.timing_encoder.enc1.conv1.in_channels == TIMING_STFT_FEATURE_CHANNELS
+    assert model.timing_encoder.temporal_receptive_field_samples >= TARGET_MAX_DETECTABLE_SAMPLES
+    assert TIMING_STFT_WINDOW_SAMPLES <= 5
+    assert TARGET_INPUT_SAMPLES == 1_000_000
+    assert TARGET_MAX_DETECTABLE_SAMPLES == 100_000
+
+    native = [
+        {
+            "frequency_feature": torch.randn(1, FREQUENCY_STFT_FEATURE_CHANNELS, 16, 8),
+            "timing_feature": torch.randn(1, TIMING_STFT_FEATURE_CHANNELS, 8, 31),
+        }
+        for _ in range(1)
+    ]
+    out = model(native, torch.randn(1, N_FIRST_PASS_SCALAR_FEATURES))
+    assert out["pulse_length_log"].shape == (1, 3)
+
+
+def test_pulse_length_and_power_use_independent_lstm_states():
+    model = TonePulseTXControlNetVarLen(
+        in_ch=23,
+        base_ch=4,
+        max_tones=2,
+        max_pulses=3,
+        pulse_length_ar_hidden=11,
+        pulse_power_ar_hidden=13,
+    )
+    z = torch.randn(2, 96)
+    length_teacher_a = torch.full((2, 3), math.log(5.0))
+    length_teacher_b = torch.full((2, 3), math.log(10_000.0))
+    power_teacher_a = torch.full((2, 3), -10.0)
+    power_teacher_b = torch.full((2, 3), 10.0)
+
+    assert model.pulse_length_ar_step.input_size == 3
+    assert model.pulse_power_ar_step.input_size == 3
+    assert model.pulse_length_ar_step.hidden_size == 11
+    assert model.pulse_power_ar_step.hidden_size == 13
+    assert model.pulse_length_ar_step is not model.pulse_power_ar_step
+
+    length_a = model.pulse_length_autoregressive(z, teacher_length_logs=length_teacher_a)
+    length_b = model.pulse_length_autoregressive(z, teacher_length_logs=length_teacher_b)
+    power_a = model.pulse_power_autoregressive(z, teacher_power_logits=power_teacher_a)
+    power_b = model.pulse_power_autoregressive(z, teacher_power_logits=power_teacher_b)
+
+    assert "pulse_power_logit" not in length_a
+    assert "pulse_length_log" not in power_a
+    assert not torch.allclose(length_a["pulse_length_log_mean"], length_b["pulse_length_log_mean"])
+    assert not torch.allclose(power_a["pulse_power_logit_mean"], power_b["pulse_power_logit_mean"])
+
+
 def test_actor_critic_logp_entropy_include_autoregressive_pulse_terms(monkeypatch):
     from tx_controller_tone_pulse_stft_varlen_9 import ActorCritic
 
     batch = 2
     actor_critic = ActorCritic(in_ch=23, base_ch=4, max_tones=2, max_pulses=3).eval()
-    stft = [torch.randn(batch, 23, 16, 8) for _ in range(3)]
+    stft = [torch.randn(batch, 23, 16, 8)]
     scalar = torch.randn(batch, N_FIRST_PASS_SCALAR_FEATURES)
 
     action_mean, _, log_std, _, _ = actor_critic._policy_tensors(
@@ -150,28 +221,38 @@ def test_actor_critic_logp_entropy_include_autoregressive_pulse_terms(monkeypatc
         scalar_side=scalar,
     )
     dist = actor_critic._action_distribution(action_mean=action_mean, log_std=log_std)
-    flat_log_prob = dist.log_prob(action_mean).sum(dim=-1)
-    flat_entropy = dist.entropy().sum(dim=-1)
+    flat_mask = torch.ones_like(action_mean)
+    flat_mask[..., actor_critic._recurrent_pulse_control_action_slice()] = 0.0
+    flat_log_prob = (dist.log_prob(action_mean) * flat_mask).sum(dim=-1)
+    flat_entropy = (dist.entropy() * flat_mask).sum(dim=-1)
 
     def fake_phase_log_prob(z, phases):
         assert phases.shape == (batch, actor_critic.max_pulses)
         return torch.full((z.shape[0],), 1.25, device=z.device), {}
 
-    def fake_length_power_log_prob(z, length_logs, power_logits):
+    def fake_length_log_prob(z, length_logs):
         assert length_logs.shape == (batch, actor_critic.max_pulses)
+        return torch.full((z.shape[0],), 1.25, device=z.device), {}
+
+    def fake_power_log_prob(z, power_logits):
         assert power_logits.shape == (batch, actor_critic.max_pulses)
-        return torch.full((z.shape[0],), 2.75, device=z.device), {}
+        return torch.full((z.shape[0],), 1.5, device=z.device), {}
 
     def fake_phase_entropy(z):
         return torch.full((z.shape[0],), 0.5, device=z.device)
 
-    def fake_length_power_entropy(z):
-        return torch.full((z.shape[0],), 1.5, device=z.device)
+    def fake_length_entropy(z):
+        return torch.full((z.shape[0],), 0.75, device=z.device)
+
+    def fake_power_entropy(z):
+        return torch.full((z.shape[0],), 0.75, device=z.device)
 
     monkeypatch.setattr(actor_critic.backbone, "pulse_phase_autoregressive_log_prob", fake_phase_log_prob)
-    monkeypatch.setattr(actor_critic.backbone, "pulse_length_power_autoregressive_log_prob", fake_length_power_log_prob)
+    monkeypatch.setattr(actor_critic.backbone, "pulse_length_autoregressive_log_prob", fake_length_log_prob)
+    monkeypatch.setattr(actor_critic.backbone, "pulse_power_autoregressive_log_prob", fake_power_log_prob)
     monkeypatch.setattr(actor_critic.backbone, "pulse_phase_autoregressive_entropy", fake_phase_entropy)
-    monkeypatch.setattr(actor_critic.backbone, "pulse_length_power_autoregressive_entropy", fake_length_power_entropy)
+    monkeypatch.setattr(actor_critic.backbone, "pulse_length_autoregressive_entropy", fake_length_entropy)
+    monkeypatch.setattr(actor_critic.backbone, "pulse_power_autoregressive_entropy", fake_power_entropy)
 
     log_prob, entropy, _ = actor_critic.evaluate_actions(
         stft_feature_list=stft,
