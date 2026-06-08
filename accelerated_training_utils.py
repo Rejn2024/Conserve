@@ -805,7 +805,6 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
 _ACTION_OVERRIDE_KEYS = (
     "noise_color",
     "fading_mode",
-    "burst_color",
     "rf_center_hz",
     "carrier_hz",
     "num_tones",
@@ -844,8 +843,6 @@ _ACTION_OVERRIDE_KEYS = (
     "freq_offset",
     "timing_offset",
     "rician_k_db",
-    "burst_probability",
-    "burst_power_ratio_db",
     "peak_power",
     "seed",
 )

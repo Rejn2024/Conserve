@@ -916,7 +916,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
 
         self.noise_color_head = nn.Linear(96, len(NOISE_COLORS))
         self.fading_mode_head = nn.Linear(96, len(FADING_MODES))
-        self.burst_color_head = nn.Linear(96, len(NOISE_COLORS))
 
         self.sample_rate_scale_head = nn.Linear(96, 1)
         self.rf_center_delta_head = nn.Linear(96, 1)
@@ -965,8 +964,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
         self.timing_offset_head = nn.Linear(96, 1)
         self.fading_block_head = nn.Linear(96, 1)
         self.rician_k_db_head = nn.Linear(96, 1)
-        self.burst_prob_head = nn.Linear(96, 1)
-        self.burst_power_ratio_head = nn.Linear(96, 1)
 
     def split_stft_branches(
         self, feature: Union[torch.Tensor, Dict[str, torch.Tensor]]
@@ -1276,7 +1273,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
         return {
             "noise_color_logits": self.noise_color_head(z),
             "fading_mode_logits": self.fading_mode_head(z),
-            "burst_color_logits": self.burst_color_head(z),
             "sample_rate_scale": 0.5 + 2.0 * torch.sigmoid(self.sample_rate_scale_head(z)),
             "rf_center_delta_hz": 500_000.0 * torch.tanh(self.rf_center_delta_head(z)),
             "carrier_hz_norm": 0.45 * torch.tanh(self.carrier_norm_head(z)),
@@ -1318,8 +1314,6 @@ class TonePulseTXControlNetVarLen(nn.Module):
             "timing_offset": 1.0 + 0.002 * torch.tanh(self.timing_offset_head(z)),
             "fading_block_len_norm": torch.sigmoid(self.fading_block_head(z)),
             "rician_k_db": 20.0 * torch.sigmoid(self.rician_k_db_head(z)),
-            "burst_probability": 1e-2 * torch.sigmoid(self.burst_prob_head(z)),
-            "burst_power_ratio_db": 30.0 * torch.sigmoid(self.burst_power_ratio_head(z)),
         }
 
     def forward(self, stft_feature_list: List[torch.Tensor], scalar_side: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -1928,7 +1922,7 @@ def decode_tone_pulse_config(
 ) -> TonePulseControlConfig:
     noise_color = NOISE_COLORS[int(torch.argmax(model_out["noise_color_logits"], dim=-1).item())]
     fading_mode = FADING_MODES[int(torch.argmax(model_out["fading_mode_logits"], dim=-1).item())]
-    burst_color = NOISE_COLORS[int(torch.argmax(model_out["burst_color_logits"], dim=-1).item())]
+    burst_color = "white"
 
     sample_rate_scale = _finite_model_scalar(
         model_out, "sample_rate_scale", default=1.0, min_value=0.1, max_value=10.0
@@ -2137,10 +2131,10 @@ def decode_tone_pulse_config(
             )
         ),
         rician_k_db=_finite_model_scalar(model_out, "rician_k_db", default=0.0, min_value=0.0),
-        burst_probability=_finite_model_scalar(model_out, "burst_probability", default=0.0, min_value=0.0, max_value=1.0),
+        burst_probability=0.0,
         burst_len_min=16,
         burst_len_max=64,
-        burst_power_ratio_db=_finite_model_scalar(model_out, "burst_power_ratio_db", default=0.0, min_value=0.0),
+        burst_power_ratio_db=0.0,
         burst_color=burst_color,
         peak_power=peak_power,
         seed=seed,
@@ -2450,13 +2444,13 @@ def apply_tone_pulse_action_overrides(
         tone_pulse_amplitudes=tone_pulse_amplitudes,
         noise_color=_choice_from_override(overrides.get("noise_color", cfg.noise_color), NOISE_COLORS, cfg.noise_color),
         fading_mode=_choice_from_override(overrides.get("fading_mode", cfg.fading_mode), FADING_MODES, cfg.fading_mode),
-        burst_color=_choice_from_override(overrides.get("burst_color", cfg.burst_color), NOISE_COLORS, cfg.burst_color),
+        burst_color="white",
         snr_db=None if overrides.get("snr_db", cfg.snr_db) is None else _finite_float(overrides.get("snr_db", cfg.snr_db), cfg.snr_db or 0.0),
         freq_offset=_finite_float(overrides.get("freq_offset", cfg.freq_offset), cfg.freq_offset),
         timing_offset=_finite_float(overrides.get("timing_offset", cfg.timing_offset), cfg.timing_offset),
         rician_k_db=_finite_float(overrides.get("rician_k_db", cfg.rician_k_db), cfg.rician_k_db),
-        burst_probability=max(0.0, min(1.0, _finite_float(overrides.get("burst_probability", cfg.burst_probability), cfg.burst_probability))),
-        burst_power_ratio_db=_finite_float(overrides.get("burst_power_ratio_db", cfg.burst_power_ratio_db), cfg.burst_power_ratio_db),
+        burst_probability=0.0,
+        burst_power_ratio_db=0.0,
         peak_power=None if overrides.get("peak_power", cfg.peak_power) is None else max(0.0, _finite_float(overrides.get("peak_power", cfg.peak_power), cfg.peak_power or 0.0)),
         seed=_finite_int(overrides.get("seed", cfg.seed), cfg.seed),
     )
@@ -2609,20 +2603,22 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
             pulse_off_samples=cfg.pulse_off_samples,
             pulse_count=cfg.pulse_count,
             start_offset_samples=cfg.start_offset_samples,
-            snr_db=cfg.snr_db,
+            # Build a clean base waveform. Impairments are applied after the
+            # final per-tone/per-pulse waveform is reconstructed below.
+            snr_db=None,
             noise_color=cfg.noise_color,
-            freq_offset=cfg.freq_offset,
-            timing_offset=cfg.timing_offset,
-            fading_mode=cfg.fading_mode,
+            freq_offset=0.0,
+            timing_offset=1.0,
+            fading_mode="none",
             fading_block_len=cfg.fading_block_len,
             rician_k_db=cfg.rician_k_db,
             multipath_taps=None,
-            burst_probability=cfg.burst_probability,
+            burst_probability=0.0,
             burst_len_min=cfg.burst_len_min,
             burst_len_max=cfg.burst_len_max,
-            burst_power_ratio_db=cfg.burst_power_ratio_db,
-            burst_color=cfg.burst_color,
-            peak_power=cfg.peak_power,
+            burst_power_ratio_db=0.0,
+            burst_color="white",
+            peak_power=None,
             seed=cfg.seed,
         )
 
@@ -2641,8 +2637,44 @@ def build_controlled_tone_pulse_batch_from_iq_batches(
             tone_pulse_amplitudes=cfg.tone_pulse_amplitudes,
             tone_pulse_lengths_samples=cfg.tone_pulse_lengths_samples,
         )
+        tx_iq = txflex.impair_iq(
+            iq=tx_iq,
+            snr_db=cfg.snr_db,
+            noise_color=cfg.noise_color,
+            freq_offset=cfg.freq_offset,
+            timing_offset=cfg.timing_offset,
+            fading_mode=cfg.fading_mode,
+            fading_block_len=cfg.fading_block_len,
+            rician_k_db=cfg.rician_k_db,
+            multipath_taps=None,
+            burst_probability=0.0,
+            burst_len_min=cfg.burst_len_min,
+            burst_len_max=cfg.burst_len_max,
+            burst_power_ratio_db=0.0,
+            burst_color="white",
+            seed=cfg.seed,
+        )
+        tx_iq, peak_limited, pre_limit_peak_power = txflex.limit_peak_power(tx_iq, cfg.peak_power)
 
         tx_metadata = dict(tx_result.metadata)
+        tx_metadata.update({
+            "snr_db": cfg.snr_db,
+            "noise_color": cfg.noise_color,
+            "freq_offset": cfg.freq_offset,
+            "timing_offset": cfg.timing_offset,
+            "fading_mode": cfg.fading_mode,
+            "fading_block_len": cfg.fading_block_len,
+            "rician_k_db": cfg.rician_k_db,
+            "burst_probability": 0.0,
+            "burst_power_ratio_db": 0.0,
+            "burst_color": "white",
+            "peak_power": cfg.peak_power,
+            "peak_limited": peak_limited,
+            "pre_limit_peak_power": pre_limit_peak_power,
+            "actual_num_samples": int(tx_iq.numel()),
+            "avg_power": txflex.measure_power(tx_iq),
+            "measured_peak_power": float(torch.max(torch.abs(tx_iq) ** 2).item()) if tx_iq.numel() else 0.0,
+        })
         tx_metadata["controller_input_lengths"] = [int(v) for v in lengths[i].tolist()]
         tx_metadata["controller_rx_input_power"] = float(rx_input_power_t[i].item())
         tx_metadata["controller_scalar_feature_schema"] = FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION
