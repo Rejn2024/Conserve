@@ -14,6 +14,7 @@ from tx_controller_tone_pulse_stft_varlen_9 import (
     TIMING_STFT_HOP_SAMPLES,
     TIMING_STFT_WINDOW_SAMPLES,
     TonePulseTXControlNetVarLen,
+    preprocess_batched_iq_to_stft_feature,
     preprocess_iq_to_stft_feature,
     tone_pulse_action_dim,
     build_first_pass_scalar_side_from_iq_sections,
@@ -162,7 +163,7 @@ def test_network_uses_parallel_resunets_with_requested_temporal_scale():
     assert model.timing_encoder.enc1.conv1.in_channels == TIMING_STFT_FEATURE_CHANNELS
     assert model.timing_encoder.temporal_receptive_field_samples >= TARGET_MAX_DETECTABLE_SAMPLES
     assert TIMING_STFT_WINDOW_SAMPLES <= 5
-    assert TARGET_INPUT_SAMPLES == 1_000_000
+    assert TARGET_INPUT_SAMPLES is None
     assert TARGET_MAX_DETECTABLE_SAMPLES == 100_000
 
     native = [
@@ -268,3 +269,16 @@ def test_actor_critic_logp_entropy_include_autoregressive_pulse_terms(monkeypatc
         action=action_mean,
     )
     assert torch.allclose(provided_action_log_prob, flat_log_prob + 4.0)
+
+
+def test_preprocessing_uses_native_iq_length_by_default():
+    short = torch.complex(torch.randn(257), torch.randn(257))
+    long = torch.complex(torch.randn(401), torch.randn(401))
+
+    short_proc = preprocess_iq_to_stft_feature(short, sample_rate_hz=1_000_000.0)
+    batch_proc = preprocess_batched_iq_to_stft_feature([short, long], sample_rate_hz=1_000_000.0)
+
+    assert short_proc["length_samples"].item() == 257
+    assert batch_proc["lengths"].tolist() == [257.0, 401.0]
+    assert batch_proc["frequency_feature"].shape[0] == 2
+    assert batch_proc["timing_feature"].shape[0] == 2
