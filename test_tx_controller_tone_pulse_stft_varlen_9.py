@@ -17,6 +17,7 @@ from tx_controller_tone_pulse_stft_varlen_9 import (
     preprocess_batched_iq_to_stft_feature,
     preprocess_iq_to_stft_feature,
     tone_pulse_action_dim,
+    apply_tone_pulse_action_overrides,
     build_first_pass_scalar_side_from_iq_sections,
     compute_first_pass_scalar_features_for_iq_batch,
     decode_tone_pulse_config,
@@ -73,6 +74,9 @@ def test_decode_tone_pulse_config_sanitizes_nan_model_outputs():
     assert cfg.pulse_count >= 1
     assert all(5 <= length <= 10_000 for length in cfg.pulse_lengths_samples)
     assert cfg.start_offset_samples >= 0
+    assert cfg.burst_probability == 0.0
+    assert cfg.burst_power_ratio_db == 0.0
+    assert cfg.burst_color == "white"
 
     finite_scalars = [
         cfg.sample_rate_hz,
@@ -129,8 +133,47 @@ def test_first_pass_scalar_side_from_sections_feeds_default_network():
     assert out["pulse_phase_ar_control"].shape == (batch, 1)
     assert out["pulse_length_ar_control"].shape == (batch, 1)
     assert out["pulse_power_ar_control"].shape == (batch, 1)
+    assert "burst_color_logits" not in out
+    assert "burst_probability" not in out
+    assert "burst_power_ratio_db" not in out
     assert torch.all(out["pulse_length_samples_cont"] >= 5.0)
     assert torch.all(out["pulse_length_samples_cont"] <= 10_000.0)
+
+
+def test_impulsive_noise_action_overrides_are_locked_off():
+    max_tones = 2
+    max_pulses = 3
+    model = TonePulseTXControlNetVarLen(in_ch=23, base_ch=4, max_tones=max_tones, max_pulses=max_pulses).eval()
+    stft = [torch.randn(1, 23, 16, 8)]
+    scalar = torch.randn(1, N_FIRST_PASS_SCALAR_FEATURES)
+    model_out = model(stft, scalar)
+    cfg = decode_tone_pulse_config(
+        model_out=model_out,
+        intake_sample_rate_hz=2_000_000.0,
+        rf_center_est_hz=0.0,
+        desired_output_iq_len=256,
+        user_peak_power_fraction=40.0,
+        rx_input_power=0.5,
+        max_tones=max_tones,
+        max_pulses=max_pulses,
+        seed=7,
+    )
+
+    overridden = apply_tone_pulse_action_overrides(
+        cfg,
+        {
+            "burst_probability": 1.0,
+            "burst_power_ratio_db": 100.0,
+            "burst_color": "violet",
+        },
+        desired_output_iq_len=256,
+        max_tones=max_tones,
+        max_pulses=max_pulses,
+    )
+
+    assert overridden.burst_probability == 0.0
+    assert overridden.burst_power_ratio_db == 0.0
+    assert overridden.burst_color == "white"
 
 
 def test_tone_pulse_action_dim_uses_recurrent_pulse_state():
