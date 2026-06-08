@@ -24,7 +24,6 @@ from tx_controller_tone_pulse_stft_varlen_9 import (
     FIRST_PASS_SCALAR_FEATURE_NAMES,
     FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION,
     build_controlled_tone_pulse_batch_from_iq_batches,
-    TARGET_INPUT_SAMPLES,
     build_first_pass_scalar_side_from_iq_batch,
     preprocess_batched_iq_to_stft_feature,
     tone_pulse_action_dim,
@@ -131,7 +130,7 @@ def _s3_list_cache_records(client: Any, bucket: str, prefix: str) -> List[str]:
 def _build_training_cache_record(
     sdir: Path,
     jammer_sampling_freq: float,
-    section_len: int,
+    section_len: Optional[int],
     resample: Callable[[Any, float, float], Any],
     *,
     cache_stft_features: bool = False,
@@ -141,9 +140,11 @@ def _build_training_cache_record(
 
     whole = loadmod.load_whole_iq(sdir)
     sample_rate_hz = float(whole["meta"]["sample_rate_hz"])
-    iq = _to_complex_tensor(resample(whole["iq"], sample_rate_hz, jammer_sampling_freq)[:section_len])
-    if iq.numel() < section_len:
-        iq = torch.nn.functional.pad(iq, (0, section_len - iq.numel()))
+    iq = _to_complex_tensor(resample(whole["iq"], sample_rate_hz, jammer_sampling_freq))
+    if section_len is not None:
+        if section_len <= 0:
+            raise ValueError("section_len must be > 0 when provided")
+        iq = iq[:section_len]
 
     record = {
         "sample_name": sdir.name,
@@ -216,10 +217,25 @@ def _collate_stft_feature_list(batch: Sequence[Dict[str, Any]]) -> Optional[List
     views = [row["stft_feature_list"] for row in batch]
     if any(len(view) != 1 for view in views):
         raise ValueError("stft_feature_list must contain one complete-IQ feature view")
+    def pad_and_stack(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+        max_h = max(int(tensor.shape[-2]) for tensor in tensors)
+        max_w = max(int(tensor.shape[-1]) for tensor in tensors)
+        padded = [
+            torch.nn.functional.pad(
+                tensor,
+                (0, max_w - int(tensor.shape[-1]), 0, max_h - int(tensor.shape[-2])),
+            )
+            for tensor in tensors
+        ]
+        return torch.stack(padded, dim=0)
+
     first = views[0][0]
     if isinstance(first, dict):
-        return [{key: torch.stack([torch.as_tensor(view[0][key], dtype=torch.float32) for view in views], dim=0) for key in first}]
-    return [torch.stack([torch.as_tensor(view[0], dtype=torch.float32) for view in views], dim=0)]
+        return [{
+            key: pad_and_stack([torch.as_tensor(view[0][key], dtype=torch.float32) for view in views])
+            for key in first
+        }]
+    return [pad_and_stack([torch.as_tensor(view[0], dtype=torch.float32) for view in views])]
 
 
 def _resolve_sample_dirs(dataset_root: Path, max_numeric_suffix: Optional[int]) -> List[Path]:
@@ -242,7 +258,7 @@ def precompute_training_cache(
     cache_root: Path,
     jammer_sampling_freq: float,
     *,
-    section_len: int = TARGET_INPUT_SAMPLES,
+    section_len: Optional[int] = None,
     overwrite: bool = False,
     max_numeric_suffix: Optional[int] = None,
     resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
@@ -254,14 +270,15 @@ def precompute_training_cache(
     Each cached sample stores:
     - whole_iq (complex32 when available, otherwise complex64)
     - whole_sample_rate_hz (float)
-    - one complete IQ object resampled to jammer_sampling_freq and cropped/padded to section_len
+    - one complete IQ object resampled to jammer_sampling_freq at its native length
     - metadata + source path for debugging/auditability
 
     Args:
         dataset_root: Directory containing ``sample_<number>`` sample directories.
         cache_root: Directory where ``.pt`` cache records and the manifest are written.
         jammer_sampling_freq: Target sample rate for the cached complete IQ tensor.
-        section_len: Number of resampled IQ values to keep from the complete IQ object.
+        section_len: Optional maximum number of resampled IQ values to keep. By
+            default the complete transmission is retained without padding.
         overwrite: Rebuild existing cache records when True.
         max_numeric_suffix: Optional inclusive upper limit for the trailing numeric
             suffix of sample directory names. For example, ``100`` processes
@@ -311,7 +328,7 @@ def precompute_training_cache(
         "dataset_root": str(dataset_root),
         "cache_root": str(cache_root),
         "jammer_sampling_freq": float(jammer_sampling_freq),
-        "section_len": int(section_len),
+        "section_len": None if section_len is None else int(section_len),
         "max_numeric_suffix": max_numeric_suffix,
         "cache_stft_features": bool(cache_stft_features),
         "num_samples": len(produced),
@@ -328,7 +345,7 @@ def precompute_training_cache_s3(
     cache_s3_uri: str,
     jammer_sampling_freq: float,
     *,
-    section_len: int = TARGET_INPUT_SAMPLES,
+    section_len: Optional[int] = None,
     overwrite: bool = False,
     max_numeric_suffix: Optional[int] = None,
     resample_fn: Optional[Callable[[Any, float, float], Any]] = None,
@@ -384,7 +401,7 @@ def precompute_training_cache_s3(
         "cache_root": cache_s3_uri.rstrip("/"),
         "cache_s3_uri": cache_s3_uri.rstrip("/"),
         "jammer_sampling_freq": float(jammer_sampling_freq),
-        "section_len": int(section_len),
+        "section_len": None if section_len is None else int(section_len),
         "max_numeric_suffix": max_numeric_suffix,
         "cache_stft_features": bool(cache_stft_features),
         "num_samples": len(produced),
@@ -424,17 +441,24 @@ class CachedIQDataset(Dataset):
 def collate_cached_iq(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Collate cached records into a batch dict.
 
-    Note: whole_iq may have variable lengths, so keep as a list.
-    Resampled complete IQ tensors are fixed-length and stackable.
+    Both original and resampled IQ objects may have variable lengths. The
+    resampled tensors are padded only to the longest item in this batch, and
+    their native lengths are returned in ``iq_lengths``.
     """
 
+    iq_list = [x["iq"] for x in batch]
+    iq_lengths = torch.as_tensor([int(iq.numel()) for iq in iq_list], dtype=torch.long)
+    max_len = int(iq_lengths.max().item())
+    padded_iq = [torch.nn.functional.pad(iq, (0, max_len - int(iq.numel()))) for iq in iq_list]
     out = {
         "sample_names": [x["sample_name"] for x in batch],
         "source_dirs": [x["source_dir"] for x in batch],
         "whole_iq_list": [x["whole_iq"] for x in batch],
         "whole_meta_list": [x["whole_meta"] for x in batch],
         "whole_sr_list": [float(x["whole_sample_rate_hz"]) for x in batch],
-        "iq": torch.stack([x["iq"] for x in batch], dim=0),
+        "iq_list": iq_list,
+        "iq_lengths": iq_lengths,
+        "iq": torch.stack(padded_iq, dim=0),
     }
     stft_feature_list = _collate_stft_feature_list(batch)
     if stft_feature_list is not None:

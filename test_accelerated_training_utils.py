@@ -779,3 +779,29 @@ def test_jammer_controller_batch_decodes_actor_action_rows(monkeypatch):
     assert captured["action_overrides"][1]["start_offset_samples"] == pytest.approx(7.0)
     assert "pulse_on_samples" not in captured["action_overrides"][1]
     assert "pulse_off_samples" not in captured["action_overrides"][1]
+
+
+def test_precompute_cache_preserves_native_lengths_by_default(tmp_path: Path):
+    pytest.importorskip("numpy")
+    data_root = tmp_path / "dataset"
+    cache_root = tmp_path / "cache"
+    data_root.mkdir()
+    _write_sample(data_root, 0, n_whole=321)
+    _write_sample(data_root, 1, n_whole=517)
+
+    atu.precompute_training_cache(
+        dataset_root=data_root,
+        cache_root=cache_root,
+        jammer_sampling_freq=2e9,
+        resample_fn=lambda x, _fs_in, _fs_out: x,
+    )
+
+    first = torch.load(cache_root / "sample_000000.pt", weights_only=False)
+    second = torch.load(cache_root / "sample_000001.pt", weights_only=False)
+    assert first["iq"].numel() == 321
+    assert second["iq"].numel() == 517
+
+    batch = atu.collate_cached_iq([first, second])
+    assert batch["iq_lengths"].tolist() == [321, 517]
+    assert batch["iq"].shape == (2, 517)
+    assert batch["iq_list"][0].numel() == 321

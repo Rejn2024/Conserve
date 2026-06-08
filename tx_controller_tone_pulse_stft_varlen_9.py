@@ -27,7 +27,7 @@ TIMING_STFT_FEATURE_CHANNELS = 9
 TIMING_STFT_WINDOW_SAMPLES = 5
 TIMING_STFT_HOP_SAMPLES = 5
 TARGET_MAX_DETECTABLE_SAMPLES = 100_000
-TARGET_INPUT_SAMPLES = 1_000_000
+TARGET_INPUT_SAMPLES: Optional[int] = None
 
 
 
@@ -187,6 +187,43 @@ def _as_batch_complex_tensor(iq_batch: Union[torch.Tensor, Sequence[Union[torch.
     return torch.stack(padded, dim=0).to(dtype=DEFAULT_COMPLEX_DTYPE)
 
 
+
+
+def _as_complex_rows(
+    iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]]
+) -> List[torch.Tensor]:
+    """Return one sanitized complex tensor per IQ object without length padding."""
+
+    if isinstance(iq_batch, torch.Tensor):
+        x = iq_batch.to(dtype=DEFAULT_COMPLEX_DTYPE)
+        if x.ndim == 1:
+            return [x]
+        if x.ndim == 2:
+            return [x[i] for i in range(x.shape[0])]
+        raise ValueError(f"iq_batch must have shape [T] or [B, T], got {tuple(x.shape)}")
+
+    rows = [_as_complex_tensor(x) for x in iq_batch]
+    if not rows:
+        raise ValueError("iq_batch must contain at least one IQ array")
+    if any(int(row.numel()) <= 0 for row in rows):
+        raise ValueError("iq_batch entries must contain at least one sample")
+    return rows
+
+
+def _pad_feature_maps_for_stack(features: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Pad only derived feature maps so variable-length IQ inputs can batch."""
+
+    if not features:
+        raise ValueError("features must contain at least one tensor")
+    max_h = max(int(feat.shape[-2]) for feat in features)
+    max_w = max(int(feat.shape[-1]) for feat in features)
+    padded = []
+    for feat in features:
+        pad_h = max_h - int(feat.shape[-2])
+        pad_w = max_w - int(feat.shape[-1])
+        padded.append(F.pad(feat, (0, pad_w, 0, pad_h)) if pad_h or pad_w else feat)
+    return torch.stack(padded, dim=0)
+
 def compute_first_pass_scalar_features_for_iq_batch(
     iq_batch: Union[torch.Tensor, Sequence[Union[torch.Tensor, List[complex]]]],
     sample_rate_hz: float,
@@ -201,6 +238,24 @@ def compute_first_pass_scalar_features_for_iq_batch(
     samples available to the policy: packet/time geometry, coarse spectral
     overlap, power context, sample-rate scale, and validity flags.
     """
+
+    if not isinstance(iq_batch, torch.Tensor):
+        rows = _as_complex_rows(iq_batch)
+        if len({int(row.numel()) for row in rows}) > 1:
+            per_row = [
+                compute_first_pass_scalar_features_for_iq_batch(
+                    row.unsqueeze(0),
+                    sample_rate_hz,
+                    reference_sample_rate_hz=reference_sample_rate_hz,
+                    time_bins=time_bins,
+                )["scalar_side"].squeeze(0)
+                for row in rows
+            ]
+            return {
+                "scalar_side": torch.stack(per_row, dim=0),
+                "feature_names": FIRST_PASS_SCALAR_FEATURE_NAMES,
+                "schema_version": FIRST_PASS_SCALAR_FEATURE_SCHEMA_VERSION,
+            }
 
     x = _complex64_for_limited_op(_sanitize_complex_iq(_as_batch_complex_tensor(iq_batch)))
     if x.ndim != 2:
@@ -338,12 +393,9 @@ def build_first_pass_scalar_side_from_iq_batch(
 ) -> torch.Tensor:
     """Return first-pass scalar features for one complete IQ object per row."""
 
-    combined = _as_batch_complex_tensor(iq_batch)
-    if combined.shape[1] <= 0:
-        raise ValueError("IQ objects must contain at least one sample")
     if device is not None:
-        combined = combined.to(device=device)
-    return compute_first_pass_scalar_features_for_iq_batch(combined, sample_rate_hz)["scalar_side"]
+        iq_batch = [row.to(device=device) for row in _as_complex_rows(iq_batch)]
+    return compute_first_pass_scalar_features_for_iq_batch(iq_batch, sample_rate_hz)["scalar_side"]
 
 
 def build_first_pass_scalar_side_from_iq_sections(
@@ -441,11 +493,9 @@ def preprocess_batched_iq_to_stft_feature(
     nperseg: int = 128,
     noverlap: int = 96,
     nfft: int = 128,
-    enforce_iq_len: int = TARGET_INPUT_SAMPLES,
+    enforce_iq_len: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
-    x_batch = _sanitize_complex_iq(_as_batch_complex_tensor(iq_batch))
-    if x_batch.ndim != 2:
-        raise ValueError(f"iq_batch must have shape [B, T], got {tuple(x_batch.shape)}")
+    rows = [_sanitize_complex_iq(row) for row in _as_complex_rows(iq_batch)]
 
     feats = []
     frequency_feats = []
@@ -453,9 +503,7 @@ def preprocess_batched_iq_to_stft_feature(
     rx_powers = []
     peaks = []
     lengths = []
-    for i in range(x_batch.shape[0]):
-        x = x_batch[i]
-        lengths.append(int(x.numel()))
+    for x in rows:
         proc = preprocess_iq_to_stft_feature(
             iq=x,
             sample_rate_hz=sample_rate_hz,
@@ -464,6 +512,7 @@ def preprocess_batched_iq_to_stft_feature(
             nfft=nfft,
             enforce_iq_len=enforce_iq_len,
         )
+        lengths.append(int(proc["length_samples"].item()))
         feats.append(proc["feature"])
         frequency_feats.append(proc["frequency_feature"])
         timing_feats.append(proc["timing_feature"])
@@ -471,9 +520,9 @@ def preprocess_batched_iq_to_stft_feature(
         peaks.append(proc["peak_hz"].to(dtype=torch.float32))
 
     return {
-        "feature": _sanitize_stft_feature(torch.stack(feats, dim=0)),
-        "frequency_feature": _sanitize_stft_feature(torch.stack(frequency_feats, dim=0)),
-        "timing_feature": _sanitize_stft_feature(torch.stack(timing_feats, dim=0)),
+        "feature": _sanitize_stft_feature(_pad_feature_maps_for_stack(feats)),
+        "frequency_feature": _sanitize_stft_feature(_pad_feature_maps_for_stack(frequency_feats)),
+        "timing_feature": _sanitize_stft_feature(_pad_feature_maps_for_stack(timing_feats)),
         "rx_power": torch.stack(rx_powers, dim=0).to(dtype=torch.float32),
         "peak_hz": torch.stack(peaks, dim=0).to(dtype=torch.float32),
         "lengths": torch.as_tensor(lengths, dtype=torch.float32),
@@ -484,14 +533,15 @@ def preprocess_iq_to_stft_feature(
     nperseg: int = 128,
     noverlap: int = 96,
     nfft: int = 128,
-    enforce_iq_len: int = TARGET_INPUT_SAMPLES,
+    enforce_iq_len: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     x_t = _sanitize_complex_iq(_as_complex_tensor(iq))
-    if int(enforce_iq_len) > 0:
+    if enforce_iq_len is not None and int(enforce_iq_len) > 0:
         if x_t.numel() < int(enforce_iq_len):
             x_t = F.pad(x_t, (0, int(enforce_iq_len) - int(x_t.numel())))
         elif x_t.numel() > int(enforce_iq_len):
             x_t = x_t[: int(enforce_iq_len)]
+    processed_length = int(x_t.numel())
     if x_t.numel() < 8:
         x_t = F.pad(x_t, (0, 8 - int(x_t.numel())))
 
@@ -618,6 +668,7 @@ def preprocess_iq_to_stft_feature(
         "timing_feature": _sanitize_stft_feature(feat_time),
         "rx_power": measure_iq_power(iq),
         "peak_hz": f[torch.argmax(torch.mean(power, dim=1))].to(dtype=torch.float32) if power.numel() else torch.tensor(0.0, dtype=torch.float32, device=x_work.device),
+        "length_samples": torch.tensor(float(processed_length), dtype=torch.float32, device=x_work.device),
     }
 
 
@@ -783,8 +834,9 @@ class ResUNetSTFTEncoder(nn.Module):
 class TonePulseTXControlNetVarLen(nn.Module):
     """Parallel frequency/timing Res-U-Nets over variable-length IQ windows.
 
-    Inputs may contain up to ``TARGET_INPUT_SAMPLES`` samples. The timing STFT
-    preserves five-sample events and its dilated bottleneck spans at least
+    Inputs may use their native transmission length without a fixed one-million
+    sample pre-pad/truncate step. The timing STFT preserves five-sample events
+    and its dilated bottleneck spans at least
     ``TARGET_MAX_DETECTABLE_SAMPLES`` samples.
     """
 
