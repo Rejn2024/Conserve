@@ -42,8 +42,9 @@ def realistic_params(rng: random.Random) -> Dict:
     Realistic but still decodable region for current v4 RX.
     """
 
-    sr = rng.choice([(500_000.0, 48_000.0), 
-                     (1_000_000.0, 200_000.0),
+    sr = rng.choice([
+                     # (500_000.0, 48_000.0),
+                     # (1_000_000.0, 200_000.0),
                      (1_000_000_000.0, 433_920_000.0),
                      (2_000_000_000.0, 915_000_000.0),
                      (5_000_000_000.0, 2_400_000_000.0)])
