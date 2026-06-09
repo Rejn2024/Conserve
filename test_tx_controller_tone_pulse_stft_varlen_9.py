@@ -130,9 +130,6 @@ def test_first_pass_scalar_side_from_sections_feeds_default_network():
     assert out["pulse_phase_rel_rad"].shape == (batch, 3)
     assert out["pulse_length_log"].shape == (batch, 3)
     assert out["pulse_power_logit"].shape == (batch, 3)
-    assert out["pulse_phase_ar_control"].shape == (batch, 1)
-    assert out["pulse_length_ar_control"].shape == (batch, 1)
-    assert out["pulse_power_ar_control"].shape == (batch, 1)
     assert "burst_color_logits" not in out
     assert "burst_probability" not in out
     assert "burst_power_ratio_db" not in out
@@ -176,9 +173,9 @@ def test_impulsive_noise_action_overrides_are_locked_off():
     assert overridden.burst_color == "white"
 
 
-def test_tone_pulse_action_dim_uses_recurrent_pulse_state():
-    assert tone_pulse_action_dim(max_tones=2, max_pulses=3) == 12 + 4 * 2
-    assert tone_pulse_action_dim(max_tones=2, max_pulses=99) == 12 + 4 * 2
+def test_tone_pulse_action_dim_includes_independent_per_pulse_outputs():
+    assert tone_pulse_action_dim(max_tones=2, max_pulses=3) == 9 + 4 * 2 + 3 * 3
+    assert tone_pulse_action_dim(max_tones=2, max_pulses=99) == 9 + 4 * 2 + 3 * 99
     model = TonePulseTXControlNetVarLen(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
     from tx_controller_tone_pulse_stft_varlen_9 import ActorCritic
 
@@ -220,98 +217,41 @@ def test_network_uses_parallel_resunets_with_requested_temporal_scale():
     assert out["pulse_length_log"].shape == (1, 3)
 
 
-def test_pulse_length_and_power_use_independent_lstm_states():
-    model = TonePulseTXControlNetVarLen(
-        in_ch=23,
-        base_ch=4,
-        max_tones=2,
-        max_pulses=3,
-        pulse_length_ar_hidden=11,
-        pulse_power_ar_hidden=13,
-    )
+def test_pulse_phase_length_and_power_use_independent_output_heads():
+    model = TonePulseTXControlNetVarLen(in_ch=23, base_ch=4, max_tones=2, max_pulses=3)
     z = torch.randn(2, 96)
-    length_teacher_a = torch.full((2, 3), math.log(5.0))
-    length_teacher_b = torch.full((2, 3), math.log(10_000.0))
-    power_teacher_a = torch.full((2, 3), -10.0)
-    power_teacher_b = torch.full((2, 3), 10.0)
+    out = model.model_outputs_from_fused(z)
 
-    assert model.pulse_length_ar_step.input_size == 3
-    assert model.pulse_power_ar_step.input_size == 3
-    assert model.pulse_length_ar_step.hidden_size == 11
-    assert model.pulse_power_ar_step.hidden_size == 13
-    assert model.pulse_length_ar_step is not model.pulse_power_ar_step
-
-    length_a = model.pulse_length_autoregressive(z, teacher_length_logs=length_teacher_a)
-    length_b = model.pulse_length_autoregressive(z, teacher_length_logs=length_teacher_b)
-    power_a = model.pulse_power_autoregressive(z, teacher_power_logits=power_teacher_a)
-    power_b = model.pulse_power_autoregressive(z, teacher_power_logits=power_teacher_b)
-
-    assert "pulse_power_logit" not in length_a
-    assert "pulse_length_log" not in power_a
-    assert not torch.allclose(length_a["pulse_length_log_mean"], length_b["pulse_length_log_mean"])
-    assert not torch.allclose(power_a["pulse_power_logit_mean"], power_b["pulse_power_logit_mean"])
+    assert model.pulse_phase_rel_head.out_features == 3
+    assert model.pulse_length_log_head.out_features == 3
+    assert model.pulse_power_logit_head.out_features == 3
+    assert model.pulse_phase_rel_head is not model.pulse_length_log_head
+    assert model.pulse_length_log_head is not model.pulse_power_logit_head
+    assert out["pulse_phase_rel_rad"].shape == (2, 3)
+    assert out["pulse_length_log"].shape == (2, 3)
+    assert out["pulse_power_logit"].shape == (2, 3)
 
 
-def test_actor_critic_logp_entropy_include_autoregressive_pulse_terms(monkeypatch):
+def test_actor_critic_logp_entropy_cover_all_independent_action_columns():
     from tx_controller_tone_pulse_stft_varlen_9 import ActorCritic
 
     batch = 2
     actor_critic = ActorCritic(in_ch=23, base_ch=4, max_tones=2, max_pulses=3).eval()
     stft = [torch.randn(batch, 23, 16, 8)]
     scalar = torch.randn(batch, N_FIRST_PASS_SCALAR_FEATURES)
-
-    action_mean, _, log_std, _, _ = actor_critic._policy_tensors(
-        stft_feature_list=stft,
-        scalar_side=scalar,
-    )
+    action_mean, _, log_std, _, _ = actor_critic._policy_tensors(stft_feature_list=stft, scalar_side=scalar)
     dist = actor_critic._action_distribution(action_mean=action_mean, log_std=log_std)
-    flat_mask = torch.ones_like(action_mean)
-    flat_mask[..., actor_critic._recurrent_pulse_control_action_slice()] = 0.0
-    flat_log_prob = (dist.log_prob(action_mean) * flat_mask).sum(dim=-1)
-    flat_entropy = (dist.entropy() * flat_mask).sum(dim=-1)
+    expected_log_prob = dist.log_prob(action_mean).sum(dim=-1)
+    expected_entropy = dist.entropy().sum(dim=-1)
 
-    def fake_phase_log_prob(z, phases):
-        assert phases.shape == (batch, actor_critic.max_pulses)
-        return torch.full((z.shape[0],), 1.25, device=z.device), {}
+    log_prob, entropy, _ = actor_critic.evaluate_actions(stft_feature_list=stft, scalar_side=scalar, actions=action_mean)
+    assert torch.allclose(log_prob, expected_log_prob)
+    assert torch.allclose(entropy, expected_entropy)
 
-    def fake_length_log_prob(z, length_logs):
-        assert length_logs.shape == (batch, actor_critic.max_pulses)
-        return torch.full((z.shape[0],), 1.25, device=z.device), {}
-
-    def fake_power_log_prob(z, power_logits):
-        assert power_logits.shape == (batch, actor_critic.max_pulses)
-        return torch.full((z.shape[0],), 1.5, device=z.device), {}
-
-    def fake_phase_entropy(z):
-        return torch.full((z.shape[0],), 0.5, device=z.device)
-
-    def fake_length_entropy(z):
-        return torch.full((z.shape[0],), 0.75, device=z.device)
-
-    def fake_power_entropy(z):
-        return torch.full((z.shape[0],), 0.75, device=z.device)
-
-    monkeypatch.setattr(actor_critic.backbone, "pulse_phase_autoregressive_log_prob", fake_phase_log_prob)
-    monkeypatch.setattr(actor_critic.backbone, "pulse_length_autoregressive_log_prob", fake_length_log_prob)
-    monkeypatch.setattr(actor_critic.backbone, "pulse_power_autoregressive_log_prob", fake_power_log_prob)
-    monkeypatch.setattr(actor_critic.backbone, "pulse_phase_autoregressive_entropy", fake_phase_entropy)
-    monkeypatch.setattr(actor_critic.backbone, "pulse_length_autoregressive_entropy", fake_length_entropy)
-    monkeypatch.setattr(actor_critic.backbone, "pulse_power_autoregressive_entropy", fake_power_entropy)
-
-    log_prob, entropy, _ = actor_critic.evaluate_actions(
-        stft_feature_list=stft,
-        scalar_side=scalar,
-        actions=action_mean,
+    _, _, provided_log_prob = actor_critic.get_action_value_logp(
+        {"stft_feature_list": stft, "scalar_side": scalar}, action=action_mean
     )
-
-    assert torch.allclose(log_prob, flat_log_prob + 4.0)
-    assert torch.allclose(entropy, flat_entropy + 2.0)
-
-    _, _, provided_action_log_prob = actor_critic.get_action_value_logp(
-        {"stft_feature_list": stft, "scalar_side": scalar},
-        action=action_mean,
-    )
-    assert torch.allclose(provided_action_log_prob, flat_log_prob + 4.0)
+    assert torch.allclose(provided_log_prob, expected_log_prob)
 
 
 def test_preprocessing_uses_native_iq_length_by_default():

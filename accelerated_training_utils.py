@@ -702,27 +702,10 @@ def _as_float(value: Any, default: float) -> float:
 
 
 def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulses: Optional[int] = None) -> Dict[str, Any]:
-    """Normalize PPO action payloads into controller kwargs.
+    """Normalize PPO actions into controller kwargs.
 
-    Supported forms:
-    - dict with optional keys:
-        desired_output_iq_len, user_peak_power_fraction, seed,
-        noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
-        num_tones, base_f, spacing, amp_raw, pulse_count,
-        start_offset_samples, pulse_phase_rel_rad
-    - sequence/tensor:
-        * up to 3 items mapped to desired_output_iq_len, user_peak_power_fraction, seed
-        * when max_tones is known, the current ActorCritic layout is
-          decoded as 12 + 4*max_tones controls.  The three extra
-          Gaussian dimensions govern recurrent pulse phase, length, and power
-          controllers without storing per-pulse columns.
-        * > 3 legacy items are interpreted as continuous controls in this order:
-          noise_color, fading_mode, burst_color, rf_center_hz, carrier_hz,
-          num_tones, base_f, spacing, [amp_raw...], legacy pulse_on_samples,
-          legacy pulse_off_samples, pulse_count, start_offset_samples.  The
-          legacy on/off values are parsed only for backward compatibility and
-          are not forwarded as recurrent-controller action overrides.
-    - scalar/tensor scalar interpreted as user_peak_power_fraction
+    The current flat layout contains independent phase, log-length, and power
+    columns for every pulse. Legacy continuous layouts remain accepted below.
     """
 
     if isinstance(action, dict):
@@ -736,14 +719,13 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
     if isinstance(action, (list, tuple)):
         if len(action) > 3:
             vec = [float(x) for x in action]
-            if max_tones is not None and len(vec) == tone_pulse_action_dim(int(max_tones)):
+            if max_tones is not None and max_pulses is not None and len(vec) == tone_pulse_action_dim(int(max_tones), int(max_pulses)):
                 mt = int(max_tones)
+                mp = int(max_pulses)
                 idx = 0
                 out = {
-                    "noise_color": vec[idx],
-                    "fading_mode": vec[idx + 1],
-                    "rf_center_delta_hz": vec[idx + 2],
-                    "carrier_hz_norm": vec[idx + 3],
+                    "noise_color": vec[idx], "fading_mode": vec[idx + 1],
+                    "rf_center_delta_hz": vec[idx + 2], "carrier_hz_norm": vec[idx + 3],
                     "num_tones": vec[idx + 4],
                 }
                 idx += 5
@@ -758,10 +740,12 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
                 idx += mt
                 out["tone_phase_offset_rad"] = vec[idx]
                 idx += 1
-                out["pulse_phase_ar_control"] = vec[idx]
-                out["pulse_length_ar_control"] = vec[idx + 1]
-                out["pulse_power_ar_control"] = vec[idx + 2]
-                idx += 3
+                out["pulse_phase_rel_rad"] = vec[idx : idx + mp]
+                idx += mp
+                out["pulse_length_log"] = vec[idx : idx + mp]
+                idx += mp
+                out["pulse_power_logit"] = vec[idx : idx + mp]
+                idx += mp
                 out["pulse_phase_offset_rad"] = vec[idx]
                 idx += 1
                 out["pulse_count"] = vec[idx]
@@ -772,31 +756,12 @@ def _normalize_action(action: Any, *, max_tones: Optional[int] = None, max_pulse
                 raise ValueError("continuous action vector must contain at least 12 values")
             amp_width = len(vec) - 12
             return {
-                "noise_color": vec[0],
-                "fading_mode": vec[1],
-                "burst_color": vec[2],
-                "rf_center_hz": vec[3],
-                "carrier_hz": vec[4],
-                "num_tones": vec[5],
-                "base_f": vec[6],
-                "spacing": vec[7],
-                "amp_raw": vec[8 : 8 + amp_width],
-                "pulse_on_samples": vec[8 + amp_width],
-                "pulse_off_samples": vec[9 + amp_width],
-                "pulse_count": vec[10 + amp_width],
-                "start_offset_samples": vec[11 + amp_width],
+                "noise_color": vec[0], "fading_mode": vec[1], "burst_color": vec[2],
+                "rf_center_hz": vec[3], "carrier_hz": vec[4], "num_tones": vec[5],
+                "base_f": vec[6], "spacing": vec[7], "amp_raw": vec[8 : 8 + amp_width],
+                "pulse_on_samples": vec[8 + amp_width], "pulse_off_samples": vec[9 + amp_width],
+                "pulse_count": vec[10 + amp_width], "start_offset_samples": vec[11 + amp_width],
             }
-
-        out: Dict[str, Any] = {}
-        if len(action) >= 1:
-            out["desired_output_iq_len"] = action[0]
-        if len(action) >= 2:
-            out["user_peak_power_fraction"] = action[1]
-        if len(action) >= 3:
-            out["seed"] = action[2]
-        return out
-
-    if action is None:
         return {}
 
     return {"user_peak_power_fraction": action}
@@ -827,14 +792,8 @@ _ACTION_OVERRIDE_KEYS = (
     "tone_phase_rel_rad",
     "tone_phase_offset_rad",
     "pulse_phase_rel_rad",
-    "pulse_phase_rel_mix_logits",
-    "pulse_phase_rel_mix_loc_rad",
-    "pulse_phase_rel_mix_concentration",
     "pulse_phase_offset_rad",
     "pulse_phase_rotations_rad",
-    "pulse_phase_ar_control",
-    "pulse_length_ar_control",
-    "pulse_power_ar_control",
     "pulse_length_log",
     "pulse_lengths_samples",
     "pulse_power_logit",

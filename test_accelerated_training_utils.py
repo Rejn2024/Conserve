@@ -752,12 +752,14 @@ def test_jammer_controller_batch_decodes_actor_action_rows(monkeypatch):
         }
         for _ in range(2)
     ]
-    actions = torch.zeros((2, 12 + 4 * 2), dtype=torch.float32)
+    actions = torch.zeros((2, atu.tone_pulse_action_dim(2, 3)), dtype=torch.float32)
     actions[0, 4] = 1.0
     actions[0, 5:7] = torch.tensor([0.1, -0.1])
     actions[1, 4] = 2.0
     actions[1, 5:7] = torch.tensor([0.2, -0.2])
-    actions[1, 14:17] = torch.tensor([0.3, -0.4, 0.5])
+    actions[1, 14:17] = torch.tensor([0.3, 0.4, 0.5])
+    actions[1, 17:20] = torch.tensor([1.7, 1.8, 1.9])
+    actions[1, 20:23] = torch.tensor([-0.3, -0.4, -0.5])
     actions[1, -1] = 7.0
 
     atu.jammer_controller_batch(
@@ -773,9 +775,9 @@ def test_jammer_controller_batch_decodes_actor_action_rows(monkeypatch):
     assert captured["action_overrides"][0]["tone_freq_mean_norms"] == pytest.approx([0.1, -0.1])
     assert captured["action_overrides"][1]["num_tones"] == pytest.approx(2.0)
     assert captured["action_overrides"][1]["tone_freq_mean_norms"] == pytest.approx([0.2, -0.2])
-    assert captured["action_overrides"][1]["pulse_phase_ar_control"] == pytest.approx(0.3)
-    assert captured["action_overrides"][1]["pulse_length_ar_control"] == pytest.approx(-0.4)
-    assert captured["action_overrides"][1]["pulse_power_ar_control"] == pytest.approx(0.5)
+    assert captured["action_overrides"][1]["pulse_phase_rel_rad"] == pytest.approx([0.3, 0.4, 0.5])
+    assert captured["action_overrides"][1]["pulse_length_log"] == pytest.approx([1.7, 1.8, 1.9])
+    assert captured["action_overrides"][1]["pulse_power_logit"] == pytest.approx([-0.3, -0.4, -0.5])
     assert captured["action_overrides"][1]["start_offset_samples"] == pytest.approx(7.0)
     assert "pulse_on_samples" not in captured["action_overrides"][1]
     assert "pulse_off_samples" not in captured["action_overrides"][1]
