@@ -1,0 +1,210 @@
+Bayesian optimisation for jammer parameter-space exploration
+============================================================
+
+Purpose of this file
+--------------------
+This is a self-contained seed for a future Codex conversation about using
+Bayesian optimisation (BO) to direct exploration of the simulated jamming
+signal's parameter space in the Conserve repository.
+
+Scope and safety boundary
+-------------------------
+All work discussed here is intended only for authorized, closed-loop lab
+simulation, defensive receiver-robustness testing, controlled datasets, or
+shielded test environments. Generated waveforms and experiments should remain
+inside those controlled environments.
+
+Question discussed
+------------------
+Can Bayesian optimisation be used to direct exploration of the parameter space
+for the jamming signal?
+
+Conclusion
+----------
+Yes. BO is a strong fit as a sample-efficient, derivative-free outer-loop
+optimizer when each candidate evaluation is expensive because it requires:
+
+1. synthesizing a candidate tone/pulse waveform;
+2. resampling and adding it to a simulated received transmission;
+3. running the receiver/decoder; and
+4. calculating a scalar decode-degradation score.
+
+BO is particularly suitable because the current JammerVecEnv behaves like a
+short-horizon or one-step black-box optimization environment by default. It can
+also evaluate a batch of candidate actions in parallel.
+
+Relevant existing repository capabilities
+-----------------------------------------
+
+1. Action/configuration inputs
+   accelerated_training_utils.py contains _normalize_action(...), which accepts
+   dictionaries and continuous action vectors and maps them into jammer control
+   parameters. Supported controls include tone placement and amplitude, pulse
+   timing, pulse count, start offset, RF/carrier settings, noise/fading choices,
+   power controls, phases, and related settings.
+
+2. Batched candidate evaluation
+   jammer_controller_batch(...) accepts one action per sample and preserves
+   per-row action overrides. JammerVecEnv.step(...) accepts a batch of actions,
+   synthesizes the corresponding waveforms, computes rewards/scores, and returns
+   per-candidate metadata. This can serve directly as the BO evaluation loop.
+
+3. Constrained waveform overrides
+   tx_controller_tone_pulse_stft_varlen_9.py contains
+   apply_tone_pulse_action_overrides(...). It applies proposed parameters while
+   constraining them to the existing simulated tone/pulse space, including tone
+   count, frequencies, bandwidth/std, amplitudes, pulse timing/count, phases,
+   noise/fading/burst controls, and peak power.
+
+4. Black-box objective
+   accelerated_training_utils.py's default environment reward path synthesizes
+   jammer IQ, combines it with the original IQ, runs the receiver, and calls
+   score_decode(...). score_iq_decode.py defines a dense, bounded score where
+   clean/effective decoding receives a lower score and failed or unreliable
+   decoding receives a larger score. Therefore, a BO loop can maximize
+   score_decode, or minimize its negative if the BO library assumes
+   minimization.
+
+Recommended first search space
+------------------------------
+Do not initially optimize the full high-dimensional per-tone/per-pulse action
+space. Begin with approximately 5-15 physically meaningful variables, such as:
+
+- number of tones;
+- normalized center/mean frequency or base frequency;
+- tone spacing or bandwidth/std;
+- one or a few amplitude/power-allocation controls;
+- pulse-on duration;
+- pulse-off duration or duty cycle;
+- pulse count;
+- start offset; and
+- an overall bounded peak-power control.
+
+Categorical noise/fading options can be introduced later or handled by a
+mixed-variable BO method. Phase vectors and independent parameters for every
+tone and pulse should be deferred until a lower-dimensional search has shown
+value.
+
+Objective design
+----------------
+The simplest objective is:
+
+    maximize score_decode(rx_result, metadata)
+
+because higher scores currently indicate worse or less reliable decoding.
+Before implementing BO, verify this sign convention in the exact evaluation
+path and log both the raw decode score and the transformed optimization
+objective. The repository's RL learning notes identify reward-sign consistency
+as an important issue.
+
+The objective should also enforce authorized simulation constraints. If needed,
+use a constrained or penalized objective that discourages excessive power,
+overly broad emissions, out-of-range settings, or other degenerate solutions.
+Keep objective components bounded and logged separately.
+
+Suggested BO evaluation loop
+----------------------------
+A future implementation can follow this structure:
+
+1. Select a fixed training subset of simulated transmissions and a separate
+   held-out validation subset.
+2. Generate an initial space-filling design, such as Sobol or Latin hypercube
+   candidates.
+3. Encode each candidate in a format accepted by _normalize_action(...).
+4. Evaluate a batch of candidates with JammerVecEnv.step(...).
+5. Record candidate parameters, raw score, constrained objective, transmission
+   context, seed, and returned metadata.
+6. Fit or update the surrogate model.
+7. Use a batched acquisition function to propose the next candidates.
+8. Periodically evaluate the incumbent candidates on held-out transmissions and
+   randomized seeds/channels to detect overfitting.
+
+Conceptual pseudocode:
+
+    for iteration in range(num_bo_rounds):
+        actions = acquisition_function.suggest(batch_size=env.num_envs)
+        next_obs, rewards, dones, infos, success, total = env.step(actions)
+        observations.add(x=actions, y=rewards, metadata=infos)
+        surrogate.fit(observations)
+
+Important design choices for a future implementation
+----------------------------------------------------
+
+- Decide whether the goal is per-transmission optimization or a robust jammer
+  configuration that performs well across a distribution of transmissions.
+- For robust optimization, evaluate a candidate over multiple packet/channel
+  contexts and optimize a statistic such as mean score, lower confidence bound,
+  or a risk-sensitive quantile.
+- Treat repeated evaluations with different seeds as noisy observations rather
+  than assuming a deterministic objective.
+- Use batched BO so the existing vectorized environment evaluates several
+  candidates per receiver batch.
+- Preserve strict train/validation separation to avoid optimizing only for a
+  small cached transmission set.
+- Track parameter bounds, normalization, categorical encoding, seeds, objective
+  components, and incumbent history in a reproducible experiment record.
+- Start with a modest search space; standard Gaussian-process BO becomes less
+  effective as dimensionality grows.
+
+BO versus reinforcement learning
+--------------------------------
+BO is likely preferable when evaluations are expensive, the effective horizon
+is one step, sample efficiency matters, and an interpretable parameter search
+is desired. RL is likely preferable when learning a fast conditional policy
+that must generalize from observations to many changing transmissions or when
+there are meaningful sequential decisions.
+
+A useful hybrid workflow is:
+
+1. use BO to identify promising low-dimensional regions or waveform families;
+2. use those results to seed a replay buffer, curriculum, action bounds, or
+   initial policy exploration; and
+3. train/evaluate an RL policy across diverse, held-out transmission and channel
+   conditions.
+
+Suggested next implementation task
+----------------------------------
+Create a small, optional BO experiment module or notebook that does not alter
+the existing RL path. It should:
+
+- define explicit bounded parameter specifications;
+- convert BO candidates into action dictionaries;
+- batch-evaluate candidates through JammerVecEnv;
+- aggregate scores across configurable contexts/seeds;
+- save every observation and incumbent to a machine-readable results file;
+- include unit tests for candidate-to-action conversion, bounds, objective sign,
+  deterministic seeded evaluation, and batch/result alignment; and
+- document the controlled-simulation-only safety boundary.
+
+Potential libraries should be selected only after checking the environment and
+current dependency policy. A Gaussian-process BO package with mixed-variable,
+noisy-observation, constrained, and batched-acquisition support would be a good
+starting point. A lightweight random/Sobol baseline should be implemented for
+comparison so BO's sample-efficiency benefit can be measured.
+
+Key files to inspect in a future conversation
+---------------------------------------------
+
+- RL_JAMMER_LEARNING_SUGGESTIONS.md
+- accelerated_training_utils.py
+  - _normalize_action(...)
+  - jammer_controller_batch(...)
+  - JammerVecEnv
+  - JammerVecEnv._default_reward(...)
+  - JammerVecEnv.step(...)
+- tx_controller_tone_pulse_stft_varlen_9.py
+  - TonePulseControlConfig
+  - apply_tone_pulse_action_overrides(...)
+  - build_controlled_tone_pulse_batch_from_iq_batches(...)
+- score_iq_decode.py
+  - score_decode(...)
+- test_accelerated_training_utils.py
+- test_tx_controller_tone_pulse_stft_varlen_9.py
+- test_score_iq_decode.py
+
+Current state
+-------------
+No Bayesian-optimisation implementation was created during the summarized
+conversation. The discussion established feasibility, identified repository
+integration points, recommended a staged low-dimensional search, and proposed a
+BO/RL hybrid workflow.
