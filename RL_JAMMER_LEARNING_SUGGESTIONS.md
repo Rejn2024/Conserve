@@ -28,7 +28,7 @@ Recommendations:
 
 ### 3) Use dense, stable reward shaping instead of a sparse decode-only target
 
-A final decode result is an expensive and often sparse signal. The agent will learn faster if it receives dense feedback that correlates with degraded receiver confidence while still validating against end-to-end decode failure.
+A final decode result is an expensive and often sparse signal. The agent will learn faster if it receives dense feedback that correlates with degraded receiver confidence while still validating against end-to-end decode failure. See `DENSE_REWARD_SHAPING_GUIDE.md` for an expanded implementation guide.
 
 Recommendations:
 
@@ -36,6 +36,13 @@ Recommendations:
 - Normalize all reward components to comparable ranges before summing.
 - Start with dense proxy terms each step, then periodically include the full decode reward as the authoritative objective.
 - Penalize degenerate solutions such as always-max-power, overly broad noise, or waveforms outside the authorized simulation constraints.
+
+Definitions for the suggested dense reward terms:
+
+- **Receiver metric degradation:** a bounded measurement of how much worse the receiver's internal quality indicators become after adding the generated waveform, compared with the clean baseline for the same packet. Examples include lower correlation peaks, lower demodulator confidence, higher decoder distance, or larger `metric_div`-style values when exposed by the RX chain. Compute it as a baseline-relative delta and clip/normalize it before adding it to the reward.
+- **Symbol/bit confidence reduction:** a reduction in the receiver's confidence for recovered symbols or bits, even when the packet still decodes. If the receiver exposes soft decisions, use lower mean absolute log-likelihood ratio, lower posterior probability for the selected symbol, or a smaller margin between the best and second-best symbol hypotheses. This gives learning signal before full decode failure occurs.
+- **Packet synchronization loss:** evidence that the receiver can no longer reliably find or track packet timing/frequency structure. Useful proxies include missed preamble detection, reduced sync correlation peak-to-sidelobe ratio, failed carrier/timing lock, large timing-offset estimate error, or frame-boundary loss. Treat hard sync failure as a high reward component, but use the continuous sync metric as the dense signal.
+- **Constellation error growth:** an increase in the distance between received/equalized symbols and their nearest ideal constellation points. Common forms are higher error-vector magnitude, higher mean squared symbol error, or lower cluster separation. Normalize by the clean baseline or by expected symbol power so this term is comparable across SNRs and modulation settings.
 
 ### 4) Add a curriculum from easy to hard transmissions
 
