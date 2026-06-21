@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
@@ -8,6 +9,39 @@ import pytest
 import torch
 
 import accelerated_training_utils as atu
+
+
+class _FakeS3Body:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _FakeS3Client:
+    def __init__(self):
+        self.objects = {}
+
+    def head_object(self, *, Bucket, Key):
+        if (Bucket, Key) not in self.objects:
+            raise RuntimeError("404 Not Found")
+        return {"ContentLength": len(self.objects[(Bucket, Key)])}
+
+    def put_object(self, *, Bucket, Key, Body, **_kwargs):
+        self.objects[(Bucket, Key)] = bytes(Body)
+        return {"ETag": "fake"}
+
+    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+        contents = [
+            {"Key": key, "Size": len(body)}
+            for (bucket, key), body in self.objects.items()
+            if bucket == Bucket and key.startswith(Prefix)
+        ]
+        return {"Contents": sorted(contents, key=lambda x: x["Key"]), "IsTruncated": False}
+
+    def get_object(self, *, Bucket, Key):
+        return {"Body": _FakeS3Body(self.objects[(Bucket, Key)])}
 
 
 def _write_sample(root: Path, idx: int, n_whole: int = 2048):
@@ -70,6 +104,62 @@ def test_precompute_and_dataloader(tmp_path: Path):
     assert batch["iq2"].shape == (2, 1024)
     assert batch["iq3"].shape == (2, 1024)
     assert len(batch["whole_iq_list"]) == 2
+
+
+def test_precompute_training_cache_s3_and_dataloader(tmp_path: Path):
+    pytest.importorskip("numpy")
+    data_root = tmp_path / "dataset"
+    data_root.mkdir()
+
+    _write_sample(data_root, 0)
+    _write_sample(data_root, 1)
+
+    fake_s3 = _FakeS3Client()
+
+    def identity_resample(x, _fs_in, _fs_out):
+        return x
+
+    produced = atu.precompute_training_cache_s3(
+        dataset_root=data_root,
+        s3_cache_root="s3://unit-test-bucket/cache/train",
+        jammer_sampling_freq=2e9,
+        section_len=1024,
+        resample_fn=identity_resample,
+        s3_client=fake_s3,
+    )
+
+    assert produced == [
+        "s3://unit-test-bucket/cache/train/sample_000000.pt",
+        "s3://unit-test-bucket/cache/train/sample_000001.pt",
+    ]
+    assert ("unit-test-bucket", "cache/train/manifest.json") in fake_s3.objects
+
+    manifest = json.loads(fake_s3.objects[("unit-test-bucket", "cache/train/manifest.json")].decode("utf-8"))
+    assert manifest["cache_root"] == "s3://unit-test-bucket/cache/train"
+    assert manifest["num_samples"] == 2
+
+    loader = atu.create_cached_dataloader_s3(
+        "s3://unit-test-bucket/cache/train",
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        s3_client=fake_s3,
+    )
+    batch = next(iter(loader))
+
+    assert batch["sample_names"] == ["sample_000000", "sample_000001"]
+    assert batch["iq1"].shape == (2, 1024)
+    assert batch["iq2"].shape == (2, 1024)
+    assert batch["iq3"].shape == (2, 1024)
+    assert len(batch["whole_iq_list"]) == 2
+
+    first_record = torch.load(
+        io.BytesIO(fake_s3.objects[("unit-test-bucket", "cache/train/sample_000000.pt")]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert first_record["source_dir"].endswith("sample_000000")
 
 
 def test_run_epoch_cached_eval_path(tmp_path: Path, monkeypatch):
